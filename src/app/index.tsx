@@ -1,16 +1,31 @@
 import { ProgressiveBlurView } from '@/components/progressive-blur-view';
 import { GradientAvatar } from '@/components/gradient-avatar';
-import { describeJmapError, fetchJmapMailboxSnapshot } from '@/lib/jmap-client';
+import {
+  archiveJmapEmail,
+  describeJmapError,
+  fetchJmapMailboxSnapshot,
+  setJmapEmailPinned,
+  setJmapEmailUnread,
+  trashJmapEmail,
+} from '@/lib/jmap-client';
 import { messages, type Message } from '@/lib/mock-mail';
 import {
   GlassEffectContainer,
   HStack,
   Host,
   Image as SwiftImage,
+  List,
   Namespace,
+  RNHostView,
   Rectangle,
+  Button as SwiftButton,
+  Circle,
+  Spacer,
+  SwipeActions,
   Text as SwiftText,
   TextField,
+  VStack,
+  ZStack,
   type TextFieldRef,
   useNativeState,
 } from '@expo/ui/swift-ui';
@@ -25,14 +40,20 @@ import {
   frame,
   glassEffect,
   glassEffectId,
+  listRowSeparator,
+  listStyle,
   lineLimit,
   onTapGesture,
   offset as swiftOffset,
   opacity as swiftOpacity,
   padding,
+  scrollContentBackground,
+  shapes,
+  background,
   submitLabel,
   textInputAutocapitalization,
   truncationMode,
+  useScrollGeometryChange,
 } from '@expo/ui/swift-ui/modifiers';
 import { LinearGradient } from 'expo-linear-gradient';
 import {
@@ -46,10 +67,6 @@ import { SymbolView } from 'expo-symbols';
 import { ComponentProps, PropsWithChildren, useCallback, useId, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  Animated,
-  ListRenderItem,
-  NativeScrollEvent,
-  NativeSyntheticEvent,
   Platform,
   Pressable,
   ScrollView,
@@ -65,13 +82,20 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 const tint = '#0A84FF';
 const textScale = { maxFontSizeMultiplier: 1.12 };
-const titleRevealStart = 44;
-const titleRevealEnd = 66;
+const titleRevealStart = 0.5;
+const titleRevealEnd = 8;
 const systemFont = Platform.select({ ios: 'system-ui', default: undefined });
 const roundedFont = Platform.select({ ios: 'ui-rounded', default: undefined });
 const pressHaptic = () => {
   void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 };
+type InboxSwipeAction = 'archive' | 'delete' | 'toggle-pin' | 'toggle-unread';
+
+function interpolate(value: number, inputMin: number, inputMax: number, outputMin: number, outputMax: number) {
+  const progress = Math.max(0, Math.min(1, (value - inputMin) / (inputMax - inputMin)));
+  return outputMin + (outputMax - outputMin) * progress;
+}
+
 export default function InboxScreen() {
   const { mailboxId, mailboxName } = useLocalSearchParams<{
     mailboxId?: string;
@@ -79,12 +103,12 @@ export default function InboxScreen() {
   }>();
   const insets = useSafeAreaInsets();
   const colors = lightColors;
-  const [scrollY] = useState(() => new Animated.Value(0));
+  const initialScrollOffsetYRef = useRef<number | null>(null);
   const [jmapLoading, setJmapLoading] = useState(true);
   const [jmapStatus, setJmapStatus] = useState('');
   const [liveMailboxName, setLiveMailboxName] = useState<string | null>(null);
   const [liveMessages, setLiveMessages] = useState<Message[] | null>(null);
-  const [navTitleVisible, setNavTitleVisible] = useState(false);
+  const [scrollY, setScrollY] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
   const activeMailboxName = liveMailboxName ?? mailboxName ?? 'Inbox';
   const sourceMessages = liveMessages ?? messages;
@@ -99,22 +123,88 @@ export default function InboxScreen() {
         );
       })
     : sourceMessages;
-  const renderItem: ListRenderItem<Message> = ({ item }) => (
-    <MessageRow
-      colors={colors}
-      item={item}
-      onPress={() => {
-        router.push({
-          pathname: '/message/[id]',
-          params: getMessageRouteParams(item, activeMailboxName, liveMessages ? 'jmap' : 'mock'),
-        });
-      }}
-    />
-  );
+  const handleMessageSwipeAction = (item: Message, action: InboxSwipeAction) => {
+    pressHaptic();
 
+    if (!liveMessages) {
+      return;
+    }
+
+    const previousMessages = liveMessages;
+    const restoreMessages = () => {
+      setLiveMessages(previousMessages);
+    };
+
+    if (action === 'archive' || action === 'delete') {
+      setLiveMessages((currentMessages) =>
+        currentMessages?.filter((message) => message.id !== item.id) ?? null,
+      );
+
+      const request = action === 'archive'
+        ? archiveJmapEmail(item.id)
+        : trashJmapEmail(item.id);
+
+      request.catch(restoreMessages);
+      return;
+    }
+
+    if (action === 'toggle-pin') {
+      const nextPinned = !item.pinned;
+      setLiveMessages((currentMessages) =>
+        updateLiveMessage(currentMessages, item.id, {
+          keywords: updateMessageKeyword(item.keywords, '$flagged', nextPinned),
+          pinned: nextPinned,
+        }),
+      );
+
+      setJmapEmailPinned(item.id, nextPinned)
+        .then((result) => {
+          setLiveMessages((currentMessages) =>
+            updateLiveMessage(currentMessages, item.id, {
+              keywords: result.keywords,
+              pinned: result.pinned,
+              unread: result.unread,
+            }),
+          );
+        })
+        .catch(restoreMessages);
+      return;
+    }
+
+    const nextUnread = !item.unread;
+    setLiveMessages((currentMessages) =>
+      updateLiveMessage(currentMessages, item.id, {
+        keywords: updateMessageKeyword(item.keywords, '$seen', !nextUnread),
+        unread: nextUnread,
+      }),
+    );
+
+    setJmapEmailUnread(item.id, nextUnread)
+      .then((result) => {
+        setLiveMessages((currentMessages) =>
+          updateLiveMessage(currentMessages, item.id, {
+            keywords: result.keywords,
+            pinned: result.pinned,
+            unread: result.unread,
+          }),
+        );
+      })
+      .catch(restoreMessages);
+  };
+  const scrollGeometryModifier = useScrollGeometryChange(
+    useCallback((geometry) => {
+      if (initialScrollOffsetYRef.current === null) {
+        initialScrollOffsetYRef.current = geometry.contentOffsetY;
+      }
+
+      setScrollY(Math.max(0, geometry.contentOffsetY - initialScrollOffsetYRef.current));
+    }, []),
+  );
   useFocusEffect(
     useCallback(() => {
       const controller = new AbortController();
+      initialScrollOffsetYRef.current = null;
+      setScrollY(0);
 
       Promise.resolve().then(() => {
         if (!controller.signal.aborted) {
@@ -151,16 +241,8 @@ export default function InboxScreen() {
     }, [mailboxId]),
   );
   const headerBackdropHeight = insets.top + 70;
-  const headerOpacity = scrollY.interpolate({
-    inputRange: [titleRevealStart - 6, titleRevealEnd],
-    outputRange: [0, 1],
-    extrapolate: 'clamp',
-  });
-  const largeTitleOpacity = scrollY.interpolate({
-    inputRange: [titleRevealStart - 8, titleRevealEnd],
-    outputRange: [1, 0.12],
-    extrapolate: 'clamp',
-  });
+  const headerOpacity = interpolate(scrollY, 0, titleRevealEnd, 0, 1);
+  const navTitleVisible = scrollY >= titleRevealStart;
   const openCompose = () => {
     router.push('/compose');
   };
@@ -180,13 +262,6 @@ export default function InboxScreen() {
 
     const text = (eventOrText as { nativeEvent?: { text?: string } })?.nativeEvent?.text;
     setSearchQuery(text ?? '');
-  };
-  const handleScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
-    const nextVisible = event.nativeEvent.contentOffset.y >= titleRevealEnd;
-
-    if (nextVisible !== navTitleVisible) {
-      setNavTitleVisible(nextVisible);
-    }
   };
 
   return (
@@ -251,50 +326,53 @@ export default function InboxScreen() {
       </Stack.Toolbar>
 
       <View style={[styles.root, { backgroundColor: colors.background }]}>
-        <Animated.FlatList
-          data={visibleMessages}
-          keyExtractor={(item) => item.id}
-          renderItem={renderItem}
-          onScroll={Animated.event(
-            [{ nativeEvent: { contentOffset: { y: scrollY } } }],
-            { listener: handleScroll, useNativeDriver: true },
-          )}
-          scrollEventThrottle={16}
-          showsVerticalScrollIndicator={false}
-          contentContainerStyle={[
-            styles.listContent,
-            { paddingBottom: insets.bottom + 92, paddingTop: insets.top + 56 },
-          ]}
-          ListHeaderComponent={
-            <View style={styles.header}>
-              <Animated.Text
-                {...textScale}
-                numberOfLines={1}
-                style={[styles.title, { color: colors.text, opacity: largeTitleOpacity }]}>
-                {activeMailboxName}
-              </Animated.Text>
-              {jmapLoading ? (
-                <ActivityIndicator color={tint} size="small" style={styles.headerSpinner} />
-              ) : null}
-              {jmapStatus ? (
-                <Text {...textScale} style={[styles.headerStatus, { color: colors.secondaryText }]}>
-                  {jmapStatus}
-                </Text>
-              ) : null}
-            </View>
-          }
-        />
-
-      <Animated.View
-        pointerEvents="none"
-        style={[
-          styles.headerBackdrop,
-          { height: headerBackdropHeight, opacity: headerOpacity },
-        ]}>
-        <HeaderGlassBackdrop colors={colors} height={headerBackdropHeight} />
-      </Animated.View>
-
-    </View>
+        <Host useViewportSizeMeasurement style={styles.inboxListHost}>
+          <List
+            modifiers={[
+              listStyle('plain'),
+              scrollContentBackground('hidden'),
+              ...(scrollGeometryModifier ? [scrollGeometryModifier] : []),
+            ]}>
+            <HStack modifiers={[listRowSeparator('hidden')]}>
+              <RNHostView matchContents>
+                <InboxListHeader
+                  activeMailboxName={activeMailboxName}
+                  colors={colors}
+                  jmapLoading={jmapLoading}
+                  jmapStatus={jmapStatus}
+                />
+              </RNHostView>
+            </HStack>
+            {visibleMessages.map((item) => (
+              <MessageRow
+                colors={colors}
+                item={item}
+                key={item.id}
+                onSwipeAction={(action) => handleMessageSwipeAction(item, action)}
+                onPress={() => {
+                  router.push({
+                    pathname: '/message/[id]',
+                    params: getMessageRouteParams(item, activeMailboxName, liveMessages ? 'jmap' : 'mock'),
+                  });
+                }}
+              />
+            ))}
+            <HStack modifiers={[listRowSeparator('hidden')]}>
+              <RNHostView matchContents>
+                <View style={{ height: insets.bottom + 92 }} />
+              </RNHostView>
+            </HStack>
+          </List>
+        </Host>
+        <View
+          pointerEvents="none"
+          style={[
+            styles.headerBackdrop,
+            { height: headerBackdropHeight, opacity: headerOpacity },
+          ]}>
+          <HeaderGlassBackdrop colors={colors} height={headerBackdropHeight} />
+        </View>
+      </View>
     </>
   );
 }
@@ -319,6 +397,78 @@ function getMessageRouteParams(item: Message, mailboxName: string, source: 'jmap
     to: item.to ?? '',
     unread: item.unread ? '1' : '0',
   };
+}
+
+function updateLiveMessage(
+  messages: Message[] | null,
+  messageId: string,
+  patch: Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>,
+) {
+  if (!messages) {
+    return null;
+  }
+
+  return messages.map((message) => {
+    if (message.id !== messageId) {
+      return message;
+    }
+
+    return {
+      ...message,
+      ...(patch.keywords === undefined ? {} : { keywords: patch.keywords }),
+      ...(patch.pinned === undefined ? {} : { pinned: patch.pinned }),
+      ...(patch.unread === undefined ? {} : { unread: patch.unread }),
+    };
+  });
+}
+
+function updateMessageKeyword(
+  keywords: Message['keywords'],
+  keyword: '$flagged' | '$seen',
+  enabled: boolean,
+) {
+  const nextKeywords: Record<string, true> = { ...(keywords ?? {}) };
+
+  if (enabled) {
+    nextKeywords[keyword] = true;
+  } else {
+    delete nextKeywords[keyword];
+  }
+
+  return nextKeywords;
+}
+
+function InboxListHeader({
+  activeMailboxName,
+  colors,
+  jmapLoading,
+  jmapStatus,
+}: {
+  activeMailboxName: string;
+  colors: ColorSet;
+  jmapLoading: boolean;
+  jmapStatus: string;
+}) {
+  const { width } = useWindowDimensions();
+
+  return (
+    <View style={[styles.header, { width }]}>
+      <Text
+        {...textScale}
+        numberOfLines={1}
+        style={[styles.title, { color: colors.text }]}>
+        {activeMailboxName}
+      </Text>
+      {jmapLoading ? (
+        <ActivityIndicator color={tint} size="small" style={styles.headerSpinner} />
+      ) : null}
+      {jmapStatus ? (
+        <Text {...textScale} style={[styles.headerStatus, { color: colors.secondaryText }]}>
+          {jmapStatus}
+        </Text>
+      ) : null}
+    </View>
+  );
 }
 
 function NativeNavTitle({
@@ -592,49 +742,187 @@ function MessageDetail({
 function MessageRow({
   item,
   colors,
+  onSwipeAction,
   onPress,
 }: {
   item: Message;
   colors: ColorSet;
+  onSwipeAction: (action: InboxSwipeAction) => void;
   onPress: () => void;
 }) {
   const attachments = item.attachments ?? [];
+  const avatarTextSize = (item.avatar?.length ?? 1) > 1 ? 16 : 22;
+  const tapRow = () => {
+    pressHaptic();
+    onPress();
+  };
 
   return (
-    <Pressable onPress={onPress} style={({ pressed }) => [styles.rowPressable, pressed && styles.pressed]}>
-      <View style={styles.unreadSlot}>
-        {item.unread ? <View style={styles.unreadDot} /> : null}
-      </View>
-      <GradientAvatar
-        color={item.avatarColor}
-        label={item.avatar}
-        size={44}
-        style={styles.avatar}
-        textSize={(item.avatar?.length ?? 1) > 1 ? 16 : 22}
-      />
-      <View style={[styles.messageBody, { borderBottomColor: colors.separator }]}>
-        <View style={styles.rowTop}>
-          <Text {...textScale} numberOfLines={1} style={[styles.sender, { color: colors.text }]}>
-            {item.sender}
-          </Text>
-          {item.count ? <Text {...textScale} style={[styles.threadCount, { color: colors.secondaryText }]}>{item.count}</Text> : null}
-          {item.pinned ? (
-            <SymbolView name="pin.fill" tintColor={colors.pin} size={12} weight="semibold" />
+    <SwipeActions>
+      <HStack
+        alignment="top"
+        spacing={10}
+        modifiers={[frame({ maxWidth: 1000, alignment: 'leading' }), onTapGesture(tapRow)]}>
+        <ZStack modifiers={[frame({ width: 8, height: 44 })]}>
+          {item.unread ? (
+            <Circle modifiers={[frame({ width: 8, height: 8 }), foregroundColor(tint)]} />
           ) : null}
-          <Text {...textScale} style={[styles.date, { color: item.unread ? tint : colors.secondaryText }]}>
-            {item.date}
-          </Text>
-        </View>
-        <Text {...textScale} numberOfLines={1} style={[styles.subject, { color: colors.text }]}>
-          {item.subject}
-        </Text>
-        <Text {...textScale} numberOfLines={1} style={[styles.preview, { color: colors.secondaryText }]}>
-          {item.preview}
-        </Text>
-        <InboxAttachmentPreview attachments={attachments} colors={colors} />
-      </View>
-    </Pressable>
+        </ZStack>
+        <RNHostView matchContents>
+          <GradientAvatar
+            color={item.avatarColor}
+            label={item.avatar}
+            size={44}
+            style={styles.swiftRowAvatar}
+            textSize={avatarTextSize}
+          />
+        </RNHostView>
+        <VStack alignment="leading" spacing={1} modifiers={[frame({ maxWidth: 1000, alignment: 'leading' })]}>
+          <HStack alignment="firstTextBaseline" spacing={5}>
+            <SwiftText
+              modifiers={[
+                font({ size: 16, weight: 'bold' }),
+                foregroundColor(colors.text),
+                frame({ maxWidth: 1000, alignment: 'leading' }),
+                lineLimit(1),
+                truncationMode('tail'),
+              ]}>
+              {item.sender}
+            </SwiftText>
+            <Spacer minLength={5} />
+            {item.count ? (
+              <SwiftText
+                modifiers={[font({ size: 14, weight: 'bold' }), foregroundColor(colors.secondaryText)]}>
+                {item.count}
+              </SwiftText>
+            ) : null}
+            {item.pinned ? (
+              <SwiftImage systemName="pin.fill" color={colors.pin} size={12} />
+            ) : null}
+            <SwiftText
+              modifiers={[
+                font({ size: 14, weight: 'medium' }),
+                foregroundColor(item.unread ? tint : colors.secondaryText),
+                lineLimit(1),
+              ]}>
+              {item.date}
+            </SwiftText>
+          </HStack>
+          <SwiftText
+            modifiers={[
+              font({ size: 15, weight: 'regular' }),
+              foregroundColor(colors.text),
+              lineLimit(1),
+              truncationMode('tail'),
+            ]}>
+            {item.subject}
+          </SwiftText>
+          <SwiftText
+            modifiers={[
+              font({ size: 14, weight: 'regular' }),
+              foregroundColor(colors.secondaryText),
+              lineLimit(1),
+              truncationMode('tail'),
+            ]}>
+            {item.preview}
+          </SwiftText>
+          <SwiftInboxAttachmentPreview attachments={attachments} colors={colors} />
+        </VStack>
+      </HStack>
+      <SwipeActions.Actions edge="leading" allowsFullSwipe>
+        <SwiftButton
+          label={item.unread ? 'Read' : 'Unread'}
+          onPress={() => onSwipeAction('toggle-unread')}
+          systemImage={item.unread ? 'envelope.open' : 'envelope.badge'}
+        />
+        <SwiftButton
+          label={item.pinned ? 'Unpin' : 'Pin'}
+          onPress={() => onSwipeAction('toggle-pin')}
+          systemImage={item.pinned ? 'pin.slash' : 'pin'}
+        />
+      </SwipeActions.Actions>
+      <SwipeActions.Actions edge="trailing" allowsFullSwipe>
+        <SwiftButton
+          label="Archive"
+          onPress={() => onSwipeAction('archive')}
+          systemImage="archivebox"
+        />
+        <SwiftButton
+          label="Delete"
+          onPress={() => onSwipeAction('delete')}
+          role="destructive"
+          systemImage="trash"
+        />
+      </SwipeActions.Actions>
+    </SwipeActions>
   );
+}
+
+function SwiftInboxAttachmentPreview({
+  attachments,
+  colors,
+}: {
+  attachments: NonNullable<Message['attachments']>;
+  colors: ColorSet;
+}) {
+  const firstAttachment = attachments[0];
+
+  if (!firstAttachment) {
+    return null;
+  }
+
+  return (
+    <HStack spacing={6} modifiers={[padding({ top: 4 })]}>
+      <HStack
+        alignment="center"
+        spacing={4}
+        modifiers={[
+          padding({ horizontal: 6, vertical: 3 }),
+          background(colors.messageChip, shapes.roundedRectangle({ cornerRadius: 4 })),
+        ]}>
+        <SwiftImage
+          systemName={getAttachmentPreviewSwiftSymbol(firstAttachment)}
+          color={getAttachmentPreviewTint(firstAttachment, colors)}
+          size={15}
+        />
+        <SwiftText
+          modifiers={[
+            font({ size: 13, weight: 'regular' }),
+            foregroundColor(colors.text),
+            lineLimit(1),
+            truncationMode('tail'),
+          ]}>
+          {firstAttachment.name}
+        </SwiftText>
+      </HStack>
+      {attachments.length > 1 ? (
+        <SwiftText
+          modifiers={[
+            font({ size: 13, weight: 'regular' }),
+            foregroundColor(colors.secondaryText),
+            lineLimit(1),
+          ]}>
+          & {attachments.length - 1} more
+        </SwiftText>
+      ) : null}
+    </HStack>
+  );
+}
+
+function getAttachmentPreviewSwiftSymbol(
+  attachment: NonNullable<Message['attachments']>[number],
+): 'photo' | 'doc.richtext' | 'doc' {
+  const type = attachment.type.toLowerCase();
+
+  if (type.startsWith('image/')) {
+    return 'photo';
+  }
+
+  if (type === 'application/pdf') {
+    return 'doc.richtext';
+  }
+
+  return 'doc';
 }
 
 function InboxAttachmentPreview({
@@ -1001,6 +1289,9 @@ const styles = StyleSheet.create({
   },
   listContent: {
   },
+  inboxListHost: {
+    flex: 1,
+  },
   headerBackdrop: {
     left: 0,
     overflow: 'hidden',
@@ -1069,6 +1360,7 @@ const styles = StyleSheet.create({
     minHeight: 72,
     paddingLeft: 4,
     paddingRight: 18,
+    width: '100%',
   },
   pressed: {
     opacity: 0.74,
@@ -1098,8 +1390,14 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '700',
   },
+  swiftRowAvatar: {
+    alignItems: 'center',
+    borderRadius: 22,
+    height: 44,
+    justifyContent: 'center',
+    width: 44,
+  },
   messageBody: {
-    borderBottomWidth: StyleSheet.hairlineWidth,
     flex: 1,
     marginLeft: 10,
     paddingBottom: 8,
