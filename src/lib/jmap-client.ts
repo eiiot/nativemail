@@ -97,6 +97,8 @@ export type JmapMailboxSnapshot = {
     mailbox: JmapMailbox | null
     mailboxes: JmapMailbox[]
     messages: Message[]
+    position?: number
+    total?: number | null
     username: string
 }
 
@@ -194,10 +196,12 @@ export async function fetchJmapMailboxes(signal?: AbortSignal) {
 export async function fetchJmapMailboxSnapshot({
     mailboxId,
     limit = DEFAULT_MESSAGE_LIMIT,
+    position = 0,
     signal,
 }: {
     mailboxId?: string | null
     limit?: number
+    position?: number
     signal?: AbortSignal
 } = {}): Promise<JmapMailboxSnapshot> {
     const { accountId, client } = await createFastmailJmapClient(signal)
@@ -205,21 +209,24 @@ export async function fetchJmapMailboxSnapshot({
     try {
         const mailboxes = await getMailboxes(client, accountId, signal)
         const mailbox = findMailbox(mailboxes, mailboxId)
-        const messages = mailbox
-            ? await getMailboxMessages(
+        const page = mailbox
+            ? await getMailboxMessagesPage(
                   client,
                   accountId,
                   mailbox.id,
+                  position,
                   limit,
                   signal
               )
-            : []
+            : null
 
         return {
             accountId,
             mailbox,
             mailboxes,
-            messages,
+            messages: page?.messages ?? [],
+            position: page?.position ?? position,
+            total: page?.total ?? null,
             username: client.username,
         }
     } finally {
@@ -534,11 +541,33 @@ async function getMailboxMessages(
     limit: number,
     signal?: AbortSignal
 ) {
+    const page = await getMailboxMessagesPage(
+        client,
+        accountId,
+        mailboxId,
+        0,
+        limit,
+        signal
+    )
+
+    return page.messages
+}
+
+async function getMailboxMessagesPage(
+    client: JMAPClient,
+    accountId: Id,
+    mailboxId: Id,
+    position: number,
+    limit: number,
+    signal?: AbortSignal
+) {
     const query = Email.request.query({
         accountId,
+        calculateTotal: true,
         collapseThreads: true,
         filter: { inMailbox: mailboxId },
         limit,
+        position,
         sort: [{ property: 'receivedAt', isAscending: false }],
     })
     const get = Email.request.get({
@@ -554,6 +583,8 @@ async function getMailboxMessages(
         .send(signal)
     let emailIds: Id[] = []
     let emails: EmailObject[] = []
+    let responsePosition = position
+    let total: number | null = null
 
     for (const invocation of response.methodResponses) {
         if (isErrorInvocation(invocation)) {
@@ -564,6 +595,10 @@ async function getMailboxMessages(
 
         if (invocation.name === 'Email/query') {
             emailIds = invocation.getArgument('ids') as Id[]
+            responsePosition =
+                (invocation.getArgument('position') as number | undefined) ??
+                position
+            total = (invocation.getArgument('total') as number | undefined) ?? null
         }
 
         if (invocation.name === 'Email/get') {
@@ -571,7 +606,11 @@ async function getMailboxMessages(
         }
     }
 
-    return sortEmailsByQuery(emails, emailIds).map(mapEmailToMessage)
+    return {
+        messages: sortEmailsByQuery(emails, emailIds).map(mapEmailToMessage),
+        position: responsePosition,
+        total,
+    }
 }
 
 async function getEmails(
@@ -650,7 +689,7 @@ async function moveJmapEmailToRole(
 
         const mailboxIds: Record<string, true> =
             role === 'trash'
-                ? { [targetMailbox.id]: true }
+                ? ({ [targetMailbox.id]: true } as Record<string, true>)
                 : getArchivedMailboxIds(
                       metadata.mailboxIds,
                       mailboxes,
@@ -815,10 +854,10 @@ function getArchivedMailboxIds(
     currentMailboxIds: Record<string, true>,
     mailboxes: JmapMailbox[],
     archiveMailboxId: Id
-) {
-    const mailboxIds = {
+): Record<string, true> {
+    const mailboxIds: Record<string, true> = {
         ...currentMailboxIds,
-        [archiveMailboxId]: true,
+        [archiveMailboxId]: true as true,
     }
 
     for (const mailbox of mailboxes) {

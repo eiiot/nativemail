@@ -21,6 +21,7 @@ import {
   setJmapEmailPinned,
   setJmapEmailUnread,
   trashJmapEmail,
+  type JmapMailboxSnapshot,
 } from '@/lib/jmap-client';
 import {
   getNavigationDebugReport,
@@ -35,18 +36,10 @@ import {
   HStack,
   Host,
   Image as SwiftImage,
-  List,
   Namespace,
-  RNHostView,
   Rectangle,
-  Button as SwiftButton,
-  Circle,
-  Spacer,
-  SwipeActions,
   Text as SwiftText,
   TextField,
-  VStack,
-  ZStack,
   type TextFieldRef,
   useNativeState,
 } from '@expo/ui/swift-ui';
@@ -61,21 +54,14 @@ import {
   frame,
   glassEffect,
   glassEffectId,
-  listRowSeparator,
-  listStyle,
   lineLimit,
   onTapGesture,
   offset as swiftOffset,
   opacity as swiftOpacity,
   padding,
-  refreshable,
-  scrollContentBackground,
-  shapes,
-  background,
   submitLabel,
   textInputAutocapitalization,
   truncationMode,
-  useScrollGeometryChange,
 } from '@expo/ui/swift-ui/modifiers';
 import { LinearGradient } from 'expo-linear-gradient';
 import {
@@ -88,10 +74,15 @@ import { Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router
 import { SymbolView } from 'expo-symbols';
 import { ComponentProps, PropsWithChildren, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
+  Animated,
   Clipboard,
   InteractionManager,
+  type ListRenderItem,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
   Platform,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -108,10 +99,10 @@ const textScale = { maxFontSizeMultiplier: 1.12 };
 const titleRevealStart = 0.5;
 const titleRevealEnd = 8;
 const initialInboxRowRenderLimit = 10;
+const inboxRenderPageSize = 20;
+const inboxMailboxPageSize = 50;
+const inboxLoadMoreThreshold = 900;
 const inboxBodyWarmDelayMs = 650;
-const destructiveSwipeRemovalDelayMs = 360;
-const estimatedInboxRowHeight = 72;
-const estimatedInboxAttachmentRowExtraHeight = 30;
 const emptyMessageBodies: Record<string, unknown> = {};
 const systemFont = Platform.select({ ios: 'system-ui', default: undefined });
 const roundedFont = Platform.select({ ios: 'ui-rounded', default: undefined });
@@ -121,11 +112,6 @@ const pressHaptic = () => {
 type InboxSwipeAction = 'archive' | 'delete' | 'toggle-pin' | 'toggle-unread';
 type BodyCacheDebugState = 'checking' | 'disk' | 'memory' | 'missing';
 
-function interpolate(value: number, inputMin: number, inputMax: number, outputMin: number, outputMax: number) {
-  const progress = Math.max(0, Math.min(1, (value - inputMin) / (inputMax - inputMin)));
-  return outputMin + (outputMax - outputMin) * progress;
-}
-
 export default function InboxScreen() {
   const { mailboxId, mailboxName } = useLocalSearchParams<{
     mailboxId?: string;
@@ -133,9 +119,11 @@ export default function InboxScreen() {
   }>();
   const insets = useSafeAreaInsets();
   const colors = lightColors;
-  const initialScrollOffsetYRef = useRef<number | null>(null);
   const pendingDestructiveSwipeMessageIdsRef = useRef(new Set<string>());
   const pullRefreshInFlightRef = useRef<Promise<void> | null>(null);
+  const loadMoreInFlightRef = useRef<Promise<void> | null>(null);
+  const loadMoreInboxMessagesRef = useRef<() => void>(() => {});
+  const hasMoreMessagesRef = useRef(true);
   const debugMode = useDebugMode();
   const navigationDebugTrace = useNavigationDebugTrace();
   const snapshot = useMailStore((state) => selectMailboxSnapshot(state, mailboxId));
@@ -149,7 +137,9 @@ export default function InboxScreen() {
   const removeStoreMessageFromMailbox = useMailStore(
     (state) => state.removeMessageFromMailbox,
   );
-  const [scrollY, setScrollY] = useState(0);
+  const [scrollY] = useState(() => new Animated.Value(0));
+  const [navTitleVisible, setNavTitleVisible] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [bodyDiskStateById, setBodyDiskStateById] = useState<Record<string, boolean | undefined>>({});
   const [rowRenderLimit, setRowRenderLimit] = useState(initialInboxRowRenderLimit);
@@ -159,9 +149,7 @@ export default function InboxScreen() {
   const renderedMessages = visibleMessages.slice(0, rowRenderLimit);
   const bodyDebugMessageIds = renderedMessages.map((message) => message.id);
   const bodyDebugKey = bodyDebugMessageIds.join('\n');
-  const bodyWarmMessageIds = visibleMessages
-    .slice(0, initialInboxRowRenderLimit)
-    .map((message) => message.id);
+  const bodyWarmMessageIds = renderedMessages.map((message) => message.id);
   const bodyWarmKey = bodyWarmMessageIds.join('\n');
   const bodyCacheDebugStates = useMemo(
     () => getBodyCacheDebugStates({
@@ -171,13 +159,7 @@ export default function InboxScreen() {
     }),
     [bodyDebugKey, bodyDiskStateById, messageBodies],
   );
-  const deferredMessages = rowRenderLimit < visibleMessages.length
-    ? visibleMessages.slice(rowRenderLimit)
-    : [];
-  const deferredRowsHeight = deferredMessages.reduce(
-    (height, message) => height + getEstimatedInboxRowHeight(message),
-    0,
-  );
+  const hiddenRowCount = Math.max(0, visibleMessages.length - renderedMessages.length);
   const messageRouteSource = liveMessages ? 'jmap' : 'mock';
   const handleMessageSwipeAction = (item: Message, action: InboxSwipeAction) => {
     pressHaptic();
@@ -198,24 +180,24 @@ export default function InboxScreen() {
       }
 
       pendingDestructiveSwipeMessageIdsRef.current.add(item.id);
+      removeStoreMessageFromMailbox(item.id, liveMailboxId);
 
-      const request = action === 'archive'
-        ? archiveJmapEmail(item.id)
-        : trashJmapEmail(item.id);
-      const removalTimer = setTimeout(() => {
-        removeStoreMessageFromMailbox(item.id, liveMailboxId);
-        pendingDestructiveSwipeMessageIdsRef.current.delete(item.id);
-      }, destructiveSwipeRemovalDelayMs);
+      InteractionManager.runAfterInteractions(() => {
+        const request = action === 'archive'
+          ? archiveJmapEmail(item.id)
+          : trashJmapEmail(item.id);
 
-      request
-        .then(() => {
-          void removeCachedEmailFromMailbox(item.id, liveMailboxId).catch(() => {});
-        })
-        .catch(() => {
-          clearTimeout(removalTimer);
-          pendingDestructiveSwipeMessageIdsRef.current.delete(item.id);
-          restoreMessages();
-        });
+        request
+          .then(() => {
+            void removeCachedEmailFromMailbox(item.id, liveMailboxId).catch(() => {});
+          })
+          .catch(() => {
+            restoreMessages();
+          })
+          .finally(() => {
+            pendingDestructiveSwipeMessageIdsRef.current.delete(item.id);
+          });
+      });
       return;
     }
 
@@ -264,30 +246,50 @@ export default function InboxScreen() {
       })
       .catch(restoreMessages);
   };
-  const scrollGeometryModifier = useScrollGeometryChange(
-    useCallback((geometry) => {
-      if (initialScrollOffsetYRef.current === null) {
-        initialScrollOffsetYRef.current = geometry.contentOffsetY;
-      }
-
-      setScrollY(Math.max(0, geometry.contentOffsetY - initialScrollOffsetYRef.current));
-    }, []),
-  );
+  const updateHasMoreMessages = useCallback((nextHasMoreMessages: boolean) => {
+    hasMoreMessagesRef.current = nextHasMoreMessages;
+  }, []);
   const refreshMailboxFromServer = useCallback(
     async ({
+      apply = true,
+      limit = inboxMailboxPageSize,
+      position = 0,
       signal,
       tracePrefix,
     }: {
+      apply?: boolean;
+      limit?: number;
+      position?: number;
       signal?: AbortSignal;
       tracePrefix: string;
     }) => {
-      markNavigationTrace(`${tracePrefix} start`);
-      const snapshot = await fetchJmapMailboxSnapshot({ mailboxId, signal });
-      markNavigationTrace(`${tracePrefix} finished`, `rows=${snapshot.messages.length}`);
-      applyMailboxSnapshot(snapshot, mailboxId);
-      void writeCachedMailboxSnapshot(snapshot).catch(() => {});
+      markNavigationTrace(`${tracePrefix} start`, `position=${position} limit=${limit}`);
+      const snapshot = await fetchJmapMailboxSnapshot({
+        limit,
+        mailboxId,
+        position,
+        signal,
+      });
+      markNavigationTrace(
+        `${tracePrefix} finished`,
+        `position=${snapshot.position ?? position} rows=${snapshot.messages.length} total=${snapshot.total ?? 'unknown'}`,
+      );
+      updateHasMoreMessages(getSnapshotHasMoreMessages(snapshot, limit));
+
+      if (apply) {
+        const currentSnapshot = selectMailboxSnapshot(useMailStore.getState(), mailboxId);
+        const nextSnapshot = currentSnapshot
+          ? mergeMailboxPageIntoSnapshot(currentSnapshot, snapshot)
+          : snapshot;
+
+        updateHasMoreMessages(getSnapshotHasMoreMessages(nextSnapshot, limit));
+        applyMailboxSnapshot(nextSnapshot, mailboxId);
+        void writeCachedMailboxSnapshot(nextSnapshot).catch(() => {});
+      }
+
+      return snapshot;
     },
-    [applyMailboxSnapshot, mailboxId],
+    [applyMailboxSnapshot, mailboxId, updateHasMoreMessages],
   );
   const refreshInbox = useCallback(() => {
     if (pullRefreshInFlightRef.current) {
@@ -295,10 +297,14 @@ export default function InboxScreen() {
     }
 
     const refresh = (async () => {
+      setRefreshing(true);
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 
       try {
-        await refreshMailboxFromServer({ tracePrefix: 'inbox pull refresh' });
+        await refreshMailboxFromServer({
+          limit: Math.max(inboxMailboxPageSize, liveMessages?.length ?? 0),
+          tracePrefix: 'inbox pull refresh',
+        });
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       } catch (error: unknown) {
         if (!(error instanceof Error && error.name === 'FastmailJmapTokenMissingError')) {
@@ -309,11 +315,90 @@ export default function InboxScreen() {
       }
     })().finally(() => {
       pullRefreshInFlightRef.current = null;
+      setRefreshing(false);
     });
 
     pullRefreshInFlightRef.current = refresh;
     return refresh;
-  }, [refreshMailboxFromServer]);
+  }, [liveMessages?.length, refreshMailboxFromServer]);
+  const loadMoreInboxMessages = useCallback(() => {
+    if (rowRenderLimit < visibleMessages.length) {
+      setRowRenderLimit((current) => {
+        const nextLimit = Math.min(current + inboxRenderPageSize, visibleMessages.length);
+
+        if (nextLimit !== current) {
+          markNavigationTrace('inbox cached rows revealed', `rows=${nextLimit}`);
+        }
+
+        return nextLimit;
+      });
+      return;
+    }
+
+    if (searchQuery.trim()) {
+      return;
+    }
+
+    const currentSnapshot = selectMailboxSnapshot(useMailStore.getState(), mailboxId);
+    const currentMessages = currentSnapshot?.messages ?? [];
+
+    if (
+      !currentSnapshot ||
+      !currentMessages.length ||
+      !hasMoreMessagesRef.current ||
+      loadMoreInFlightRef.current
+    ) {
+      return;
+    }
+
+    const nextPosition = currentMessages.length;
+
+    const loadMore = refreshMailboxFromServer({
+      apply: false,
+      limit: inboxMailboxPageSize,
+      position: nextPosition,
+      tracePrefix: 'inbox load more',
+    })
+      .then((page) => {
+        const mergedSnapshot = mergeMailboxPageIntoSnapshot(currentSnapshot, page);
+
+        updateHasMoreMessages(getSnapshotHasMoreMessages(mergedSnapshot, inboxMailboxPageSize));
+        applyMailboxSnapshot(mergedSnapshot, mailboxId);
+        void writeCachedMailboxSnapshot(mergedSnapshot).catch(() => {});
+      })
+      .catch((error: unknown) => {
+        if (!(error instanceof Error && error.name === 'FastmailJmapTokenMissingError')) {
+          console.warn('JMAP inbox load more failed', describeJmapError(error));
+        }
+        markNavigationTrace('inbox load more failed', describeJmapError(error));
+      })
+      .finally(() => {
+        loadMoreInFlightRef.current = null;
+      });
+
+    loadMoreInFlightRef.current = loadMore;
+  }, [
+    applyMailboxSnapshot,
+    mailboxId,
+    refreshMailboxFromServer,
+    rowRenderLimit,
+    searchQuery,
+    updateHasMoreMessages,
+    visibleMessages.length,
+  ]);
+  useEffect(() => {
+    loadMoreInboxMessagesRef.current = loadMoreInboxMessages;
+  }, [loadMoreInboxMessages]);
+  useEffect(() => {
+    updateHasMoreMessages(true);
+  }, [mailboxId, updateHasMoreMessages]);
+  useEffect(() => {
+    if (!snapshot || loadMoreInFlightRef.current) {
+      return;
+    }
+
+    updateHasMoreMessages(getSnapshotHasMoreMessages(snapshot, Math.max(inboxMailboxPageSize, snapshot.messages.length)));
+  }, [snapshot, updateHasMoreMessages]);
   useEffect(() => {
     if (!debugMode || !bodyDebugKey) {
       return;
@@ -339,16 +424,15 @@ export default function InboxScreen() {
   useEffect(() => {
     markNavigationTrace(
       'inbox committed',
-      `mailbox=${activeMailboxName} rendered=${renderedMessages.length} rows=${sourceMessages.length} deferredHeight=${deferredRowsHeight}`,
+      `mailbox=${activeMailboxName} rendered=${renderedMessages.length} rows=${sourceMessages.length} hidden=${hiddenRowCount}`,
     );
-  }, [activeMailboxName, deferredRowsHeight, mailboxId, renderedMessages.length, sourceMessages.length]);
+  }, [activeMailboxName, hiddenRowCount, mailboxId, renderedMessages.length, sourceMessages.length]);
   useEffect(() => {
     setRowRenderLimit(initialInboxRowRenderLimit);
     markNavigationTrace('inbox row render limited', `rows=${initialInboxRowRenderLimit}`);
 
     const expandRowsTask = InteractionManager.runAfterInteractions(() => {
-      setRowRenderLimit(Number.POSITIVE_INFINITY);
-      markNavigationTrace('inbox row render expanded');
+      loadMoreInboxMessagesRef.current();
     });
 
     return () => {
@@ -370,7 +454,7 @@ export default function InboxScreen() {
       markNavigationTrace('body warm start', `rows=${messageIds.length}`);
       void prefetchMessageBodies(messageIds, {
         concurrency: 1,
-        limit: initialInboxRowRenderLimit,
+        limit: messageIds.length,
       })
         .then((result) => {
           if (cancelled) {
@@ -411,8 +495,8 @@ export default function InboxScreen() {
   useFocusEffect(
     useCallback(() => {
       const controller = new AbortController();
-      initialScrollOffsetYRef.current = null;
-      setScrollY(0);
+      scrollY.setValue(0);
+      setNavTitleVisible(false);
       markNavigationTrace('inbox focus effect', `mailboxId=${mailboxId ?? 'inbox'}`);
 
       const refreshTask = InteractionManager.runAfterInteractions(() => {
@@ -440,6 +524,7 @@ export default function InboxScreen() {
         }
 
         void refreshMailboxFromServer({
+          limit: Math.max(inboxMailboxPageSize, memorySnapshot?.messages.length ?? 0),
           signal: controller.signal,
           tracePrefix: 'inbox JMAP fetch',
         })
@@ -459,11 +544,14 @@ export default function InboxScreen() {
         refreshTask.cancel();
         controller.abort();
       };
-    }, [mailboxId, refreshMailboxFromServer]),
+    }, [mailboxId, refreshMailboxFromServer, scrollY]),
   );
   const headerBackdropHeight = insets.top + 70;
-  const headerOpacity = interpolate(scrollY, 0, titleRevealEnd, 0, 1);
-  const navTitleVisible = scrollY >= titleRevealStart;
+  const headerOpacity = scrollY.interpolate({
+    inputRange: [0, titleRevealEnd],
+    outputRange: [0, 1],
+    extrapolate: 'clamp',
+  });
   const openCompose = () => {
     router.push('/compose');
   };
@@ -492,6 +580,47 @@ export default function InboxScreen() {
     const text = (eventOrText as { nativeEvent?: { text?: string } })?.nativeEvent?.text;
     setSearchQuery(text ?? '');
   };
+  const handleScroll = useCallback(
+    (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+      const nextVisible = contentOffset.y >= titleRevealStart;
+
+      setNavTitleVisible((currentVisible) =>
+        currentVisible === nextVisible ? currentVisible : nextVisible,
+      );
+
+      const distanceToBottom = contentSize.height - layoutMeasurement.height - contentOffset.y;
+
+      if (
+        contentSize.height > layoutMeasurement.height &&
+        distanceToBottom <= inboxLoadMoreThreshold
+      ) {
+        loadMoreInboxMessagesRef.current();
+      }
+    },
+    [],
+  );
+  const renderItem = useCallback<ListRenderItem<Message>>(
+    ({ item }) => {
+      const messageHref = getMessageRouteHref(item, activeMailboxName, messageRouteSource);
+
+      return (
+        <MessageRow
+          bodyCacheDebugState={debugMode ? bodyCacheDebugStates[item.id] : undefined}
+          colors={colors}
+          item={item}
+          onPress={() => {
+            if (liveMessages) {
+              void hydrateMessageBodyFromCache(item.id).catch(() => {});
+            }
+
+            router.push(messageHref);
+          }}
+        />
+      );
+    },
+    [activeMailboxName, bodyCacheDebugStates, debugMode, liveMessages, messageRouteSource],
+  );
 
   return (
     <>
@@ -555,59 +684,48 @@ export default function InboxScreen() {
       </Stack.Toolbar>
 
       <View style={[styles.root, { backgroundColor: colors.background }]}>
-        <Host useViewportSizeMeasurement style={styles.inboxListHost}>
-          <List
-            modifiers={[
-              listStyle('plain'),
-              scrollContentBackground('hidden'),
-              ...(scrollGeometryModifier ? [scrollGeometryModifier] : []),
-              refreshable(refreshInbox),
-            ]}>
-            <HStack modifiers={[listRowSeparator('hidden')]}>
-              <RNHostView matchContents>
-                <InboxListHeader
-                  activeMailboxName={activeMailboxName}
-                  colors={colors}
-                  debugMode={debugMode}
-                  navigationDebugTrace={navigationDebugTrace}
-                />
-              </RNHostView>
-            </HStack>
-            {renderedMessages.map((item) => {
-              const messageHref = getMessageRouteHref(item, activeMailboxName, messageRouteSource);
-
-              return (
-                <MessageRow
-                  bodyCacheDebugState={debugMode ? bodyCacheDebugStates[item.id] : undefined}
-                  colors={colors}
-                  item={item}
-                  key={item.id}
-                  onSwipeAction={(action) => handleMessageSwipeAction(item, action)}
-                  onPress={() => {
-                    if (liveMessages) {
-                      void hydrateMessageBodyFromCache(item.id).catch(() => {});
-                    }
-
-                    router.push(messageHref);
-                  }}
-                />
-              );
-            })}
-            <HStack modifiers={[listRowSeparator('hidden')]}>
-              <RNHostView matchContents>
-                <View style={{ height: insets.bottom + 92 + deferredRowsHeight }} />
-              </RNHostView>
-            </HStack>
-          </List>
-        </Host>
-        <View
+        <Animated.FlatList
+          contentContainerStyle={[
+            styles.listContent,
+            { paddingBottom: insets.bottom + 92, paddingTop: insets.top + 56 },
+          ]}
+          data={renderedMessages}
+          keyExtractor={(item) => item.id}
+          ListHeaderComponent={
+            <InboxListHeader
+              activeMailboxName={activeMailboxName}
+              colors={colors}
+              debugMode={debugMode}
+              navigationDebugTrace={navigationDebugTrace}
+            />
+          }
+          onEndReached={loadMoreInboxMessages}
+          onEndReachedThreshold={1.4}
+          onScroll={Animated.event(
+            [{ nativeEvent: { contentOffset: { y: scrollY } } }],
+            { listener: handleScroll, useNativeDriver: true },
+          )}
+          refreshControl={
+            <RefreshControl
+              onRefresh={() => {
+                void refreshInbox();
+              }}
+              refreshing={refreshing}
+              tintColor={tint}
+            />
+          }
+          renderItem={renderItem}
+          scrollEventThrottle={16}
+          showsVerticalScrollIndicator={false}
+        />
+        <Animated.View
           pointerEvents="none"
           style={[
             styles.headerBackdrop,
             { height: headerBackdropHeight, opacity: headerOpacity },
           ]}>
           <HeaderGlassBackdrop colors={colors} height={headerBackdropHeight} />
-        </View>
+        </Animated.View>
       </View>
     </>
   );
@@ -642,6 +760,49 @@ function getMessageRouteHref(item: Message, mailboxName: string, source: 'jmap' 
   };
 }
 
+function mergeMailboxPageIntoSnapshot(
+  currentSnapshot: JmapMailboxSnapshot,
+  pageSnapshot: JmapMailboxSnapshot,
+): JmapMailboxSnapshot {
+  const position = pageSnapshot.position ?? 0;
+  const seenMessageIds = new Set<string>();
+  const pageEndPosition = position + pageSnapshot.messages.length;
+  const total = pageSnapshot.total ?? currentSnapshot.total ?? null;
+  const shouldKeepTail = typeof total === 'number' ? pageEndPosition < total : true;
+  const messages = [
+    ...currentSnapshot.messages.slice(0, position),
+    ...pageSnapshot.messages,
+    ...(shouldKeepTail ? currentSnapshot.messages.slice(pageEndPosition) : []),
+  ].filter((message) => {
+    if (seenMessageIds.has(message.id)) {
+      return false;
+    }
+
+    seenMessageIds.add(message.id);
+    return true;
+  });
+
+  return {
+    accountId: pageSnapshot.accountId,
+    mailbox: pageSnapshot.mailbox ?? currentSnapshot.mailbox,
+    mailboxes: pageSnapshot.mailboxes.length ? pageSnapshot.mailboxes : currentSnapshot.mailboxes,
+    messages: typeof total === 'number' ? messages.slice(0, total) : messages,
+    position: currentSnapshot.position ?? 0,
+    total,
+    username: pageSnapshot.username || currentSnapshot.username,
+  };
+}
+
+function getSnapshotHasMoreMessages(snapshot: JmapMailboxSnapshot, requestedLimit: number) {
+  const total = snapshot.total ?? snapshot.mailbox?.totalEmails ?? null;
+
+  if (typeof total === 'number') {
+    return (snapshot.position ?? 0) + snapshot.messages.length < total;
+  }
+
+  return snapshot.messages.length >= requestedLimit;
+}
+
 function getSearchFilteredMessages(messages: Message[], searchQuery: string) {
   const query = searchQuery.trim().toLowerCase();
 
@@ -670,11 +831,6 @@ function updateMessageKeyword(
   }
 
   return nextKeywords;
-}
-
-function getEstimatedInboxRowHeight(message: Message) {
-  return estimatedInboxRowHeight
-    + ((message.attachments?.length ?? 0) ? estimatedInboxAttachmentRowExtraHeight : 0);
 }
 
 async function getBodyDiskDebugStateEntries(messageIds: string[]) {
@@ -1081,208 +1237,69 @@ function MessageRow({
   bodyCacheDebugState,
   item,
   colors,
-  onSwipeAction,
   onPress,
 }: {
   bodyCacheDebugState?: BodyCacheDebugState;
   item: Message;
   colors: ColorSet;
-  onSwipeAction: (action: InboxSwipeAction) => void;
   onPress: () => void;
 }) {
   const attachments = item.attachments ?? [];
-  const avatarTextSize = (item.avatar?.length ?? 1) > 1 ? 16 : 22;
   const bodyCacheDebugLabel = bodyCacheDebugState
     ? getBodyCacheDebugLabel(bodyCacheDebugState)
     : null;
-  const tapRow = () => {
-    pressHaptic();
-    onPress();
-  };
 
   return (
-    <SwipeActions>
-      <HStack
-        alignment="top"
-        spacing={10}
-        modifiers={[
-          frame({ maxWidth: 1000, alignment: 'leading' }),
-          onTapGesture(tapRow),
-        ]}>
-        <ZStack modifiers={[frame({ width: 8, height: 44 })]}>
-          {item.unread ? (
-            <Circle modifiers={[frame({ width: 8, height: 8 }), foregroundColor(tint)]} />
+    <Pressable
+      onPress={() => {
+        pressHaptic();
+        onPress();
+      }}
+      style={({ pressed }) => [styles.rowPressable, pressed && styles.pressed]}>
+      <View style={styles.unreadSlot}>
+        {item.unread ? <View style={styles.unreadDot} /> : null}
+      </View>
+      <GradientAvatar
+        color={item.avatarColor}
+        label={item.avatar}
+        size={44}
+        style={styles.avatar}
+        textSize={(item.avatar?.length ?? 1) > 1 ? 16 : 22}
+      />
+      <View style={[styles.messageBody, { borderBottomColor: colors.separator }]}>
+        <View style={styles.rowTop}>
+          <Text {...textScale} numberOfLines={1} style={[styles.sender, { color: colors.text }]}>
+            {item.sender}
+          </Text>
+          {item.count ? (
+            <Text {...textScale} style={[styles.threadCount, { color: colors.secondaryText }]}>
+              {item.count}
+            </Text>
           ) : null}
-        </ZStack>
-        <RNHostView matchContents>
-          <GradientAvatar
-            color={item.avatarColor}
-            label={item.avatar}
-            size={44}
-            style={styles.swiftRowAvatar}
-            textSize={avatarTextSize}
-          />
-        </RNHostView>
-        <ZStack alignment="bottomTrailing" modifiers={[frame({ maxWidth: 1000, alignment: 'leading' })]}>
-          <VStack alignment="leading" spacing={1} modifiers={[frame({ maxWidth: 1000, alignment: 'leading' })]}>
-            <HStack alignment="firstTextBaseline" spacing={5}>
-              <SwiftText
-                modifiers={[
-                  font({ size: 16, weight: 'bold' }),
-                  foregroundColor(colors.text),
-                  frame({ maxWidth: 1000, alignment: 'leading' }),
-                  lineLimit(1),
-                  truncationMode('tail'),
-                ]}>
-                {item.sender}
-              </SwiftText>
-              <Spacer minLength={5} />
-              {item.count ? (
-                <SwiftText
-                  modifiers={[font({ size: 14, weight: 'bold' }), foregroundColor(colors.secondaryText)]}>
-                  {item.count}
-                </SwiftText>
-              ) : null}
-              {item.pinned ? (
-                <SwiftImage systemName="pin.fill" color={colors.pin} size={12} />
-              ) : null}
-              <SwiftText
-                modifiers={[
-                  font({ size: 14, weight: 'medium' }),
-                  foregroundColor(item.unread ? tint : colors.secondaryText),
-                  lineLimit(1),
-                ]}>
-                {item.date}
-              </SwiftText>
-            </HStack>
-            <SwiftText
-              modifiers={[
-                font({ size: 15, weight: 'regular' }),
-                foregroundColor(colors.text),
-                lineLimit(1),
-                truncationMode('tail'),
-              ]}>
-              {item.subject}
-            </SwiftText>
-            <SwiftText
-              modifiers={[
-                font({ size: 14, weight: 'regular' }),
-                foregroundColor(colors.secondaryText),
-                lineLimit(1),
-                truncationMode('tail'),
-              ]}>
-              {item.preview}
-            </SwiftText>
-            <SwiftInboxAttachmentPreview attachments={attachments} colors={colors} />
-          </VStack>
-          {bodyCacheDebugLabel ? (
-            <SwiftText
-              modifiers={[
-                font({ size: 9, weight: 'medium' }),
-                foregroundColor(colors.secondaryText),
-                padding({ trailing: 1 }),
-                swiftOpacity(0.72),
-                lineLimit(1),
-              ]}>
-              {bodyCacheDebugLabel}
-            </SwiftText>
+          {item.pinned ? (
+            <SymbolView name="pin.fill" tintColor={colors.pin} size={12} weight="semibold" />
           ) : null}
-        </ZStack>
-      </HStack>
-      <SwipeActions.Actions edge="leading" allowsFullSwipe>
-        <SwiftButton
-          label={item.unread ? 'Read' : 'Unread'}
-          onPress={() => onSwipeAction('toggle-unread')}
-          systemImage={item.unread ? 'envelope.open' : 'envelope.badge'}
-        />
-        <SwiftButton
-          label={item.pinned ? 'Unpin' : 'Pin'}
-          onPress={() => onSwipeAction('toggle-pin')}
-          systemImage={item.pinned ? 'pin.slash' : 'pin'}
-        />
-      </SwipeActions.Actions>
-      <SwipeActions.Actions edge="trailing" allowsFullSwipe>
-        <SwiftButton
-          label="Archive"
-          onPress={() => onSwipeAction('archive')}
-          systemImage="archivebox"
-        />
-        <SwiftButton
-          label="Delete"
-          onPress={() => onSwipeAction('delete')}
-          role="destructive"
-          systemImage="trash"
-        />
-      </SwipeActions.Actions>
-    </SwipeActions>
+          <Text {...textScale} style={[styles.date, { color: item.unread ? tint : colors.secondaryText }]}>
+            {item.date}
+          </Text>
+        </View>
+        <Text {...textScale} numberOfLines={1} style={[styles.subject, { color: colors.text }]}>
+          {item.subject}
+        </Text>
+        <Text {...textScale} numberOfLines={1} style={[styles.preview, { color: colors.secondaryText }]}>
+          {item.preview}
+        </Text>
+        <InboxAttachmentPreview attachments={attachments} colors={colors} />
+        {bodyCacheDebugLabel ? (
+          <Text
+            numberOfLines={1}
+            style={[styles.bodyCacheDebugLabel, { color: colors.secondaryText }]}>
+            {bodyCacheDebugLabel}
+          </Text>
+        ) : null}
+      </View>
+    </Pressable>
   );
-}
-
-function SwiftInboxAttachmentPreview({
-  attachments,
-  colors,
-}: {
-  attachments: NonNullable<Message['attachments']>;
-  colors: ColorSet;
-}) {
-  const firstAttachment = attachments[0];
-
-  if (!firstAttachment) {
-    return null;
-  }
-
-  return (
-    <HStack spacing={6} modifiers={[padding({ top: 4 })]}>
-      <HStack
-        alignment="center"
-        spacing={4}
-        modifiers={[
-          padding({ horizontal: 6, vertical: 3 }),
-          background(colors.messageChip, shapes.roundedRectangle({ cornerRadius: 4 })),
-        ]}>
-        <SwiftImage
-          systemName={getAttachmentPreviewSwiftSymbol(firstAttachment)}
-          color={getAttachmentPreviewTint(firstAttachment, colors)}
-          size={15}
-        />
-        <SwiftText
-          modifiers={[
-            font({ size: 13, weight: 'regular' }),
-            foregroundColor(colors.text),
-            lineLimit(1),
-            truncationMode('tail'),
-          ]}>
-          {firstAttachment.name}
-        </SwiftText>
-      </HStack>
-      {attachments.length > 1 ? (
-        <SwiftText
-          modifiers={[
-            font({ size: 13, weight: 'regular' }),
-            foregroundColor(colors.secondaryText),
-            lineLimit(1),
-          ]}>
-          & {attachments.length - 1} more
-        </SwiftText>
-      ) : null}
-    </HStack>
-  );
-}
-
-function getAttachmentPreviewSwiftSymbol(
-  attachment: NonNullable<Message['attachments']>[number],
-): 'photo' | 'doc.richtext' | 'doc' {
-  const type = attachment.type.toLowerCase();
-
-  if (type.startsWith('image/')) {
-    return 'photo';
-  }
-
-  if (type === 'application/pdf') {
-    return 'doc.richtext';
-  }
-
-  return 'doc';
 }
 
 function InboxAttachmentPreview({
@@ -1319,7 +1336,7 @@ function InboxAttachmentPreview({
           {...textScale}
           numberOfLines={1}
           style={[styles.inboxAttachmentMore, { color: colors.secondaryText }]}>
-          & {attachments.length - 1} more
+          and {attachments.length - 1} more
         </Text>
       ) : null}
     </View>
@@ -1780,18 +1797,13 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '700',
   },
-  swiftRowAvatar: {
-    alignItems: 'center',
-    borderRadius: 22,
-    height: 44,
-    justifyContent: 'center',
-    width: 44,
-  },
   messageBody: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
     flex: 1,
     marginLeft: 10,
     paddingBottom: 8,
     paddingTop: 7,
+    position: 'relative',
   },
   rowTop: {
     alignItems: 'baseline',
@@ -1829,6 +1841,17 @@ const styles = StyleSheet.create({
     fontWeight: '400',
     lineHeight: 18,
   },
+  bodyCacheDebugLabel: {
+    alignSelf: 'flex-end',
+    fontFamily: systemFont,
+    fontSize: 9,
+    fontWeight: '500',
+    lineHeight: 10,
+    opacity: 0.72,
+    position: 'absolute',
+    right: 0,
+    bottom: 1,
+  },
   inboxAttachmentRow: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -1857,12 +1880,13 @@ const styles = StyleSheet.create({
     marginLeft: 5,
   },
   inboxAttachmentMore: {
-    flexShrink: 0,
+    flexShrink: 1,
     fontFamily: systemFont,
     fontSize: 14,
     fontWeight: '400',
     lineHeight: 18,
     marginLeft: 8,
+    minWidth: 0,
   },
   messageDetailContent: {
     paddingHorizontal: 20,
