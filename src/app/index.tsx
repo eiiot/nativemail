@@ -68,6 +68,7 @@ import {
   offset as swiftOffset,
   opacity as swiftOpacity,
   padding,
+  refreshable,
   scrollContentBackground,
   shapes,
   background,
@@ -134,6 +135,7 @@ export default function InboxScreen() {
   const colors = lightColors;
   const initialScrollOffsetYRef = useRef<number | null>(null);
   const pendingDestructiveSwipeMessageIdsRef = useRef(new Set<string>());
+  const pullRefreshInFlightRef = useRef<Promise<void> | null>(null);
   const debugMode = useDebugMode();
   const navigationDebugTrace = useNavigationDebugTrace();
   const snapshot = useMailStore((state) => selectMailboxSnapshot(state, mailboxId));
@@ -287,6 +289,31 @@ export default function InboxScreen() {
     },
     [applyMailboxSnapshot, mailboxId],
   );
+  const refreshInbox = useCallback(() => {
+    if (pullRefreshInFlightRef.current) {
+      return pullRefreshInFlightRef.current;
+    }
+
+    const refresh = (async () => {
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+
+      try {
+        await refreshMailboxFromServer({ tracePrefix: 'inbox pull refresh' });
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      } catch (error: unknown) {
+        if (!(error instanceof Error && error.name === 'FastmailJmapTokenMissingError')) {
+          console.warn('JMAP inbox pull refresh failed', describeJmapError(error));
+        }
+        markNavigationTrace('inbox pull refresh failed', describeJmapError(error));
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      }
+    })().finally(() => {
+      pullRefreshInFlightRef.current = null;
+    });
+
+    pullRefreshInFlightRef.current = refresh;
+    return refresh;
+  }, [refreshMailboxFromServer]);
   useEffect(() => {
     if (!debugMode || !bodyDebugKey) {
       return;
@@ -534,6 +561,7 @@ export default function InboxScreen() {
               listStyle('plain'),
               scrollContentBackground('hidden'),
               ...(scrollGeometryModifier ? [scrollGeometryModifier] : []),
+              refreshable(refreshInbox),
             ]}>
             <HStack modifiers={[listRowSeparator('hidden')]}>
               <RNHostView matchContents>
