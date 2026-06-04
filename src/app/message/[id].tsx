@@ -12,6 +12,7 @@ import {
   type JmapMessageBodyDebug,
   type JmapMessageActionResult,
 } from '@/lib/jmap-client';
+import { updateCachedEmail } from '@/lib/mail-cache';
 import { useDebugMode } from '@/lib/debug-mode';
 import {
   clampEmailBodyHeight,
@@ -123,8 +124,10 @@ export default function MessageScreen() {
   const messageId = Array.isArray(id) ? id[0] : id;
   const fallbackMessage = getMessageById(messageId);
   const routeMessage = getRouteMessage(params, fallbackMessage);
+  const routeKeywordsText = getRouteParam(params.keywords) ?? '';
   const storeMessageBody = useMailStore((state) => selectMessageBody(state, messageId));
   const applyMessageBody = useMailStore((state) => state.applyMessageBody);
+  const patchStoreMessage = useMailStore((state) => state.patchMessage);
   const [localFlags, setLocalFlags] = useState({
     pinned: routeMessage.pinned,
     unread: routeMessage.unread,
@@ -170,6 +173,52 @@ export default function MessageScreen() {
       })
       .catch(() => {});
   }, [applyMessageBody, messageId, source, messageBodyFetchRevision]);
+  useEffect(() => {
+    if (source !== 'jmap' || !messageId || !routeMessage.unread) {
+      return;
+    }
+
+    const nextKeywords = updateMessageKeyword(routeMessage.keywords, '$seen', true);
+
+    setLocalFlags((currentFlags) => ({ ...currentFlags, unread: false }));
+    patchStoreMessage(messageId, {
+      keywords: nextKeywords,
+      unread: false,
+    });
+    void updateCachedEmail(messageId, {
+      keywords: nextKeywords,
+      unread: false,
+    }).catch(() => {});
+
+    setJmapEmailUnread(messageId, false)
+      .then((result) => {
+        patchStoreMessage(messageId, {
+          keywords: result.keywords,
+          pinned: result.pinned,
+          unread: result.unread,
+        });
+        void updateCachedEmail(messageId, {
+          keywords: result.keywords,
+          pinned: result.pinned,
+          unread: result.unread,
+        }).catch(() => {});
+        setLocalFlags((currentFlags) => ({
+          pinned: result.pinned ?? currentFlags.pinned,
+          unread: result.unread ?? currentFlags.unread,
+        }));
+      })
+      .catch(() => {
+        setLocalFlags((currentFlags) => ({ ...currentFlags, unread: routeMessage.unread }));
+        patchStoreMessage(messageId, {
+          keywords: routeMessage.keywords,
+          unread: routeMessage.unread,
+        });
+        void updateCachedEmail(messageId, {
+          keywords: routeMessage.keywords,
+          unread: routeMessage.unread,
+        }).catch(() => {});
+      });
+  }, [messageId, patchStoreMessage, routeKeywordsText, routeMessage.unread, source]);
   const runMessageAction = (action: MessageAction) => {
     pressHaptic();
 
@@ -601,6 +650,22 @@ function getRouteRecord(value: string | string[] | undefined) {
   } catch {
     return undefined;
   }
+}
+
+function updateMessageKeyword(
+  keywords: Message['keywords'],
+  keyword: '$flagged' | '$seen',
+  enabled: boolean,
+) {
+  const nextKeywords: Record<string, true> = { ...(keywords ?? {}) };
+
+  if (enabled) {
+    nextKeywords[keyword] = true;
+  } else {
+    delete nextKeywords[keyword];
+  }
+
+  return nextKeywords;
 }
 
 function getMessageMenuActions(message: Message, debugMode: boolean, hasHtmlBody: boolean): MenuAction[] {

@@ -287,6 +287,13 @@ export async function archiveJmapEmail(
     return moveJmapEmailToRole(messageId, 'archive', signal)
 }
 
+export async function unarchiveJmapEmail(
+    messageId: string,
+    signal?: AbortSignal
+): Promise<JmapMessageActionResult> {
+    return moveJmapEmailToRole(messageId, 'inbox', signal)
+}
+
 export async function trashJmapEmail(
     messageId: string,
     signal?: AbortSignal
@@ -668,7 +675,7 @@ async function getEmails(
 
 async function moveJmapEmailToRole(
     messageId: string,
-    role: 'archive' | 'trash',
+    role: 'archive' | 'inbox' | 'trash',
     signal?: AbortSignal
 ): Promise<JmapMessageActionResult> {
     const { accountId, client } = await createFastmailJmapClient(signal)
@@ -687,14 +694,23 @@ async function moveJmapEmailToRole(
             throw new Error(`Fastmail did not return a ${role} mailbox.`)
         }
 
-        const mailboxIds: Record<string, true> =
-            role === 'trash'
-                ? ({ [targetMailbox.id]: true } as Record<string, true>)
-                : getArchivedMailboxIds(
-                      metadata.mailboxIds,
-                      mailboxes,
-                      targetMailbox.id
-                  )
+        let mailboxIds: Record<string, true>
+
+        if (role === 'trash') {
+            mailboxIds = { [targetMailbox.id]: true }
+        } else if (role === 'inbox') {
+            mailboxIds = getUnarchivedMailboxIds(
+                metadata.mailboxIds,
+                mailboxes,
+                targetMailbox.id
+            )
+        } else {
+            mailboxIds = getArchivedMailboxIds(
+                metadata.mailboxIds,
+                mailboxes,
+                targetMailbox.id
+            )
+        }
 
         await updateEmail(client, accountId, messageId, { mailboxIds }, signal)
 
@@ -832,7 +848,7 @@ function findMailbox(mailboxes: JmapMailbox[], mailboxId?: string | null) {
 
 function findMailboxByRole(
     mailboxes: JmapMailbox[],
-    role: 'archive' | 'trash'
+    role: 'archive' | 'inbox' | 'trash'
 ) {
     const roleMailbox = mailboxes.find((mailbox) => mailbox.role === role)
 
@@ -841,13 +857,40 @@ function findMailboxByRole(
     }
 
     const fallbackNames =
-        role === 'archive' ? ['archive'] : ['trash', 'deleted items']
+        role === 'archive'
+            ? ['archive']
+            : role === 'inbox'
+              ? ['inbox']
+              : ['trash', 'deleted items']
 
     return (
         mailboxes.find((mailbox) =>
             fallbackNames.includes(normalizeMailboxName(mailbox.name))
         ) ?? null
     )
+}
+
+function getUnarchivedMailboxIds(
+    currentMailboxIds: Record<string, true>,
+    mailboxes: JmapMailbox[],
+    inboxMailboxId: Id
+): Record<string, true> {
+    const mailboxIds: Record<string, true> = {
+        ...currentMailboxIds,
+        [inboxMailboxId]: true as true,
+    }
+
+    for (const mailbox of mailboxes) {
+        if (mailbox.id === inboxMailboxId) {
+            continue
+        }
+
+        if (shouldRemoveFromMailboxOnUnarchive(mailbox)) {
+            delete mailboxIds[mailbox.id]
+        }
+    }
+
+    return mailboxIds
 }
 
 function getArchivedMailboxIds(
@@ -882,6 +925,10 @@ function shouldRemoveFromMailboxOnArchive(mailbox: JmapMailbox) {
         mailbox.role === 'trash' ||
         ['inbox', 'junk', 'spam', 'trash', 'deleted items'].includes(name)
     )
+}
+
+function shouldRemoveFromMailboxOnUnarchive(mailbox: JmapMailbox) {
+    return mailbox.role === 'archive' || normalizeMailboxName(mailbox.name) === 'archive'
 }
 
 function normalizeMailboxName(name: string) {

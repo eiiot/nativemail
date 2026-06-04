@@ -1,9 +1,9 @@
 import { describeJmapError, fetchJmapMailboxes, type JmapMailbox } from '@/lib/jmap-client';
 import { markNavigationTrace, startNavigationTrace } from '@/lib/navigation-debug';
 import * as Haptics from 'expo-haptics';
-import { Stack, router, useLocalSearchParams } from 'expo-router';
+import { Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
-import { ComponentProps, useEffect, useState } from 'react';
+import { ComponentProps, useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   InteractionManager,
@@ -50,6 +50,7 @@ const pressHaptic = () => {
   void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 };
 const prefetchedMailboxTimes = new Map<string, number>();
+const mailboxNavigationGuardMs = 2500;
 
 const systemMailboxOrder: SystemMailboxKey[] = [
   'inbox',
@@ -140,8 +141,25 @@ export default function FoldersScreen() {
   const [jmapLoading, setJmapLoading] = useState(true);
   const [jmapStatus, setJmapStatus] = useState('');
   const [liveSections, setLiveSections] = useState<FolderSections | null>(null);
+  const pendingMailboxNavigationKeyRef = useRef<string | null>(null);
+  const pendingMailboxNavigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mailboxRows = liveSections?.mailboxes ?? mockMailboxRows;
   const folderRows = liveSections?.folders ?? mockFolderRows;
+  const clearPendingMailboxNavigation = useCallback(() => {
+    pendingMailboxNavigationKeyRef.current = null;
+
+    if (pendingMailboxNavigationTimerRef.current) {
+      clearTimeout(pendingMailboxNavigationTimerRef.current);
+      pendingMailboxNavigationTimerRef.current = null;
+    }
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      clearPendingMailboxNavigation();
+    }, [clearPendingMailboxNavigation]),
+  );
+  useEffect(() => clearPendingMailboxNavigation, [clearPendingMailboxNavigation]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -206,10 +224,27 @@ export default function FoldersScreen() {
     router.navigate({ pathname: '/settings' });
   };
   const openMailbox = (row: FolderRow) => {
-    pressHaptic();
     const mailboxId = row.mailboxId ?? row.id;
     const mailboxRole = row.role ?? row.systemKey ?? null;
+    const navigationKey = getMailboxNavigationKey(row);
     const traceDetail = getFolderNavigationTraceDetail(row);
+
+    if (pendingMailboxNavigationKeyRef.current === navigationKey) {
+      markNavigationTrace('duplicate mailbox tap ignored', traceDetail);
+      return;
+    }
+
+    pendingMailboxNavigationKeyRef.current = navigationKey;
+
+    if (pendingMailboxNavigationTimerRef.current) {
+      clearTimeout(pendingMailboxNavigationTimerRef.current);
+    }
+
+    pendingMailboxNavigationTimerRef.current = setTimeout(() => {
+      clearPendingMailboxNavigation();
+    }, mailboxNavigationGuardMs);
+
+    pressHaptic();
     const canReturn = router.canGoBack();
     const isReturnMailbox =
       returnMailboxId === mailboxId || Boolean(returnMailboxRole && returnMailboxRole === mailboxRole);
@@ -238,6 +273,10 @@ export default function FoldersScreen() {
     markNavigationTrace('router.push returned', traceDetail);
   };
   const beginMailboxPress = (row: FolderRow) => {
+    if (pendingMailboxNavigationKeyRef.current === getMailboxNavigationKey(row)) {
+      return;
+    }
+
     startNavigationTrace('Folders -> Mailbox', getFolderNavigationTraceDetail(row));
   };
   const toggleSection = (id: string) => {
@@ -424,6 +463,10 @@ function getFolderNavigationTraceDetail(row: FolderRow) {
     : 'prefetched=no';
 
   return `mailbox=${row.label} id=${mailboxId} role=${mailboxRole ?? 'none'} ${prefetchDetail}`;
+}
+
+function getMailboxNavigationKey(row: FolderRow) {
+  return row.mailboxId ?? row.id;
 }
 
 function getMailboxHref(row: FolderRow) {
