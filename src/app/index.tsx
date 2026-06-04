@@ -1,5 +1,6 @@
 import { ProgressiveBlurView } from '@/components/progressive-blur-view';
 import { GradientAvatar } from '@/components/gradient-avatar';
+import { describeJmapError, fetchJmapMailboxSnapshot } from '@/lib/jmap-client';
 import { messages, type Message } from '@/lib/mock-mail';
 import {
   GlassEffectContainer,
@@ -40,10 +41,11 @@ import {
   isLiquidGlassAvailable,
 } from 'expo-glass-effect';
 import * as Haptics from 'expo-haptics';
-import { Stack, router } from 'expo-router';
+import { Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
-import { ComponentProps, PropsWithChildren, useId, useRef, useState } from 'react';
+import { ComponentProps, PropsWithChildren, useCallback, useId, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   Animated,
   ListRenderItem,
   NativeScrollEvent,
@@ -56,7 +58,6 @@ import {
   View,
   type StyleProp,
   type ViewStyle,
-  useColorScheme,
   useWindowDimensions,
 } from 'react-native';
 import { KeyboardStickyView } from 'react-native-keyboard-controller';
@@ -72,20 +73,82 @@ const pressHaptic = () => {
   void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 };
 export default function InboxScreen() {
+  const { mailboxId, mailboxName } = useLocalSearchParams<{
+    mailboxId?: string;
+    mailboxName?: string;
+  }>();
   const insets = useSafeAreaInsets();
-  const scheme = useColorScheme();
-  const colors = scheme === 'dark' ? darkColors : lightColors;
+  const colors = lightColors;
   const [scrollY] = useState(() => new Animated.Value(0));
+  const [jmapLoading, setJmapLoading] = useState(true);
+  const [jmapStatus, setJmapStatus] = useState('');
+  const [liveMailboxName, setLiveMailboxName] = useState<string | null>(null);
+  const [liveMessages, setLiveMessages] = useState<Message[] | null>(null);
   const [navTitleVisible, setNavTitleVisible] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const activeMailboxName = liveMailboxName ?? mailboxName ?? 'Inbox';
+  const sourceMessages = liveMessages ?? messages;
+  const visibleMessages = searchQuery.trim()
+    ? sourceMessages.filter((message) => {
+        const query = searchQuery.trim().toLowerCase();
+
+        return (
+          message.sender.toLowerCase().includes(query) ||
+          message.subject.toLowerCase().includes(query) ||
+          message.preview.toLowerCase().includes(query)
+        );
+      })
+    : sourceMessages;
   const renderItem: ListRenderItem<Message> = ({ item }) => (
     <MessageRow
       colors={colors}
       item={item}
       onPress={() => {
-        router.push({ pathname: '/message/[id]', params: { id: item.id } });
+        router.push({
+          pathname: '/message/[id]',
+          params: getMessageRouteParams(item, activeMailboxName, liveMessages ? 'jmap' : 'mock'),
+        });
       }}
     />
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      const controller = new AbortController();
+
+      Promise.resolve().then(() => {
+        if (!controller.signal.aborted) {
+          setJmapLoading(true);
+          setJmapStatus('');
+        }
+      });
+
+      fetchJmapMailboxSnapshot({ mailboxId, signal: controller.signal })
+        .then((snapshot) => {
+          setLiveMailboxName(snapshot.mailbox?.name ?? null);
+          setLiveMessages(snapshot.messages);
+        })
+        .catch((error: unknown) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+
+          setLiveMailboxName(null);
+          setLiveMessages(null);
+          setJmapStatus(error instanceof Error && error.name === 'FastmailJmapTokenMissingError'
+            ? ''
+            : `Using mock inbox: ${describeJmapError(error)}`);
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) {
+            setJmapLoading(false);
+          }
+        });
+
+      return () => {
+        controller.abort();
+      };
+    }, [mailboxId]),
   );
   const headerBackdropHeight = insets.top + 70;
   const headerOpacity = scrollY.interpolate({
@@ -137,7 +200,7 @@ export default function InboxScreen() {
         }}
       />
       <Stack.Title asChild>
-        <NativeNavTitle colors={colors} visible={navTitleVisible} />
+        <NativeNavTitle colors={colors} title={activeMailboxName} visible={navTitleVisible} />
       </Stack.Title>
       <Stack.Toolbar placement="left">
         <Stack.Toolbar.Button
@@ -189,7 +252,7 @@ export default function InboxScreen() {
 
       <View style={[styles.root, { backgroundColor: colors.background }]}>
         <Animated.FlatList
-          data={messages}
+          data={visibleMessages}
           keyExtractor={(item) => item.id}
           renderItem={renderItem}
           onScroll={Animated.event(
@@ -208,8 +271,16 @@ export default function InboxScreen() {
                 {...textScale}
                 numberOfLines={1}
                 style={[styles.title, { color: colors.text, opacity: largeTitleOpacity }]}>
-                Inbox
+                {activeMailboxName}
               </Animated.Text>
+              {jmapLoading ? (
+                <ActivityIndicator color={tint} size="small" style={styles.headerSpinner} />
+              ) : null}
+              {jmapStatus ? (
+                <Text {...textScale} style={[styles.headerStatus, { color: colors.secondaryText }]}>
+                  {jmapStatus}
+                </Text>
+              ) : null}
             </View>
           }
         />
@@ -228,7 +299,37 @@ export default function InboxScreen() {
   );
 }
 
-function NativeNavTitle({ colors, visible }: { colors: ColorSet; visible: boolean }) {
+function getMessageRouteParams(item: Message, mailboxName: string, source: 'jmap' | 'mock') {
+  return {
+    avatar: item.avatar ?? '',
+    avatarColor: item.avatarColor,
+    count: item.count ? String(item.count) : '',
+    date: item.date,
+    fromEmail: item.fromEmail ?? '',
+    hasAttachment: item.hasAttachment ? '1' : '0',
+    id: item.id,
+    keywords: JSON.stringify(item.keywords ?? {}),
+    mailboxIds: JSON.stringify(item.mailboxIds ?? {}),
+    mailboxName: item.mailboxName ?? mailboxName,
+    pinned: item.pinned ? '1' : '0',
+    preview: item.preview,
+    sender: item.sender,
+    source,
+    subject: item.subject,
+    to: item.to ?? '',
+    unread: item.unread ? '1' : '0',
+  };
+}
+
+function NativeNavTitle({
+  colors,
+  title,
+  visible,
+}: {
+  colors: ColorSet;
+  title: string;
+  visible: boolean;
+}) {
   return (
     <Host pointerEvents="none" style={styles.navTitleHost}>
       <SwiftText
@@ -243,7 +344,7 @@ function NativeNavTitle({ colors, visible }: { colors: ColorSet; visible: boolea
           swiftOffset({ y: visible ? 0 : 9 }),
           animation(Animation.easeOut({ duration: 0.22 }), visible),
         ]}>
-        Inbox
+        {title}
       </SwiftText>
     </Host>
   );
@@ -383,7 +484,7 @@ function TopNavigationCluster({
 function MessageActionDock({ bottom, colors }: { bottom: number; colors: ColorSet }) {
   return (
     <View pointerEvents="box-none" style={[styles.messageDock, { bottom }]}>
-      <GlassIconGroup colors={colors} symbols={['archivebox', 'envelope.badge', 'star']} width={182} />
+      <GlassIconGroup colors={colors} symbols={['archivebox', 'envelope.badge', 'pin']} width={182} />
       <GlassButton colors={colors} size={56} symbol="arrowshape.turn.up.left" />
       <GlassButton colors={colors} size={56} symbol="trash" />
     </View>
@@ -408,7 +509,7 @@ function GlassIconGroup({
       {symbols.map((symbol, index) => (
         <Pressable
           accessibilityRole="button"
-          key={symbol}
+          key={index}
           onPress={pressHaptic}
           style={styles.glassGroupButton}>
           <SymbolView name={symbol} tintColor={colors.text} size={symbolSize} weight="semibold" />
@@ -497,6 +598,8 @@ function MessageRow({
   colors: ColorSet;
   onPress: () => void;
 }) {
+  const attachments = item.attachments ?? [];
+
   return (
     <Pressable onPress={onPress} style={({ pressed }) => [styles.rowPressable, pressed && styles.pressed]}>
       <View style={styles.unreadSlot}>
@@ -515,6 +618,9 @@ function MessageRow({
             {item.sender}
           </Text>
           {item.count ? <Text {...textScale} style={[styles.threadCount, { color: colors.secondaryText }]}>{item.count}</Text> : null}
+          {item.pinned ? (
+            <SymbolView name="pin.fill" tintColor={colors.pin} size={12} weight="semibold" />
+          ) : null}
           <Text {...textScale} style={[styles.date, { color: item.unread ? tint : colors.secondaryText }]}>
             {item.date}
           </Text>
@@ -525,9 +631,73 @@ function MessageRow({
         <Text {...textScale} numberOfLines={1} style={[styles.preview, { color: colors.secondaryText }]}>
           {item.preview}
         </Text>
+        <InboxAttachmentPreview attachments={attachments} colors={colors} />
       </View>
     </Pressable>
   );
+}
+
+function InboxAttachmentPreview({
+  attachments,
+  colors,
+}: {
+  attachments: NonNullable<Message['attachments']>;
+  colors: ColorSet;
+}) {
+  const firstAttachment = attachments[0];
+
+  if (!firstAttachment) {
+    return null;
+  }
+
+  return (
+    <View style={styles.inboxAttachmentRow}>
+      <View style={[styles.inboxAttachmentChip, { borderColor: colors.attachmentChipBorder }]}>
+        <SymbolView
+          name={getAttachmentPreviewSymbol(firstAttachment)}
+          tintColor={getAttachmentPreviewTint(firstAttachment, colors)}
+          size={17}
+          weight="semibold"
+        />
+        <Text
+          {...textScale}
+          numberOfLines={1}
+          style={[styles.inboxAttachmentName, { color: colors.text }]}>
+          {firstAttachment.name}
+        </Text>
+      </View>
+      {attachments.length > 1 ? (
+        <Text
+          {...textScale}
+          numberOfLines={1}
+          style={[styles.inboxAttachmentMore, { color: colors.secondaryText }]}>
+          & {attachments.length - 1} more
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
+function getAttachmentPreviewSymbol(attachment: NonNullable<Message['attachments']>[number]): ComponentProps<typeof SymbolView>['name'] {
+  const type = attachment.type.toLowerCase();
+
+  if (type.startsWith('image/')) {
+    return 'photo';
+  }
+
+  if (type === 'application/pdf') {
+    return 'doc.richtext';
+  }
+
+  return 'doc';
+}
+
+function getAttachmentPreviewTint(attachment: NonNullable<Message['attachments']>[number], colors: ColorSet) {
+  if (attachment.type.toLowerCase().startsWith('image/')) {
+    return colors.attachmentImage;
+  }
+
+  return colors.secondaryText;
 }
 
 function FloatingDock({
@@ -663,6 +833,7 @@ function SwiftGlassDock({
                   glassEffectId('search-bar', namespaceId),
                   cornerRadius(26),
                   animation(dockAnimation, searchWidth),
+                  // eslint-disable-next-line react-hooks/refs
                   onTapGesture(focusSearch),
                 ]}>
                 <SwiftImage systemName="magnifyingglass" color={colors.text} size={19} />
@@ -708,6 +879,7 @@ function SwiftGlassDock({
                 glassEffectId('right-compose', namespaceId),
                 cornerRadius(26),
                 animation(dockAnimation, searchActive),
+                // eslint-disable-next-line react-hooks/refs
                 onTapGesture(searchActive ? closeSearch : tapCompose),
               ]}
             />
@@ -805,35 +977,22 @@ function GlassSurface({
 type ColorSet = typeof lightColors;
 
 const lightColors = {
-  background: '#F8F8F9',
+  background: '#FFFFFF',
   text: '#050505',
   secondaryText: '#7E7E82',
   tertiaryText: '#8B8B91',
   separator: '#E2E2E5',
   groupDivider: 'rgba(60, 60, 67, 0.16)',
   messageChip: 'rgba(118, 118, 128, 0.16)',
+  attachmentChipBorder: '#C9C9CD',
+  attachmentImage: '#FF3B30',
+  pin: '#FF3B30',
   headerTintTop: 'rgba(255, 255, 255, 1)',
   headerTintMiddle: 'rgba(255, 255, 255, 0.8)',
   headerTintBottom: 'rgba(255, 255, 255, 0)',
   glassTint: 'rgba(255, 255, 255, 0.62)',
   fallbackGlass: 'rgba(255, 255, 255, 0.86)',
   fallbackBorder: 'rgba(255, 255, 255, 0.65)',
-};
-
-const darkColors = {
-  background: '#090909',
-  text: '#F5F5F5',
-  secondaryText: '#A8A8AE',
-  tertiaryText: '#8E8E95',
-  separator: '#2B2B2F',
-  groupDivider: 'rgba(235, 235, 245, 0.16)',
-  messageChip: 'rgba(118, 118, 128, 0.24)',
-  headerTintTop: 'rgba(9, 9, 9, 1)',
-  headerTintMiddle: 'rgba(9, 9, 9, 0.8)',
-  headerTintBottom: 'rgba(9, 9, 9, 0)',
-  glassTint: 'rgba(36, 36, 38, 0.62)',
-  fallbackGlass: 'rgba(36, 36, 38, 0.86)',
-  fallbackBorder: 'rgba(255, 255, 255, 0.1)',
 };
 
 const styles = StyleSheet.create({
@@ -888,6 +1047,17 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     letterSpacing: 0,
     lineHeight: 36,
+  },
+  headerSpinner: {
+    alignSelf: 'flex-start',
+    marginTop: 8,
+  },
+  headerStatus: {
+    fontFamily: systemFont,
+    fontSize: 13,
+    fontWeight: '500',
+    lineHeight: 18,
+    marginTop: 6,
   },
   selectText: {
     fontFamily: systemFont,
@@ -970,6 +1140,41 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '400',
     lineHeight: 18,
+  },
+  inboxAttachmentRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    marginTop: 4,
+    maxWidth: '100%',
+    minHeight: 24,
+    overflow: 'hidden',
+  },
+  inboxAttachmentChip: {
+    alignItems: 'center',
+    borderRadius: 4,
+    borderWidth: StyleSheet.hairlineWidth,
+    flexShrink: 1,
+    flexDirection: 'row',
+    maxWidth: '100%',
+    minHeight: 24,
+    minWidth: 0,
+    paddingHorizontal: 6,
+  },
+  inboxAttachmentName: {
+    flexShrink: 1,
+    fontFamily: systemFont,
+    fontSize: 14,
+    fontWeight: '400',
+    lineHeight: 18,
+    marginLeft: 5,
+  },
+  inboxAttachmentMore: {
+    flexShrink: 0,
+    fontFamily: systemFont,
+    fontSize: 14,
+    fontWeight: '400',
+    lineHeight: 18,
+    marginLeft: 8,
   },
   messageDetailContent: {
     paddingHorizontal: 20,

@@ -3,6 +3,8 @@ import {
   hasFastmailJmapToken,
   saveFastmailJmapToken,
 } from '@/lib/fastmail-token';
+import { setDebugMode, useDebugMode } from '@/lib/debug-mode';
+import { describeJmapError, diagnoseFastmailJmap } from '@/lib/jmap-client';
 import * as Haptics from 'expo-haptics';
 import { Stack, router } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
@@ -14,6 +16,7 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -32,12 +35,16 @@ export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const scheme = useColorScheme();
   const colors = scheme === 'dark' ? darkColors : lightColors;
+  const debugMode = useDebugMode();
   const [configured, setConfigured] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [diagnosticText, setDiagnosticText] = useState('');
   const [tokenInput, setTokenInput] = useState('');
   const [statusText, setStatusText] = useState('');
   const canSave = tokenInput.trim().length > 0 && !saving;
+  const canTest = configured && !saving && !testing;
 
   useEffect(() => {
     let mounted = true;
@@ -85,6 +92,7 @@ export default function SettingsScreen() {
     try {
       await saveFastmailJmapToken(tokenInput);
       setTokenInput('');
+      setDiagnosticText('');
       setConfigured(true);
       setStatusText('Token saved');
     } catch {
@@ -100,6 +108,7 @@ export default function SettingsScreen() {
     try {
       await clearFastmailJmapToken();
       setTokenInput('');
+      setDiagnosticText('');
       setConfigured(false);
       setStatusText('Token cleared');
     } catch {
@@ -107,6 +116,28 @@ export default function SettingsScreen() {
     } finally {
       setSaving(false);
     }
+  };
+  const testConnection = async () => {
+    if (!canTest) {
+      return;
+    }
+
+    pressHaptic();
+    setTesting(true);
+    setDiagnosticText('Testing Fastmail JMAP connection...');
+
+    try {
+      const report = await diagnoseFastmailJmap();
+      setDiagnosticText(formatDiagnosticReport(report.steps));
+    } catch (error) {
+      setDiagnosticText(`ERROR JMAP diagnostic crashed\n${describeJmapError(error, { includeStack: true })}`);
+    } finally {
+      setTesting(false);
+    }
+  };
+  const updateDebugMode = (enabled: boolean) => {
+    pressHaptic();
+    setDebugMode(enabled);
   };
 
   return (
@@ -222,14 +253,69 @@ export default function SettingsScreen() {
               </Pressable>
             </View>
 
+            <Pressable
+              accessibilityRole="button"
+              disabled={!canTest}
+              onPress={testConnection}
+              style={({ pressed }) => [
+                styles.testButton,
+                { backgroundColor: canTest ? colors.secondaryButton : colors.disabledButton },
+                pressed && styles.pressed,
+              ]}>
+              <Text {...textScale} style={[styles.secondaryButtonText, { color: colors.text }]}>
+                {testing ? 'Testing Connection' : 'Test Connection'}
+              </Text>
+            </Pressable>
+
             <Text {...textScale} style={[styles.statusText, { color: colors.secondaryText }]}>
               {statusText || 'No token configured'}
             </Text>
+
+            {diagnosticText ? (
+              <Text
+                {...textScale}
+                selectable
+                style={[
+                  styles.diagnosticText,
+                  {
+                    backgroundColor: colors.inputBackground,
+                    color: colors.text,
+                  },
+                ]}>
+                {diagnosticText}
+              </Text>
+            ) : null}
+          </View>
+
+          <View style={[styles.card, styles.debugCard, { backgroundColor: colors.card }]}>
+            <View style={styles.debugRow}>
+              <View style={styles.debugTextBlock}>
+                <Text {...textScale} style={[styles.cardTitle, { color: colors.text }]}>
+                  Debug mode
+                </Text>
+                <Text {...textScale} style={[styles.cardSubtitle, { color: colors.secondaryText }]}>
+                  Show render diagnostics in messages
+                </Text>
+              </View>
+              <Switch
+                accessibilityLabel="Debug mode"
+                onValueChange={updateDebugMode}
+                trackColor={{ false: colors.switchTrackOff, true: colors.switchTrackOn }}
+                thumbColor={colors.switchThumb}
+                value={debugMode}
+              />
+            </View>
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
     </>
   );
+}
+
+function formatDiagnosticReport(steps: Awaited<ReturnType<typeof diagnoseFastmailJmap>>['steps']) {
+  return steps
+    .map((step) => `${step.status.toUpperCase()} ${step.label}\n${step.detail}`)
+    .join('\n\n');
 }
 
 type ColorSet = typeof lightColors;
@@ -248,6 +334,9 @@ const lightColors = {
   disabledButton: 'rgba(118, 118, 128, 0.2)',
   primaryButtonText: '#FFFFFF',
   secondaryButton: 'rgba(118, 118, 128, 0.14)',
+  switchThumb: '#FFFFFF',
+  switchTrackOff: 'rgba(118, 118, 128, 0.3)',
+  switchTrackOn: tint,
 };
 
 const darkColors: ColorSet = {
@@ -264,6 +353,9 @@ const darkColors: ColorSet = {
   disabledButton: 'rgba(118, 118, 128, 0.24)',
   primaryButtonText: '#FFFFFF',
   secondaryButton: 'rgba(118, 118, 128, 0.28)',
+  switchThumb: '#FFFFFF',
+  switchTrackOff: 'rgba(118, 118, 128, 0.34)',
+  switchTrackOn: tint,
 };
 
 const styles = StyleSheet.create({
@@ -284,6 +376,18 @@ const styles = StyleSheet.create({
   card: {
     borderRadius: 24,
     padding: 18,
+  },
+  debugCard: {
+    marginTop: 14,
+  },
+  debugRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 14,
+    justifyContent: 'space-between',
+  },
+  debugTextBlock: {
+    flex: 1,
   },
   cardHeader: {
     alignItems: 'center',
@@ -347,6 +451,14 @@ const styles = StyleSheet.create({
     minHeight: 46,
     paddingHorizontal: 18,
   },
+  testButton: {
+    alignItems: 'center',
+    borderRadius: 14,
+    justifyContent: 'center',
+    marginTop: 10,
+    minHeight: 46,
+    paddingHorizontal: 16,
+  },
   secondaryButtonText: {
     fontFamily: systemFont,
     fontSize: 15,
@@ -359,6 +471,16 @@ const styles = StyleSheet.create({
     fontWeight: '400',
     lineHeight: 18,
     marginTop: 12,
+  },
+  diagnosticText: {
+    borderRadius: 14,
+    fontFamily: Platform.select({ ios: 'Menlo', default: 'monospace' }),
+    fontSize: 12,
+    fontWeight: '400',
+    lineHeight: 17,
+    marginTop: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
   pressed: {
     opacity: 0.74,

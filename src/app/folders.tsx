@@ -1,8 +1,10 @@
+import { describeJmapError, fetchJmapMailboxes, type JmapMailbox } from '@/lib/jmap-client';
 import * as Haptics from 'expo-haptics';
 import { Stack, router } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
-import { ComponentProps, useState } from 'react';
+import { ComponentProps, useEffect, useState } from 'react';
 import {
+  ActivityIndicator,
   Platform,
   Pressable,
   ScrollView,
@@ -17,10 +19,28 @@ type FolderRow = {
   id: string;
   icon: ComponentProps<typeof SymbolView>['name'];
   label: string;
+  mailboxId?: string;
+  role?: string | null;
+  systemKey?: SystemMailboxKey;
   count?: string;
   color: string;
   muted?: boolean;
 };
+
+type FolderSections = {
+  folders: FolderRow[];
+  mailboxes: FolderRow[];
+};
+
+type SystemMailboxKey =
+  | 'inbox'
+  | 'snoozed'
+  | 'archive'
+  | 'drafts'
+  | 'scheduled'
+  | 'sent'
+  | 'spam'
+  | 'trash';
 
 const textScale = { maxFontSizeMultiplier: 1.12 };
 const systemFont = Platform.select({ ios: 'system-ui', default: undefined });
@@ -28,21 +48,81 @@ const pressHaptic = () => {
   void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 };
 
-const inboxRows: FolderRow[] = [
-  { id: 'primary', icon: 'tray', label: 'Primary', count: '1069', color: '#007AFF' },
-  { id: 'social', icon: 'person.crop.square.stack', label: 'Social', count: '300+', color: '#05B8C8' },
-  { id: 'promotions', icon: 'newspaper', label: 'Promotions', count: '300+', color: '#12A22A' },
-  { id: 'notifications', icon: 'doc.text.magnifyingglass', label: 'Notifications', count: '300+', color: '#FF8A00' },
-  { id: 'forums', icon: 'bubble.left.and.bubble.right', label: 'Forums', count: '32', color: '#8E00D8' },
+const systemMailboxOrder: SystemMailboxKey[] = [
+  'inbox',
+  'snoozed',
+  'archive',
+  'drafts',
+  'scheduled',
+  'sent',
+  'spam',
+  'trash',
 ];
 
-const favoriteRows: FolderRow[] = [
-  { id: 'starred', icon: 'star', label: 'Starred', count: '9', color: '#C7A000' },
-  { id: 'drafts', icon: 'doc.text', label: 'Drafts', count: '56', color: '#08AFC4' },
-  { id: 'sent', icon: 'paperplane', label: 'Sent', color: '#079520' },
-  { id: 'all', icon: 'tray.full', label: 'All Mail', color: '#8E00D8' },
-  { id: 'spam', icon: 'exclamationmark.octagon', label: 'Spam', count: '124', color: '#8A5A2B' },
-  { id: 'trash', icon: 'trash', label: 'Trash', color: '#D77A7A', muted: true },
+const systemMailboxConfig: Record<
+  SystemMailboxKey,
+  {
+    color: string;
+    icon: ComponentProps<typeof SymbolView>['name'];
+    label: string;
+    muted?: boolean;
+  }
+> = {
+  inbox: { color: '#007AFF', icon: 'tray', label: 'Inbox' },
+  snoozed: { color: '#A05CE5', icon: 'clock', label: 'Snoozed' },
+  archive: { color: '#8E00D8', icon: 'archivebox', label: 'Archive' },
+  drafts: { color: '#08AFC4', icon: 'doc.text', label: 'Drafts' },
+  scheduled: { color: '#FF8A00', icon: 'calendar', label: 'Scheduled' },
+  sent: { color: '#079520', icon: 'paperplane', label: 'Sent' },
+  spam: { color: '#8A5A2B', icon: 'exclamationmark.octagon', label: 'Spam' },
+  trash: { color: '#D77A7A', icon: 'trash', label: 'Trash', muted: true },
+};
+
+const systemRoleToKey: Record<string, SystemMailboxKey> = {
+  archive: 'archive',
+  drafts: 'drafts',
+  inbox: 'inbox',
+  junk: 'spam',
+  scheduled: 'scheduled',
+  sent: 'sent',
+  snoozed: 'snoozed',
+  trash: 'trash',
+};
+
+const systemNameToKey: Record<string, SystemMailboxKey> = {
+  allarchive: 'archive',
+  archive: 'archive',
+  drafts: 'drafts',
+  inbox: 'inbox',
+  junk: 'spam',
+  junkmail: 'spam',
+  scheduled: 'scheduled',
+  scheduledmail: 'scheduled',
+  scheduledmessages: 'scheduled',
+  scheduledsend: 'scheduled',
+  sent: 'sent',
+  sentmail: 'sent',
+  snoozed: 'snoozed',
+  snoozedmail: 'snoozed',
+  snoozedmessages: 'snoozed',
+  spam: 'spam',
+  trash: 'trash',
+};
+
+const mockMailboxRows: FolderRow[] = systemMailboxOrder.map((systemKey) => ({
+  color: systemMailboxConfig[systemKey].color,
+  icon: systemMailboxConfig[systemKey].icon,
+  id: systemKey,
+  label: systemMailboxConfig[systemKey].label,
+  muted: systemMailboxConfig[systemKey].muted,
+  role: systemKey === 'spam' ? 'junk' : systemKey,
+  systemKey,
+}));
+
+const mockFolderRows: FolderRow[] = [
+  { id: 'projects', icon: 'folder', label: 'Projects', color: '#707070' },
+  { id: 'receipts', icon: 'folder', label: 'Receipts', color: '#707070' },
+  { id: 'travel', icon: 'folder', label: 'Travel', color: '#707070' },
 ];
 
 export default function FoldersScreen() {
@@ -50,6 +130,47 @@ export default function FoldersScreen() {
   const scheme = useColorScheme();
   const colors = scheme === 'dark' ? darkColors : lightColors;
   const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
+  const [jmapLoading, setJmapLoading] = useState(true);
+  const [jmapStatus, setJmapStatus] = useState('');
+  const [liveSections, setLiveSections] = useState<FolderSections | null>(null);
+  const mailboxRows = liveSections?.mailboxes ?? mockMailboxRows;
+  const folderRows = liveSections?.folders ?? mockFolderRows;
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    Promise.resolve().then(() => {
+      if (!controller.signal.aborted) {
+        setJmapLoading(true);
+        setJmapStatus('');
+      }
+    });
+
+    fetchJmapMailboxes(controller.signal)
+      .then((mailboxes) => {
+        setLiveSections(getFolderSections(mailboxes));
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        setLiveSections(null);
+        setJmapStatus(error instanceof Error && error.name === 'FastmailJmapTokenMissingError'
+          ? ''
+          : `Using mock folders: ${describeJmapError(error)}`);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setJmapLoading(false);
+        }
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, []);
+
   const openCompose = () => {
     pressHaptic();
     router.push('/compose');
@@ -58,13 +179,15 @@ export default function FoldersScreen() {
     pressHaptic();
     router.navigate({ pathname: '/settings' });
   };
-  const openInbox = () => {
+  const openMailbox = (row: FolderRow) => {
     pressHaptic();
-    if (router.canGoBack()) {
-      router.back();
-    } else {
-      router.push('/');
-    }
+    router.push({
+      pathname: '/',
+      params: {
+        mailboxId: row.mailboxId ?? row.id,
+        mailboxName: row.label,
+      },
+    });
   };
   const toggleSection = (id: string) => {
     pressHaptic();
@@ -121,22 +244,32 @@ export default function FoldersScreen() {
           ]}
           showsVerticalScrollIndicator={false}>
           <Text {...textScale} style={[styles.title, { color: colors.text }]}>Folders</Text>
+          {jmapLoading ? (
+            <ActivityIndicator color="#007AFF" size="small" style={styles.statusIndicator} />
+          ) : null}
+          {jmapStatus ? (
+            <Text {...textScale} style={[styles.statusText, { color: colors.secondaryText }]}>
+              {jmapStatus}
+            </Text>
+          ) : null}
 
           <FolderSection
-            collapsed={collapsedSections.inboxes}
+            collapsed={collapsedSections.mailboxes}
             colors={colors}
-            id="inboxes"
-            label="Inboxes"
-            onPrimaryPress={openInbox}
-            rows={inboxRows}
+            id="mailboxes"
+            label="Mailboxes"
+            onRowPress={liveSections ? openMailbox : undefined}
+            rows={mailboxRows}
             onToggle={toggleSection}
           />
           <FolderSection
-            collapsed={collapsedSections.favorites}
+            collapsed={collapsedSections.folders}
             colors={colors}
-            id="favorites"
-            label="Favorites"
-            rows={favoriteRows}
+            emptyLabel="No folders"
+            id="folders"
+            label="Folders"
+            onRowPress={liveSections ? openMailbox : undefined}
+            rows={folderRows}
             onToggle={toggleSection}
           />
         </ScrollView>
@@ -148,17 +281,19 @@ export default function FoldersScreen() {
 function FolderSection({
   collapsed,
   colors,
+  emptyLabel,
   id,
   label,
-  onPrimaryPress,
+  onRowPress,
   onToggle,
   rows,
 }: {
   collapsed?: boolean;
   colors: ColorSet;
+  emptyLabel?: string;
   id: string;
   label: string;
-  onPrimaryPress?: () => void;
+  onRowPress?: (row: FolderRow) => void;
   onToggle: (id: string) => void;
   rows: FolderRow[];
 }) {
@@ -180,19 +315,86 @@ function FolderSection({
       </View>
       {collapsed ? null : (
         <View style={[styles.card, { backgroundColor: colors.card }]}>
-          {rows.map((row, index) => (
-            <FolderListRow
-              colors={colors}
-              isLast={index === rows.length - 1}
-              key={row.id}
-              onPress={row.id === 'primary' ? onPrimaryPress : undefined}
-              row={row}
-            />
-          ))}
+          {rows.length ? (
+            rows.map((row, index) => (
+              <FolderListRow
+                colors={colors}
+                isLast={index === rows.length - 1}
+                key={row.id}
+                onPress={onRowPress ? () => onRowPress(row) : undefined}
+                row={row}
+              />
+            ))
+          ) : (
+            <Text {...textScale} style={[styles.emptyText, { color: colors.secondaryText }]}>
+              {emptyLabel ?? 'No mailboxes'}
+            </Text>
+          )}
         </View>
       )}
     </View>
   );
+}
+
+function getFolderSections(mailboxes: JmapMailbox[]): FolderSections {
+  const systemRows = new Map<SystemMailboxKey, FolderRow>();
+  const folderRows: FolderRow[] = [];
+
+  for (const mailbox of mailboxes) {
+    const systemKey = getSystemMailboxKey(mailbox);
+    const row = mapMailboxToRow(mailbox, systemKey);
+
+    if (systemKey) {
+      systemRows.set(systemKey, row);
+    } else {
+      folderRows.push(row);
+    }
+  }
+
+  return {
+    folders: folderRows,
+    mailboxes: systemMailboxOrder
+      .map((systemKey) => systemRows.get(systemKey))
+      .filter((row): row is FolderRow => Boolean(row)),
+  };
+}
+
+function getSystemMailboxKey(mailbox: JmapMailbox): SystemMailboxKey | null {
+  const role = mailbox.role?.toLowerCase();
+
+  if (role && systemRoleToKey[role]) {
+    return systemRoleToKey[role];
+  }
+
+  return systemNameToKey[normalizeMailboxName(mailbox.name)] ?? null;
+}
+
+function normalizeMailboxName(name: string) {
+  return name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function mapMailboxToRow(mailbox: JmapMailbox, systemKey: SystemMailboxKey | null): FolderRow {
+  const systemConfig = systemKey ? systemMailboxConfig[systemKey] : null;
+
+  return {
+    color: systemConfig?.color ?? '#707070',
+    count: formatMailboxCount(mailbox.unreadEmails || mailbox.totalEmails),
+    icon: systemConfig?.icon ?? 'folder',
+    id: mailbox.id,
+    label: systemConfig?.label ?? mailbox.name,
+    mailboxId: mailbox.id,
+    muted: systemConfig?.muted,
+    role: mailbox.role,
+    systemKey: systemKey ?? undefined,
+  };
+}
+
+function formatMailboxCount(count: number) {
+  if (!count) {
+    return undefined;
+  }
+
+  return count > 300 ? '300+' : String(count);
 }
 
 function FolderListRow({
@@ -283,6 +485,21 @@ const styles = StyleSheet.create({
     lineHeight: 36,
     marginBottom: 22,
   },
+  statusIndicator: {
+    alignSelf: 'flex-start',
+    marginBottom: 14,
+    marginLeft: 18,
+    marginTop: -10,
+  },
+  statusText: {
+    fontFamily: systemFont,
+    fontSize: 13,
+    fontWeight: '500',
+    lineHeight: 18,
+    marginBottom: 14,
+    marginLeft: 18,
+    marginTop: -10,
+  },
   section: {
     marginBottom: 24,
   },
@@ -351,5 +568,13 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '400',
     lineHeight: 21,
+  },
+  emptyText: {
+    fontFamily: systemFont,
+    fontSize: 15,
+    fontWeight: '400',
+    lineHeight: 20,
+    paddingHorizontal: 20,
+    paddingVertical: 16,
   },
 });

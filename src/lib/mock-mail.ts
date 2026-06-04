@@ -1,9 +1,28 @@
+export type MessageAttachment = {
+  blobId?: string;
+  id: string;
+  name: string;
+  previewDataUrl?: string;
+  size: number;
+  type: string;
+};
+
 export type Message = {
   id: string;
   sender: string;
   subject: string;
   preview: string;
   date: string;
+  attachments?: MessageAttachment[];
+  body?: string;
+  hasAttachment?: boolean;
+  htmlBody?: string;
+  fromEmail?: string;
+  keywords?: Record<string, true>;
+  mailboxIds?: Record<string, true>;
+  mailboxName?: string;
+  pinned?: boolean;
+  to?: string;
   unread?: boolean;
   count?: number;
   avatar?: string;
