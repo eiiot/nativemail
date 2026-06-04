@@ -54,6 +54,10 @@ export default function FoldersScreen() {
     pressHaptic();
     router.push('/compose');
   };
+  const openSettings = () => {
+    pressHaptic();
+    router.navigate({ pathname: '/settings' });
+  };
   const openInbox = () => {
     pressHaptic();
     if (router.canGoBack()) {
@@ -80,8 +84,9 @@ export default function FoldersScreen() {
       <Stack.Title>{''}</Stack.Title>
       <Stack.Toolbar placement="left">
         <Stack.Toolbar.Button
+          accessibilityLabel="Settings"
           icon="gearshape"
-          onPress={pressHaptic}
+          onPress={openSettings}
           separateBackground
           tintColor={colors.text}
         />

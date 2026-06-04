@@ -32,6 +32,7 @@ export default function RootLayout() {
           <Stack.Screen name="folders" options={{ animation: 'slide_from_left' }} />
           <Stack.Screen name="index" />
           <Stack.Screen name="message/[id]" />
+          <Stack.Screen name="settings" />
           <Stack.Screen
             name="compose"
             options={{
