@@ -5,12 +5,18 @@ import {
 } from '@/lib/fastmail-token';
 import { setDebugMode, useDebugMode } from '@/lib/debug-mode';
 import { describeJmapError, diagnoseFastmailJmap } from '@/lib/jmap-client';
+import {
+  getNavigationDebugReport,
+  useNavigationDebugTrace,
+  type NavigationDebugTrace,
+} from '@/lib/navigation-debug';
 import * as Haptics from 'expo-haptics';
 import { Stack, router } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
+  Clipboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -36,6 +42,7 @@ export default function SettingsScreen() {
   const scheme = useColorScheme();
   const colors = scheme === 'dark' ? darkColors : lightColors;
   const debugMode = useDebugMode();
+  const navigationDebugTrace = useNavigationDebugTrace();
   const [configured, setConfigured] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -294,7 +301,7 @@ export default function SettingsScreen() {
                   Debug mode
                 </Text>
                 <Text {...textScale} style={[styles.cardSubtitle, { color: colors.secondaryText }]}>
-                  Show render diagnostics in messages
+                  Show render and navigation diagnostics
                 </Text>
               </View>
               <Switch
@@ -305,10 +312,45 @@ export default function SettingsScreen() {
                 value={debugMode}
               />
             </View>
+            {debugMode ? (
+              <NavigationDebugReport colors={colors} trace={navigationDebugTrace} />
+            ) : null}
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
     </>
+  );
+}
+
+function NavigationDebugReport({
+  colors,
+  trace,
+}: {
+  colors: ColorSet;
+  trace: NavigationDebugTrace | null;
+}) {
+  const report = getNavigationDebugReport(trace);
+  const copyReport = () => {
+    Clipboard.setString(report);
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+  };
+
+  return (
+    <View style={[styles.navigationDebugBox, { borderColor: colors.switchTrackOff }]}>
+      <View style={styles.navigationDebugHeader}>
+        <Text {...textScale} style={[styles.navigationDebugLabel, { color: colors.secondaryText }]}>
+          Navigation timing
+        </Text>
+        <Pressable accessibilityRole="button" onPress={copyReport} style={styles.navigationDebugCopyButton}>
+          <Text {...textScale} style={[styles.navigationDebugCopyText, { color: colors.text }]}>
+            Copy
+          </Text>
+        </Pressable>
+      </View>
+      <Text selectable style={[styles.navigationDebugText, { color: colors.secondaryText }]}>
+        {report}
+      </Text>
+    </View>
   );
 }
 
@@ -388,6 +430,41 @@ const styles = StyleSheet.create({
   },
   debugTextBlock: {
     flex: 1,
+  },
+  navigationDebugBox: {
+    borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth,
+    marginTop: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  navigationDebugHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  navigationDebugLabel: {
+    fontFamily: systemFont,
+    fontSize: 12,
+    fontWeight: '600',
+    lineHeight: 16,
+  },
+  navigationDebugCopyButton: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  navigationDebugCopyText: {
+    fontFamily: systemFont,
+    fontSize: 12,
+    fontWeight: '600',
+    lineHeight: 16,
+  },
+  navigationDebugText: {
+    fontFamily: Platform.select({ ios: 'Menlo', default: 'monospace' }),
+    fontSize: 11,
+    fontWeight: '400',
+    lineHeight: 15,
   },
   cardHeader: {
     alignItems: 'center',

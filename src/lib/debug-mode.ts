@@ -27,3 +27,7 @@ export function setDebugMode(enabled: boolean) {
 export function useDebugMode() {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
+
+export function isDebugModeEnabled() {
+  return debugModeEnabled;
+}

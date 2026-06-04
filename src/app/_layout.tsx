@@ -1,4 +1,6 @@
+import { hydrateMailboxSnapshotFromCache } from '@/lib/mail-store';
 import { Stack, ThemeProvider, DarkTheme, DefaultTheme } from 'expo-router';
+import { useEffect } from 'react';
 import { Text, TextInput, useColorScheme, type TextInputProps, type TextProps } from 'react-native';
 import { KeyboardProvider } from 'react-native-keyboard-controller';
 
@@ -24,6 +26,10 @@ export const unstable_settings = {
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
+
+  useEffect(() => {
+    void hydrateMailboxSnapshotFromCache().catch(() => {});
+  }, []);
 
   return (
     <KeyboardProvider>

@@ -1,10 +1,12 @@
 import { describeJmapError, fetchJmapMailboxes, type JmapMailbox } from '@/lib/jmap-client';
+import { markNavigationTrace, startNavigationTrace } from '@/lib/navigation-debug';
 import * as Haptics from 'expo-haptics';
-import { Stack, router } from 'expo-router';
+import { Stack, router, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { ComponentProps, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
+  InteractionManager,
   Platform,
   Pressable,
   ScrollView,
@@ -47,6 +49,7 @@ const systemFont = Platform.select({ ios: 'system-ui', default: undefined });
 const pressHaptic = () => {
   void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 };
+const prefetchedMailboxTimes = new Map<string, number>();
 
 const systemMailboxOrder: SystemMailboxKey[] = [
   'inbox',
@@ -126,6 +129,10 @@ const mockFolderRows: FolderRow[] = [
 ];
 
 export default function FoldersScreen() {
+  const { returnMailboxId, returnMailboxRole } = useLocalSearchParams<{
+    returnMailboxId?: string;
+    returnMailboxRole?: string;
+  }>();
   const insets = useSafeAreaInsets();
   const scheme = useColorScheme();
   const colors = scheme === 'dark' ? darkColors : lightColors;
@@ -170,6 +177,25 @@ export default function FoldersScreen() {
       controller.abort();
     };
   }, []);
+  useEffect(() => {
+    if (returnMailboxId || returnMailboxRole) {
+      return;
+    }
+
+    const inboxRow = liveSections?.mailboxes.find((row) => row.systemKey === 'inbox' || row.role === 'inbox');
+
+    if (!inboxRow) {
+      return;
+    }
+
+    const prefetchTask = InteractionManager.runAfterInteractions(() => {
+      prefetchMailbox(inboxRow, 'folders idle');
+    });
+
+    return () => {
+      prefetchTask.cancel();
+    };
+  }, [liveSections, returnMailboxId, returnMailboxRole]);
 
   const openCompose = () => {
     pressHaptic();
@@ -181,13 +207,38 @@ export default function FoldersScreen() {
   };
   const openMailbox = (row: FolderRow) => {
     pressHaptic();
+    const mailboxId = row.mailboxId ?? row.id;
+    const mailboxRole = row.role ?? row.systemKey ?? null;
+    const traceDetail = getFolderNavigationTraceDetail(row);
+    const canReturn = router.canGoBack();
+    const isReturnMailbox =
+      returnMailboxId === mailboxId || Boolean(returnMailboxRole && returnMailboxRole === mailboxRole);
+
+    markNavigationTrace('press released', traceDetail);
+    markNavigationTrace(
+      'router decision',
+      `canGoBack=${canReturn} isReturnMailbox=${isReturnMailbox} returnId=${returnMailboxId ?? 'none'} returnRole=${returnMailboxRole ?? 'none'}`,
+    );
+
+    if (canReturn && isReturnMailbox) {
+      markNavigationTrace('router.back start', traceDetail);
+      router.back();
+      markNavigationTrace('router.back returned', traceDetail);
+      return;
+    }
+
+    markNavigationTrace('router.push start', traceDetail);
     router.push({
       pathname: '/',
       params: {
-        mailboxId: row.mailboxId ?? row.id,
+        mailboxId,
         mailboxName: row.label,
       },
     });
+    markNavigationTrace('router.push returned', traceDetail);
+  };
+  const beginMailboxPress = (row: FolderRow) => {
+    startNavigationTrace('Folders -> Mailbox', getFolderNavigationTraceDetail(row));
   };
   const toggleSection = (id: string) => {
     pressHaptic();
@@ -258,6 +309,7 @@ export default function FoldersScreen() {
             colors={colors}
             id="mailboxes"
             label="Mailboxes"
+            onRowPressIn={liveSections ? beginMailboxPress : undefined}
             onRowPress={liveSections ? openMailbox : undefined}
             rows={mailboxRows}
             onToggle={toggleSection}
@@ -268,6 +320,7 @@ export default function FoldersScreen() {
             emptyLabel="No folders"
             id="folders"
             label="Folders"
+            onRowPressIn={liveSections ? beginMailboxPress : undefined}
             onRowPress={liveSections ? openMailbox : undefined}
             rows={folderRows}
             onToggle={toggleSection}
@@ -285,6 +338,7 @@ function FolderSection({
   id,
   label,
   onRowPress,
+  onRowPressIn,
   onToggle,
   rows,
 }: {
@@ -294,6 +348,7 @@ function FolderSection({
   id: string;
   label: string;
   onRowPress?: (row: FolderRow) => void;
+  onRowPressIn?: (row: FolderRow) => void;
   onToggle: (id: string) => void;
   rows: FolderRow[];
 }) {
@@ -321,6 +376,7 @@ function FolderSection({
                 colors={colors}
                 isLast={index === rows.length - 1}
                 key={row.id}
+                onPressIn={onRowPressIn ? () => onRowPressIn(row) : undefined}
                 onPress={onRowPress ? () => onRowPress(row) : undefined}
                 row={row}
               />
@@ -357,6 +413,41 @@ function getFolderSections(mailboxes: JmapMailbox[]): FolderSections {
       .map((systemKey) => systemRows.get(systemKey))
       .filter((row): row is FolderRow => Boolean(row)),
   };
+}
+
+function getFolderNavigationTraceDetail(row: FolderRow) {
+  const mailboxId = row.mailboxId ?? row.id;
+  const mailboxRole = row.role ?? row.systemKey ?? null;
+  const prefetchedAt = prefetchedMailboxTimes.get(mailboxId);
+  const prefetchDetail = prefetchedAt
+    ? `prefetched=${Math.round(nowMs() - prefetchedAt)}ms`
+    : 'prefetched=no';
+
+  return `mailbox=${row.label} id=${mailboxId} role=${mailboxRole ?? 'none'} ${prefetchDetail}`;
+}
+
+function getMailboxHref(row: FolderRow) {
+  return {
+    pathname: '/' as const,
+    params: {
+      mailboxId: row.mailboxId ?? row.id,
+      mailboxName: row.label,
+    },
+  };
+}
+
+function prefetchMailbox(row: FolderRow, reason: string) {
+  const mailboxId = row.mailboxId ?? row.id;
+  const traceDetail = getFolderNavigationTraceDetail(row);
+
+  markNavigationTrace(`router.prefetch ${reason} start`, traceDetail);
+  router.prefetch(getMailboxHref(row));
+  prefetchedMailboxTimes.set(mailboxId, nowMs());
+  markNavigationTrace(`router.prefetch ${reason} returned`, traceDetail);
+}
+
+function nowMs() {
+  return globalThis.performance?.now?.() ?? Date.now();
 }
 
 function getSystemMailboxKey(mailbox: JmapMailbox): SystemMailboxKey | null {
@@ -401,11 +492,13 @@ function FolderListRow({
   colors,
   isLast,
   onPress,
+  onPressIn,
   row,
 }: {
   colors: ColorSet;
   isLast: boolean;
   onPress?: () => void;
+  onPressIn?: () => void;
   row: FolderRow;
 }) {
   const content = (
@@ -440,7 +533,10 @@ function FolderListRow({
   );
 
   return onPress ? (
-    <Pressable onPress={onPress} style={({ pressed }) => [styles.folderRow, pressed && styles.pressed]}>
+    <Pressable
+      onPress={onPress}
+      onPressIn={onPressIn}
+      style={({ pressed }) => [styles.folderRow, pressed && styles.pressed]}>
       {content}
     </Pressable>
   ) : (
