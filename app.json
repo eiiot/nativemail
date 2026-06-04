@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "fastmail-glass",
+    "name": "Fastmail Glass",
     "slug": "fastmail-glass",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -8,7 +8,16 @@
     "scheme": "fastmailglass",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "bundleIdentifier": "dev.tuft.fastmailglass",
+      "icon": "./assets/expo.icon",
+      "supportsTablet": true,
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true,
+          "NSAllowsLocalNetworking": true
+        }
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -36,9 +45,21 @@
         }
       ]
     ],
+    "owner": "elioth",
     "experiments": {
       "typedRoutes": true,
-      "reactCompiler": true
+      "reactCompiler": true,
+      "inlineModules": {
+        "watchedDirectories": [
+          "src"
+        ]
+      }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "41b01e33-b640-4793-a841-7df5a63cf05d"
+      }
     }
   }
 }
