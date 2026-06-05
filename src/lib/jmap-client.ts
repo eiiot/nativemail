@@ -8,6 +8,7 @@ import {
     EmailCapability,
     JMAPClient,
     Mailbox,
+    Thread,
     isErrorInvocation,
     type EmailAddress,
     type EmailBodyPart,
@@ -15,6 +16,7 @@ import {
     type Id,
     type MailboxObject,
     type PatchObject,
+    type ThreadObject,
     type Transport,
     type TransportRequestOptions,
 } from 'jmap-kit'
@@ -81,6 +83,11 @@ const emailMetadataProperties = [
     'keywords',
 ] satisfies (keyof EmailObject)[]
 
+const threadProperties = [
+    'id',
+    'emailIds',
+] satisfies (keyof ThreadObject)[]
+
 export type JmapMailbox = Pick<
     MailboxObject,
     | 'id'
@@ -98,8 +105,15 @@ export type JmapMailboxSnapshot = {
     mailboxes: JmapMailbox[]
     messages: Message[]
     position?: number
+    threads?: Record<string, JmapThread>
     total?: number | null
     username: string
+}
+
+export type JmapThread = {
+    emailIds: Id[]
+    id: Id
+    messages: Message[]
 }
 
 export type JmapDiagnosticStep = {
@@ -219,13 +233,26 @@ export async function fetchJmapMailboxSnapshot({
                   signal
               )
             : null
+        const threads = page
+            ? await getThreadsForMessages(
+                  client,
+                  accountId,
+                  page.messages,
+                  mailboxes,
+                  signal
+              )
+            : {}
+        const messages = page?.messages
+            ? applyThreadCountsToMessages(page.messages, threads)
+            : []
 
         return {
             accountId,
             mailbox,
             mailboxes,
-            messages: page?.messages ?? [],
+            messages,
             position: page?.position ?? position,
+            threads,
             total: page?.total ?? null,
             username: client.username,
         }
@@ -275,6 +302,53 @@ export async function fetchJmapMessageBody(
         return message
             ? await getEmailBody(client, accountId, token, message, signal)
             : null
+    } finally {
+        await client.disconnect()
+    }
+}
+
+export async function fetchJmapThreadMessages({
+    messageId,
+    signal,
+    threadId,
+}: {
+    messageId: string
+    signal?: AbortSignal
+    threadId?: string | null
+}): Promise<Message[]> {
+    const { accountId, client } = await createFastmailJmapClient(signal)
+
+    try {
+        let resolvedThreadId = threadId ?? null
+
+        if (!resolvedThreadId) {
+            const messages = await getEmails(
+                client,
+                accountId,
+                [messageId],
+                emailSummaryProperties,
+                signal
+            )
+
+            resolvedThreadId = messages[0]?.threadId ?? null
+
+            if (!resolvedThreadId) {
+                return messages.map((email) => mapEmailToMessage(email))
+            }
+        }
+
+        const thread = await getThread(client, accountId, resolvedThreadId, signal)
+        const emailIds = thread?.emailIds?.length ? thread.emailIds : [messageId]
+        const mailboxes = await getMailboxes(client, accountId, signal)
+        const emails = await getEmails(
+            client,
+            accountId,
+            emailIds,
+            emailSummaryProperties,
+            signal
+        )
+
+        return emails.map((email) => mapEmailToMessage(email, mailboxes))
     } finally {
         await client.disconnect()
     }
@@ -614,10 +688,90 @@ async function getMailboxMessagesPage(
     }
 
     return {
-        messages: sortEmailsByQuery(emails, emailIds).map(mapEmailToMessage),
+        messages: sortEmailsByQuery(emails, emailIds).map((email) =>
+            mapEmailToMessage(email)
+        ),
         position: responsePosition,
         total,
     }
+}
+
+async function getThreadsForMessages(
+    client: JMAPClient,
+    accountId: Id,
+    messages: Message[],
+    mailboxes: JmapMailbox[],
+    signal?: AbortSignal
+): Promise<Record<string, JmapThread>> {
+    const threadIds = Array.from(
+        new Set(messages.map((message) => message.threadId).filter(Boolean))
+    ) as Id[]
+
+    if (!threadIds.length) {
+        return {}
+    }
+
+    const threads = await getThreads(client, accountId, threadIds, signal)
+    const knownMessagesById = new Map(
+        messages.map((message) => [message.id, message])
+    )
+    const missingEmailIds = Array.from(
+        new Set(
+            threads.flatMap((thread) =>
+                (thread.emailIds ?? []).filter(
+                    (emailId) => !knownMessagesById.has(emailId)
+                )
+            )
+        )
+    )
+    const missingEmails = missingEmailIds.length
+        ? await getEmails(
+              client,
+              accountId,
+              missingEmailIds,
+              emailSummaryProperties,
+              signal
+          )
+        : []
+
+    for (const email of missingEmails) {
+        knownMessagesById.set(email.id, mapEmailToMessage(email, mailboxes))
+    }
+
+    const threadMap: Record<string, JmapThread> = {}
+
+    for (const thread of threads) {
+        const emailIds = thread.emailIds ?? []
+
+        threadMap[thread.id] = {
+            emailIds,
+            id: thread.id,
+            messages: emailIds
+                .map((emailId) => knownMessagesById.get(emailId))
+                .filter((message): message is Message => Boolean(message)),
+        }
+    }
+
+    return threadMap
+}
+
+function applyThreadCountsToMessages(
+    messages: Message[],
+    threads: Record<string, JmapThread>
+) {
+    return messages.map((message) => {
+        const threadId = message.threadId
+        const thread = threadId ? threads[threadId] : null
+
+        if (!thread || thread.emailIds.length <= 1) {
+            return message
+        }
+
+        return {
+            ...message,
+            count: thread.emailIds.length,
+        }
+    })
 }
 
 async function getEmails(
@@ -671,6 +825,50 @@ async function getEmails(
     }
 
     return sortEmailsByQuery(emails, ids)
+}
+
+async function getThread(
+    client: JMAPClient,
+    accountId: Id,
+    threadId: Id,
+    signal?: AbortSignal
+) {
+    const threads = await getThreads(client, accountId, [threadId], signal)
+
+    return threads[0] ?? null
+}
+
+async function getThreads(
+    client: JMAPClient,
+    accountId: Id,
+    threadIds: Id[],
+    signal?: AbortSignal
+) {
+    const response = await client
+        .createRequestBuilder()
+        .add(
+            Thread.request.get({
+                accountId,
+                ids: threadIds,
+                properties: threadProperties,
+            })
+        )
+        .send(signal)
+    let threads: ThreadObject[] = []
+
+    for (const invocation of response.methodResponses) {
+        if (isErrorInvocation(invocation)) {
+            throw new Error(
+                `JMAP ${invocation.type}: ${JSON.stringify(invocation.arguments)}`
+            )
+        }
+
+        if (invocation.name === 'Thread/get') {
+            threads = invocation.getArgument('list') as ThreadObject[]
+        }
+    }
+
+    return sortThreadsByQuery(threads, threadIds)
 }
 
 async function moveJmapEmailToRole(
@@ -990,7 +1188,15 @@ function sortEmailsByQuery(emails: EmailObject[], ids: Id[]) {
     )
 }
 
-function mapEmailToMessage(email: EmailObject): Message {
+function sortThreadsByQuery(threads: ThreadObject[], ids: Id[]) {
+    const order = new Map(ids.map((id, index) => [id, index]))
+
+    return [...threads].sort(
+        (a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0)
+    )
+}
+
+function mapEmailToMessage(email: EmailObject, mailboxes?: JmapMailbox[]): Message {
     const from = email.from?.[0] ?? email.sender?.[0] ?? null
     const sender = formatAddress(from)
     const attachments = getDownloadableAttachments(email)
@@ -1007,13 +1213,61 @@ function mapEmailToMessage(email: EmailObject): Message {
         id: email.id,
         keywords: normalizeTrueRecord(email.keywords),
         mailboxIds: normalizeTrueRecord(email.mailboxIds),
-        mailboxName: 'Inbox',
+        mailboxName: getMessageMailboxName(email, mailboxes) ?? 'Inbox',
         pinned: email.keywords?.$flagged === true,
         preview: email.preview ?? '',
         sender,
         subject: email.subject?.trim() || '(No subject)',
+        threadId: email.threadId,
         to: email.to?.map(formatAddress).join(', '),
         unread: email.keywords?.['$seen'] !== true,
+    }
+}
+
+function getMessageMailboxName(email: EmailObject, mailboxes?: JmapMailbox[]) {
+    if (!mailboxes?.length) {
+        return null
+    }
+
+    const mailboxIds = normalizeTrueRecord(email.mailboxIds)
+    const messageMailboxes = mailboxes.filter((mailbox) => mailboxIds[mailbox.id])
+    const priorityRoles = [
+        'inbox',
+        'sent',
+        'archive',
+        'drafts',
+        'scheduled',
+        'junk',
+        'trash',
+    ]
+
+    for (const role of priorityRoles) {
+        const mailbox = messageMailboxes.find((candidate) => candidate.role === role)
+
+        if (mailbox) {
+            return getSystemMailboxLabel(mailbox)
+        }
+    }
+
+    return messageMailboxes[0]?.name ?? null
+}
+
+function getSystemMailboxLabel(mailbox: JmapMailbox) {
+    switch (mailbox.role) {
+        case 'inbox':
+            return 'Inbox'
+        case 'sent':
+            return 'Sent'
+        case 'archive':
+            return 'Archive'
+        case 'drafts':
+            return 'Drafts'
+        case 'junk':
+            return 'Spam'
+        case 'trash':
+            return 'Trash'
+        default:
+            return mailbox.name
     }
 }
 

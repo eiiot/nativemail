@@ -38,7 +38,7 @@ export function GradientAvatar({
   );
 }
 
-function avatarGradient(color: string): [string, string, string] {
+export function avatarGradient(color: string): [string, string, string] {
   return [
     mixHex(color, '#FFFFFF', 0.26),
     color,

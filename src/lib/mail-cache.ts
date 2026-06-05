@@ -1,10 +1,10 @@
 import { openDatabaseAsync, type SQLiteDatabase } from 'expo-sqlite';
 
-import type { JmapMailbox, JmapMailboxSnapshot, JmapMessageBody } from '@/lib/jmap-client';
+import type { JmapMailbox, JmapMailboxSnapshot, JmapMessageBody, JmapThread } from '@/lib/jmap-client';
 import type { Message, MessageAttachment } from '@/lib/mock-mail';
 
 const DATABASE_NAME = 'nativemail-cache.db';
-const CACHE_SCHEMA_VERSION = 1;
+const CACHE_SCHEMA_VERSION = 2;
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS mailboxes (
     account_id TEXT NOT NULL,
@@ -34,6 +34,7 @@ const SCHEMA_SQL = `
     pinned INTEGER NOT NULL DEFAULT 0,
     unread INTEGER NOT NULL DEFAULT 0,
     count INTEGER,
+    thread_id TEXT,
     keywords_json TEXT NOT NULL DEFAULT '{}',
     mailbox_ids_json TEXT NOT NULL DEFAULT '{}',
     attachments_json TEXT NOT NULL DEFAULT '[]',
@@ -41,6 +42,23 @@ const SCHEMA_SQL = `
     html_body TEXT,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (account_id, id)
+  );
+
+  CREATE TABLE IF NOT EXISTS threads (
+    account_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    email_ids_json TEXT NOT NULL DEFAULT '[]',
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (account_id, id)
+  );
+
+  CREATE TABLE IF NOT EXISTS thread_emails (
+    account_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    email_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (account_id, thread_id, email_id)
   );
 
   CREATE TABLE IF NOT EXISTS mailbox_emails (
@@ -61,6 +79,8 @@ const SCHEMA_SQL = `
 
   CREATE INDEX IF NOT EXISTS mailbox_emails_order_idx
     ON mailbox_emails(account_id, mailbox_id, position);
+  CREATE INDEX IF NOT EXISTS thread_emails_order_idx
+    ON thread_emails(account_id, thread_id, position);
   CREATE INDEX IF NOT EXISTS emails_updated_idx
     ON emails(updated_at);
   PRAGMA user_version = ${CACHE_SCHEMA_VERSION};
@@ -94,11 +114,18 @@ type EmailRow = {
   pinned: number;
   unread: number;
   count: number | null;
+  thread_id: string | null;
   keywords_json: string;
   mailbox_ids_json: string;
   attachments_json: string;
   body: string | null;
   html_body: string | null;
+};
+
+type ThreadRow = {
+  account_id: string;
+  id: string;
+  email_ids_json: string;
 };
 
 export async function readCachedMailboxSnapshot({
@@ -117,6 +144,7 @@ export async function readCachedMailboxSnapshot({
     getCachedMailboxes(db, mailbox.account_id),
     getCachedMailboxMessages(db, mailbox.account_id, mailbox.id),
   ]);
+  const threads = await getCachedThreads(db, mailbox.account_id);
 
   if (!mailboxes.length && !messages.length) {
     return null;
@@ -127,6 +155,7 @@ export async function readCachedMailboxSnapshot({
     mailbox: rowToMailbox(mailbox),
     mailboxes: mailboxes.map(rowToMailbox),
     messages,
+    threads,
     username: '',
   };
 }
@@ -137,32 +166,7 @@ export async function writeCachedMailboxSnapshot(snapshot: JmapMailboxSnapshot) 
   const mailboxId = snapshot.mailbox?.id;
 
   await db.withExclusiveTransactionAsync(async (txn) => {
-    for (const mailbox of snapshot.mailboxes) {
-      await txn.runAsync(
-        `INSERT INTO mailboxes (
-          account_id, id, name, parent_id, role, sort_order, total_emails, unread_emails, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(account_id, id) DO UPDATE SET
-          name = excluded.name,
-          parent_id = excluded.parent_id,
-          role = excluded.role,
-          sort_order = excluded.sort_order,
-          total_emails = excluded.total_emails,
-          unread_emails = excluded.unread_emails,
-          updated_at = excluded.updated_at`,
-        [
-          snapshot.accountId,
-          mailbox.id,
-          mailbox.name,
-          mailbox.parentId ?? null,
-          mailbox.role ?? null,
-          mailbox.sortOrder ?? null,
-          mailbox.totalEmails ?? null,
-          mailbox.unreadEmails ?? null,
-          now,
-        ],
-      );
-    }
+    await writeCachedMailboxes(txn, snapshot, now);
 
     if (mailboxId) {
       await txn.runAsync(
@@ -171,33 +175,112 @@ export async function writeCachedMailboxSnapshot(snapshot: JmapMailboxSnapshot) 
       );
     }
 
-    for (const [position, message] of snapshot.messages.entries()) {
-      await writeCachedMessage(txn, snapshot.accountId, message, now);
+    await writeCachedMailboxMessages(txn, snapshot, now, 0);
+    await writeCachedThreads(txn, snapshot, now);
+    await writeCachedSnapshotState(txn, snapshot, now, snapshot.messages.length);
+  });
+}
 
-      if (mailboxId) {
-        await txn.runAsync(
-          `INSERT OR REPLACE INTO mailbox_emails (
-            account_id, mailbox_id, email_id, position, updated_at
-          ) VALUES (?, ?, ?, ?, ?)`,
-          [snapshot.accountId, mailboxId, message.id, position, now],
-        );
-      }
-    }
+export async function writeCachedMailboxPage(snapshot: JmapMailboxSnapshot) {
+  const db = await getMailCacheDatabase();
+  const now = Date.now();
+  const startPosition = snapshot.position ?? 0;
 
-    await txn.runAsync(
-      `INSERT OR REPLACE INTO sync_state (scope, account_id, state, updated_at)
-       VALUES (?, ?, ?, ?)`,
+  await db.withExclusiveTransactionAsync(async (txn) => {
+    await writeCachedMailboxes(txn, snapshot, now);
+    await writeCachedMailboxMessages(txn, snapshot, now, startPosition);
+    await writeCachedThreads(txn, snapshot, now);
+    await writeCachedSnapshotState(txn, snapshot, now, startPosition + snapshot.messages.length);
+  });
+}
+
+async function writeCachedMailboxes(
+  db: SQLiteDatabase,
+  snapshot: JmapMailboxSnapshot,
+  updatedAt: number,
+) {
+  for (const mailbox of snapshot.mailboxes) {
+    await db.runAsync(
+      `INSERT INTO mailboxes (
+        account_id, id, name, parent_id, role, sort_order, total_emails, unread_emails, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, id) DO UPDATE SET
+        name = excluded.name,
+        parent_id = excluded.parent_id,
+        role = excluded.role,
+        sort_order = excluded.sort_order,
+        total_emails = excluded.total_emails,
+        unread_emails = excluded.unread_emails,
+        updated_at = excluded.updated_at`,
       [
-        mailboxId ? `mailbox:${mailboxId}:snapshot` : 'mailbox:unknown:snapshot',
         snapshot.accountId,
-        JSON.stringify({
-          messageCount: snapshot.messages.length,
-          username: snapshot.username,
-        }),
-        now,
+        mailbox.id,
+        mailbox.name,
+        mailbox.parentId ?? null,
+        mailbox.role ?? null,
+        mailbox.sortOrder ?? null,
+        mailbox.totalEmails ?? null,
+        mailbox.unreadEmails ?? null,
+        updatedAt,
       ],
     );
-  });
+  }
+}
+
+async function writeCachedMailboxMessages(
+  db: SQLiteDatabase,
+  snapshot: JmapMailboxSnapshot,
+  updatedAt: number,
+  startPosition: number,
+) {
+  const mailboxId = snapshot.mailbox?.id;
+
+  for (const [index, message] of snapshot.messages.entries()) {
+    await writeCachedMessage(db, snapshot.accountId, message, updatedAt);
+
+    if (mailboxId) {
+      await db.runAsync(
+        `INSERT OR REPLACE INTO mailbox_emails (
+          account_id, mailbox_id, email_id, position, updated_at
+        ) VALUES (?, ?, ?, ?, ?)`,
+        [snapshot.accountId, mailboxId, message.id, startPosition + index, updatedAt],
+      );
+    }
+  }
+}
+
+async function writeCachedThreads(
+  db: SQLiteDatabase,
+  snapshot: JmapMailboxSnapshot,
+  updatedAt: number,
+) {
+  for (const thread of Object.values(snapshot.threads ?? {})) {
+    await writeCachedThread(db, snapshot.accountId, thread, updatedAt);
+  }
+}
+
+async function writeCachedSnapshotState(
+  db: SQLiteDatabase,
+  snapshot: JmapMailboxSnapshot,
+  updatedAt: number,
+  messageCount: number,
+) {
+  const mailboxId = snapshot.mailbox?.id;
+
+  await db.runAsync(
+    `INSERT OR REPLACE INTO sync_state (scope, account_id, state, updated_at)
+     VALUES (?, ?, ?, ?)`,
+    [
+      mailboxId ? `mailbox:${mailboxId}:snapshot` : 'mailbox:unknown:snapshot',
+      snapshot.accountId,
+      JSON.stringify({
+        messageCount,
+        total: snapshot.total,
+        username: snapshot.username,
+      }),
+      updatedAt,
+    ],
+  );
 }
 
 export async function updateCachedEmail(
@@ -342,8 +425,46 @@ async function migrate(db: SQLiteDatabase) {
   }
 
   await db.withExclusiveTransactionAsync(async (txn) => {
-    await txn.execAsync(SCHEMA_SQL);
+    if (currentVersion < 1) {
+      await txn.execAsync(SCHEMA_SQL);
+      return;
+    }
+
+    if (currentVersion < 2) {
+      await ensureEmailThreadIdColumn(txn);
+      await txn.execAsync(`
+        CREATE TABLE IF NOT EXISTS threads (
+          account_id TEXT NOT NULL,
+          id TEXT NOT NULL,
+          email_ids_json TEXT NOT NULL DEFAULT '[]',
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (account_id, id)
+        );
+
+        CREATE TABLE IF NOT EXISTS thread_emails (
+          account_id TEXT NOT NULL,
+          thread_id TEXT NOT NULL,
+          email_id TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (account_id, thread_id, email_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS thread_emails_order_idx
+          ON thread_emails(account_id, thread_id, position);
+        PRAGMA user_version = ${CACHE_SCHEMA_VERSION};
+      `);
+    }
   });
+}
+
+async function ensureEmailThreadIdColumn(db: SQLiteDatabase) {
+  const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(emails)');
+  const hasThreadIdColumn = columns.some((column) => column.name === 'thread_id');
+
+  if (!hasThreadIdColumn) {
+    await db.execAsync('ALTER TABLE emails ADD COLUMN thread_id TEXT');
+  }
 }
 
 async function getCachedMailbox(db: SQLiteDatabase, mailboxId?: string | null) {
@@ -398,6 +519,43 @@ async function getCachedMailboxMessages(db: SQLiteDatabase, accountId: string, m
   return rows.map(rowToMessage);
 }
 
+async function getCachedThreads(db: SQLiteDatabase, accountId: string) {
+  const rows = await db.getAllAsync<ThreadRow>(
+    'SELECT * FROM threads WHERE account_id = ?',
+    accountId,
+  );
+  const threads: Record<string, JmapThread> = {};
+
+  for (const row of rows) {
+    const emailIds = parseJsonArray<string>(row.email_ids_json);
+    const messages = await getCachedThreadMessages(db, accountId, row.id);
+
+    threads[row.id] = {
+      emailIds,
+      id: row.id,
+      messages,
+    };
+  }
+
+  return threads;
+}
+
+async function getCachedThreadMessages(db: SQLiteDatabase, accountId: string, threadId: string) {
+  const rows = await db.getAllAsync<EmailRow>(
+    `SELECT emails.*
+     FROM thread_emails
+     JOIN emails
+       ON emails.account_id = thread_emails.account_id
+      AND emails.id = thread_emails.email_id
+     WHERE thread_emails.account_id = ?
+       AND thread_emails.thread_id = ?
+     ORDER BY thread_emails.position ASC`,
+    [accountId, threadId],
+  );
+
+  return rows.map(rowToMessage);
+}
+
 async function writeCachedMessage(
   db: SQLiteDatabase,
   accountId: string,
@@ -408,8 +566,8 @@ async function writeCachedMessage(
     `INSERT INTO emails (
       account_id, id, sender, subject, preview, date, avatar, avatar_color,
       from_email, to_addresses, has_attachment, pinned, unread, count,
-      keywords_json, mailbox_ids_json, attachments_json, body, html_body, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      thread_id, keywords_json, mailbox_ids_json, attachments_json, body, html_body, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(account_id, id) DO UPDATE SET
       sender = excluded.sender,
       subject = excluded.subject,
@@ -423,6 +581,7 @@ async function writeCachedMessage(
       pinned = excluded.pinned,
       unread = excluded.unread,
       count = excluded.count,
+      thread_id = excluded.thread_id,
       keywords_json = excluded.keywords_json,
       mailbox_ids_json = excluded.mailbox_ids_json,
       attachments_json = excluded.attachments_json,
@@ -444,6 +603,7 @@ async function writeCachedMessage(
       boolToInt(Boolean(message.pinned)),
       boolToInt(Boolean(message.unread)),
       message.count ?? null,
+      message.threadId ?? null,
       JSON.stringify(message.keywords ?? {}),
       JSON.stringify(message.mailboxIds ?? {}),
       JSON.stringify(message.attachments ?? []),
@@ -452,6 +612,38 @@ async function writeCachedMessage(
       updatedAt,
     ],
   );
+}
+
+async function writeCachedThread(
+  db: SQLiteDatabase,
+  accountId: string,
+  thread: JmapThread,
+  updatedAt: number,
+) {
+  await db.runAsync(
+    `INSERT INTO threads (
+      account_id, id, email_ids_json, updated_at
+    ) VALUES (?, ?, ?, ?)
+    ON CONFLICT(account_id, id) DO UPDATE SET
+      email_ids_json = excluded.email_ids_json,
+      updated_at = excluded.updated_at`,
+    [accountId, thread.id, JSON.stringify(thread.emailIds), updatedAt],
+  );
+
+  await db.runAsync(
+    'DELETE FROM thread_emails WHERE account_id = ? AND thread_id = ?',
+    [accountId, thread.id],
+  );
+
+  for (const [position, message] of thread.messages.entries()) {
+    await writeCachedMessage(db, accountId, message, updatedAt);
+    await db.runAsync(
+      `INSERT OR REPLACE INTO thread_emails (
+        account_id, thread_id, email_id, position, updated_at
+      ) VALUES (?, ?, ?, ?, ?)`,
+      [accountId, thread.id, message.id, position, updatedAt],
+    );
+  }
 }
 
 function rowToMailbox(row: MailboxRow): JmapMailbox {
@@ -486,6 +678,7 @@ function rowToMessage(row: EmailRow): Message {
     preview: row.preview,
     sender: row.sender,
     subject: row.subject,
+    threadId: row.thread_id ?? undefined,
     to: row.to_addresses ?? undefined,
     unread: row.unread === 1,
   };

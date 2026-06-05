@@ -1,9 +1,10 @@
 import { ProgressiveBlurView } from '@/components/progressive-blur-view';
-import { GradientAvatar } from '@/components/gradient-avatar';
+import { GradientAvatar, avatarGradient } from '@/components/gradient-avatar';
 import {
   hasCachedEmailBody,
   removeCachedEmailFromMailbox,
   updateCachedEmail,
+  writeCachedMailboxPage,
   writeCachedMailboxSnapshot,
 } from '@/lib/mail-cache';
 import {
@@ -49,6 +50,7 @@ import {
   TextField,
   VStack,
   ZStack,
+  type ScrollPhase,
   type TextFieldRef,
   useNativeState,
 } from '@expo/ui/swift-ui';
@@ -61,15 +63,18 @@ import {
   cornerRadius,
   font,
   foregroundColor,
+  foregroundStyle,
   frame,
   glassEffect,
   glassEffectId,
   listRowInsets,
+  listRowBackground,
   listRowSeparator,
   listSectionSpacing,
   listStyle,
   lineLimit,
   onTapGesture,
+  onScrollPhaseChange,
   offset as swiftOffset,
   opacity as swiftOpacity,
   padding,
@@ -103,6 +108,7 @@ import {
   View,
   type StyleProp,
   type ViewStyle,
+  useColorScheme,
   useWindowDimensions,
 } from 'react-native';
 import { KeyboardStickyView } from 'react-native-keyboard-controller';
@@ -115,8 +121,14 @@ const titleRevealEnd = 8;
 const initialInboxRowRenderLimit = 10;
 const inboxRenderPageSize = 20;
 const inboxMailboxPageSize = 50;
-const inboxLoadMoreThreshold = 900;
+const inboxLoadMoreThreshold = 420;
+const inboxBottomLoadRearmOffsetDelta = 240;
 const inboxBodyWarmDelayMs = 650;
+const inboxBodyWarmBatchSize = 3;
+const inboxBodyWarmBatchGapMs = 450;
+const inboxCacheWriteDelayMs = 700;
+const inboxDebugDiskBatchSize = 8;
+const inboxDebugDiskBatchGapMs = 120;
 const inboxSwipeRemovalDelayMs = 420;
 const inboxRowInsets = { top: 8, leading: 8, bottom: 8, trailing: 20 };
 const messageNavigationGuardMs = 2500;
@@ -134,20 +146,41 @@ function interpolate(value: number, inputMin: number, inputMax: number, outputMi
   return outputMin + (outputMax - outputMin) * progress;
 }
 
+function scheduleMailboxCacheWrite(label: string, write: () => Promise<void>) {
+  InteractionManager.runAfterInteractions(() => {
+    setTimeout(() => {
+      markNavigationTrace(`${label} start`);
+      void write()
+        .then(() => {
+          markNavigationTrace(`${label} finished`);
+        })
+        .catch((error: unknown) => {
+          markNavigationTrace(
+            `${label} failed`,
+            error instanceof Error ? error.message : String(error),
+          );
+        });
+    }, inboxCacheWriteDelayMs);
+  });
+}
+
 export default function InboxScreen() {
   const { mailboxId, mailboxName } = useLocalSearchParams<{
     mailboxId?: string;
     mailboxName?: string;
   }>();
   const insets = useSafeAreaInsets();
-  const colors = lightColors;
+  const scheme = useColorScheme();
+  const colors = scheme === 'dark' ? darkColors : lightColors;
   const initialScrollOffsetYRef = useRef<number | null>(null);
   const pendingDestructiveSwipeMessageIdsRef = useRef(new Set<string>());
   const pendingMessageNavigationKeyRef = useRef<string | null>(null);
   const pendingMessageNavigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pullRefreshInFlightRef = useRef<Promise<void> | null>(null);
   const loadMoreInFlightRef = useRef<Promise<void> | null>(null);
-  const loadMoreInboxMessagesRef = useRef<() => void>(() => {});
+  const loadMoreInboxMessagesRef = useRef<() => boolean>(() => false);
+  const bottomLoadArmedRef = useRef(true);
+  const bottomLoadTriggerOffsetRef = useRef(0);
   const hasMoreMessagesRef = useRef(true);
   const debugMode = useDebugMode();
   const navigationDebugTrace = useNavigationDebugTrace();
@@ -163,6 +196,7 @@ export default function InboxScreen() {
     (state) => state.removeMessageFromMailbox,
   );
   const [scrollY, setScrollY] = useState(0);
+  const [listScrollPhase, setListScrollPhase] = useState<ScrollPhase>('idle');
   const [searchQuery, setSearchQuery] = useState('');
   const [bodyDiskStateById, setBodyDiskStateById] = useState<Record<string, boolean | undefined>>({});
   const [rowRenderLimit, setRowRenderLimit] = useState(initialInboxRowRenderLimit);
@@ -199,6 +233,7 @@ export default function InboxScreen() {
   const hiddenRowCount = Math.max(0, visibleMessages.length - renderedMessages.length);
   const messageRouteSource = liveMessages ? 'jmap' : 'mock';
   const navTitleVisible = scrollY >= titleRevealStart;
+  const listIsScrolling = listScrollPhase !== 'idle';
   const markMessageReadOnOpen = useCallback(
     (item: Message) => {
       if (!liveMessages || !item.unread) {
@@ -259,13 +294,42 @@ export default function InboxScreen() {
 
       const distanceToBottom = geometry.contentHeight - geometry.containerHeight - geometry.contentOffsetY;
 
-      if (
-        geometry.contentHeight > geometry.containerHeight &&
-        distanceToBottom <= inboxLoadMoreThreshold
-      ) {
-        loadMoreInboxMessagesRef.current();
+      if (geometry.contentHeight <= geometry.containerHeight) {
+        bottomLoadArmedRef.current = true;
+        return;
+      }
+
+      if (distanceToBottom > inboxLoadMoreThreshold) {
+        if (
+          geometry.contentOffsetY > bottomLoadTriggerOffsetRef.current + inboxBottomLoadRearmOffsetDelta ||
+          geometry.contentOffsetY < bottomLoadTriggerOffsetRef.current - inboxBottomLoadRearmOffsetDelta
+        ) {
+          bottomLoadArmedRef.current = true;
+        }
+        return;
+      }
+
+      if (bottomLoadArmedRef.current) {
+        bottomLoadArmedRef.current = false;
+        bottomLoadTriggerOffsetRef.current = geometry.contentOffsetY;
+        markNavigationTrace(
+          'inbox bottom load trigger',
+          `distance=${Math.round(distanceToBottom)} offset=${Math.round(geometry.contentOffsetY)}`,
+        );
+        const didStartLoad = loadMoreInboxMessagesRef.current();
+
+        if (!didStartLoad) {
+          bottomLoadArmedRef.current = true;
+        }
       }
     }, []),
+  );
+  const scrollPhaseModifier = useMemo(
+    () =>
+      onScrollPhaseChange((phase) => {
+        setListScrollPhase((currentPhase) => (currentPhase === phase ? currentPhase : phase));
+      }),
+    [],
   );
   const handleMessageSwipeAction = useCallback(
     (item: Message, action: InboxSwipeAction) => {
@@ -413,7 +477,7 @@ export default function InboxScreen() {
       });
       markNavigationTrace(
         `${tracePrefix} finished`,
-        `position=${snapshot.position ?? position} rows=${snapshot.messages.length} total=${snapshot.total ?? 'unknown'}`,
+        `position=${snapshot.position ?? position} rows=${snapshot.messages.length} threads=${Object.keys(snapshot.threads ?? {}).length} total=${snapshot.total ?? 'unknown'}`,
       );
       updateHasMoreMessages(getSnapshotHasMoreMessages(snapshot, limit));
 
@@ -425,7 +489,7 @@ export default function InboxScreen() {
 
         updateHasMoreMessages(getSnapshotHasMoreMessages(nextSnapshot, limit));
         applyMailboxSnapshot(nextSnapshot, mailboxId);
-        void writeCachedMailboxSnapshot(nextSnapshot).catch(() => {});
+        scheduleMailboxCacheWrite('inbox cache write', () => writeCachedMailboxSnapshot(nextSnapshot));
       }
 
       return snapshot;
@@ -471,11 +535,11 @@ export default function InboxScreen() {
 
         return nextLimit;
       });
-      return;
+      return true;
     }
 
     if (searchQuery.trim()) {
-      return;
+      return false;
     }
 
     const currentSnapshot = selectMailboxSnapshot(useMailStore.getState(), mailboxId);
@@ -487,7 +551,7 @@ export default function InboxScreen() {
       !hasMoreMessagesRef.current ||
       loadMoreInFlightRef.current
     ) {
-      return;
+      return false;
     }
 
     const nextPosition = currentMessages.length;
@@ -503,7 +567,16 @@ export default function InboxScreen() {
 
         updateHasMoreMessages(getSnapshotHasMoreMessages(mergedSnapshot, inboxMailboxPageSize));
         applyMailboxSnapshot(mergedSnapshot, mailboxId);
-        void writeCachedMailboxSnapshot(mergedSnapshot).catch(() => {});
+        setRowRenderLimit((current) => {
+          const nextLimit = Math.min(current + inboxRenderPageSize, mergedSnapshot.messages.length);
+
+          if (nextLimit !== current) {
+            markNavigationTrace('inbox loaded rows revealed', `rows=${nextLimit}`);
+          }
+
+          return nextLimit;
+        });
+        scheduleMailboxCacheWrite('inbox page cache write', () => writeCachedMailboxPage(page));
       })
       .catch((error: unknown) => {
         if (!(error instanceof Error && error.name === 'FastmailJmapTokenMissingError')) {
@@ -516,6 +589,7 @@ export default function InboxScreen() {
       });
 
     loadMoreInFlightRef.current = loadMore;
+    return true;
   }, [
     applyMailboxSnapshot,
     mailboxId,
@@ -539,27 +613,48 @@ export default function InboxScreen() {
     updateHasMoreMessages(getSnapshotHasMoreMessages(snapshot, Math.max(inboxMailboxPageSize, snapshot.messages.length)));
   }, [snapshot, updateHasMoreMessages]);
   useEffect(() => {
-    if (!debugMode || !bodyDebugKey) {
+    if (!debugMode || !bodyDebugKey || listIsScrolling) {
       return;
     }
 
     let cancelled = false;
+    let nextBatchTimer: ReturnType<typeof setTimeout> | null = null;
     const messageIds = bodyDebugKey.split('\n').filter(Boolean);
 
-    void getBodyDiskDebugStateEntries(messageIds)
-      .then((entries) => {
-        if (cancelled) {
-          return;
-        }
+    const runNextDebugBatch = (cursor: number) => {
+      const batch = messageIds.slice(cursor, cursor + inboxDebugDiskBatchSize);
 
-        setBodyDiskStateById((current) => applyBodyDiskDebugStateEntries(current, entries));
-      })
-      .catch(() => {});
+      if (!batch.length || cancelled) {
+        return;
+      }
+
+      void getBodyDiskDebugStateEntries(batch)
+        .then((entries) => {
+          if (cancelled) {
+            return;
+          }
+
+          setBodyDiskStateById((current) => applyBodyDiskDebugStateEntries(current, entries));
+
+          if (cursor + inboxDebugDiskBatchSize < messageIds.length) {
+            nextBatchTimer = setTimeout(
+              () => runNextDebugBatch(cursor + inboxDebugDiskBatchSize),
+              inboxDebugDiskBatchGapMs,
+            );
+          }
+        })
+        .catch(() => {});
+    };
+
+    runNextDebugBatch(0);
 
     return () => {
       cancelled = true;
+      if (nextBatchTimer) {
+        clearTimeout(nextBatchTimer);
+      }
     };
-  }, [bodyDebugKey, debugMode]);
+  }, [bodyDebugKey, debugMode, listIsScrolling]);
   useEffect(() => {
     markNavigationTrace(
       'inbox committed',
@@ -567,6 +662,8 @@ export default function InboxScreen() {
     );
   }, [activeMailboxName, hiddenRowCount, mailboxId, renderedMessages.length, sourceMessages.length]);
   useEffect(() => {
+    bottomLoadArmedRef.current = true;
+    bottomLoadTriggerOffsetRef.current = 0;
     setRowRenderLimit(initialInboxRowRenderLimit);
     markNavigationTrace('inbox row render limited', `rows=${initialInboxRowRenderLimit}`);
 
@@ -579,21 +676,32 @@ export default function InboxScreen() {
     };
   }, [mailboxId]);
   useEffect(() => {
-    if (!liveMessages || !bodyWarmKey) {
+    if (!liveMessages || !bodyWarmKey || listIsScrolling) {
       return;
     }
 
     let cancelled = false;
+    let nextBatchTimer: ReturnType<typeof setTimeout> | null = null;
     const messageIds = bodyWarmKey.split('\n').filter(Boolean);
-    const warmTimer = setTimeout(() => {
+
+    const runNextBodyWarmBatch = (cursor: number) => {
       if (cancelled) {
         return;
       }
 
-      markNavigationTrace('body warm start', `rows=${messageIds.length}`);
-      void prefetchMessageBodies(messageIds, {
+      const batch = messageIds.slice(cursor, cursor + inboxBodyWarmBatchSize);
+
+      if (!batch.length) {
+        return;
+      }
+
+      markNavigationTrace(
+        'body warm batch start',
+        `start=${cursor} size=${batch.length} rows=${messageIds.length}`,
+      );
+      void prefetchMessageBodies(batch, {
         concurrency: 1,
-        limit: messageIds.length,
+        limit: batch.length,
       })
         .then((result) => {
           if (cancelled) {
@@ -601,17 +709,24 @@ export default function InboxScreen() {
           }
 
           markNavigationTrace(
-            'body warm finished',
+            'body warm batch finished',
             `loaded=${result.loaded} skipped=${result.skipped} failed=${result.failed}`,
           );
           if (debugMode) {
-            void getBodyDiskDebugStateEntries(messageIds)
+            void getBodyDiskDebugStateEntries(batch)
               .then((entries) => {
                 if (!cancelled) {
                   setBodyDiskStateById((current) => applyBodyDiskDebugStateEntries(current, entries));
                 }
               })
               .catch(() => {});
+          }
+
+          if (cursor + inboxBodyWarmBatchSize < messageIds.length) {
+            nextBatchTimer = setTimeout(
+              () => runNextBodyWarmBatch(cursor + inboxBodyWarmBatchSize),
+              inboxBodyWarmBatchGapMs,
+            );
           }
         })
         .catch((error: unknown) => {
@@ -620,17 +735,24 @@ export default function InboxScreen() {
           }
 
           markNavigationTrace(
-            'body warm failed',
+            'body warm batch failed',
             error instanceof Error ? error.message : String(error),
           );
         });
+    };
+
+    const warmTimer = setTimeout(() => {
+      runNextBodyWarmBatch(0);
     }, inboxBodyWarmDelayMs);
 
     return () => {
       cancelled = true;
       clearTimeout(warmTimer);
+      if (nextBatchTimer) {
+        clearTimeout(nextBatchTimer);
+      }
     };
-  }, [bodyWarmKey, debugMode, liveMessages]);
+  }, [bodyWarmKey, debugMode, listIsScrolling, liveMessages]);
   useFocusEffect(
     useCallback(() => {
       const controller = new AbortController();
@@ -809,13 +931,15 @@ export default function InboxScreen() {
               listSectionSpacing(0),
               scrollContentBackground('hidden'),
               refreshable(refreshInbox),
+              scrollPhaseModifier,
               ...(scrollGeometryModifier ? [scrollGeometryModifier] : []),
             ]}>
             <HStack
               modifiers={[
-                listRowInsets({ top: 0, leading: 0, bottom: 0, trailing: 0 }),
-                listRowSeparator('hidden'),
-              ]}>
+              listRowInsets({ top: 0, leading: 0, bottom: 0, trailing: 0 }),
+              listRowBackground(colors.background),
+              listRowSeparator('hidden'),
+            ]}>
               <RNHostView matchContents>
                 <InboxListHeader
                   activeMailboxName={activeMailboxName}
@@ -841,9 +965,10 @@ export default function InboxScreen() {
             })}
             <HStack
               modifiers={[
-                listRowInsets({ top: 0, leading: 0, bottom: 0, trailing: 0 }),
-                listRowSeparator('hidden'),
-              ]}>
+              listRowInsets({ top: 0, leading: 0, bottom: 0, trailing: 0 }),
+              listRowBackground(colors.background),
+              listRowSeparator('hidden'),
+            ]}>
               <RNHostView matchContents>
                 <View style={{ height: insets.bottom + 92 }} />
               </RNHostView>
@@ -880,7 +1005,9 @@ function getMessageRouteParams(item: Message, mailboxName: string, source: 'jmap
     sender: item.sender,
     source,
     subject: item.subject,
+    threadId: item.threadId ?? '',
     to: item.to ?? '',
+    wasUnreadOnOpen: item.unread ? '1' : '0',
     unread: item.unread ? '1' : '0',
   };
 }
@@ -920,6 +1047,10 @@ function mergeMailboxPageIntoSnapshot(
     mailboxes: pageSnapshot.mailboxes.length ? pageSnapshot.mailboxes : currentSnapshot.mailboxes,
     messages: typeof total === 'number' ? messages.slice(0, total) : messages,
     position: currentSnapshot.position ?? 0,
+    threads: {
+      ...(currentSnapshot.threads ?? {}),
+      ...(pageSnapshot.threads ?? {}),
+    },
     total,
     username: pageSnapshot.username || currentSnapshot.username,
   };
@@ -1394,7 +1525,7 @@ function MessageRow({
   };
 
   return (
-    <SwipeActions modifiers={[listRowInsets(inboxRowInsets)]}>
+    <SwipeActions modifiers={[listRowInsets(inboxRowInsets), listRowBackground(colors.background)]}>
       <HStack
         alignment="top"
         spacing={9}
@@ -1404,34 +1535,34 @@ function MessageRow({
             <Circle modifiers={[frame({ width: 8, height: 8 }), foregroundColor(tint)]} />
           ) : null}
         </ZStack>
-        <RNHostView matchContents>
-          <GradientAvatar
-            color={item.avatarColor}
-            label={item.avatar}
-            size={44}
-            style={styles.swiftRowAvatar}
-            textSize={avatarTextSize}
-          />
-        </RNHostView>
+        <SwiftGradientAvatar
+          color={item.avatarColor}
+          label={item.avatar}
+          size={44}
+          textSize={avatarTextSize}
+        />
         <VStack alignment="leading" spacing={0} modifiers={[frame({ maxWidth: 1000, alignment: 'leading' })]}>
           <HStack alignment="firstTextBaseline" spacing={4}>
             <SwiftText
               modifiers={[
                 font({ size: 16, weight: 'bold' }),
                 foregroundColor(colors.text),
-                frame({ maxWidth: 1000, alignment: 'leading' }),
                 lineLimit(1),
                 truncationMode('tail'),
               ]}>
               {item.sender}
             </SwiftText>
-            <Spacer minLength={4} />
             {item.count ? (
               <SwiftText
-                modifiers={[font({ size: 14, weight: 'bold' }), foregroundColor(colors.secondaryText)]}>
+                modifiers={[
+                  font({ size: 14, weight: 'regular' }),
+                  foregroundColor(colors.secondaryText),
+                  lineLimit(1),
+                ]}>
                 {item.count}
               </SwiftText>
             ) : null}
+            <Spacer minLength={4} />
             {item.pinned ? (
               <SwiftImage systemName="pin.fill" color={colors.pin} size={12} />
             ) : null}
@@ -1513,6 +1644,46 @@ function MessageRow({
         />
       </SwipeActions.Actions>
     </SwipeActions>
+  );
+}
+
+function SwiftGradientAvatar({
+  color,
+  label = '?',
+  size,
+  textSize,
+}: {
+  color: string;
+  label?: string;
+  size: number;
+  textSize?: number;
+}) {
+  const initials = label.trim().slice(0, 2) || '?';
+  const fontSize = textSize ?? Math.round(size * (initials.length > 1 ? 0.38 : 0.52));
+
+  return (
+    <ZStack modifiers={[frame({ width: size, height: size })]}>
+      <Circle
+        modifiers={[
+          frame({ width: size, height: size }),
+          foregroundStyle({
+            type: 'linearGradient',
+            colors: avatarGradient(color),
+            startPoint: { x: 0.12, y: 0 },
+            endPoint: { x: 1, y: 1 },
+          }),
+        ]}
+      />
+      <SwiftText
+        modifiers={[
+          font({ size: fontSize, weight: 'semibold', design: 'rounded' }),
+          foregroundColor('#FFFFFF'),
+          lineLimit(1),
+          frame({ width: size, height: size, alignment: 'center' }),
+        ]}>
+        {initials}
+      </SwiftText>
+    </ZStack>
   );
 }
 
@@ -1942,6 +2113,26 @@ const lightColors = {
   fallbackBorder: 'rgba(255, 255, 255, 0.65)',
 };
 
+const darkColors: ColorSet = {
+  background: '#090909',
+  text: '#F5F5F5',
+  secondaryText: '#A8A8AE',
+  tertiaryText: '#77777D',
+  separator: '#2D2D31',
+  groupDivider: 'rgba(235, 235, 245, 0.16)',
+  messageChip: 'rgba(118, 118, 128, 0.28)',
+  attachmentChipBorder: '#3A3A3F',
+  attachmentImage: '#FF453A',
+  archiveAction: '#8E8E93',
+  pin: '#FF453A',
+  headerTintTop: 'rgba(9, 9, 9, 1)',
+  headerTintMiddle: 'rgba(9, 9, 9, 0.82)',
+  headerTintBottom: 'rgba(9, 9, 9, 0)',
+  glassTint: 'rgba(36, 36, 38, 0.64)',
+  fallbackGlass: 'rgba(36, 36, 38, 0.88)',
+  fallbackBorder: 'rgba(255, 255, 255, 0.1)',
+};
+
 const styles = StyleSheet.create({
   root: {
     flex: 1,
@@ -2044,13 +2235,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
-  swiftRowAvatar: {
-    alignItems: 'center',
-    borderRadius: 22,
-    height: 44,
-    justifyContent: 'center',
-    width: 44,
-  },
   messageBody: {
     borderBottomWidth: StyleSheet.hairlineWidth,
     flex: 1,
@@ -2074,7 +2258,7 @@ const styles = StyleSheet.create({
   threadCount: {
     fontFamily: systemFont,
     fontSize: 14,
-    fontWeight: '700',
+    fontWeight: '400',
   },
   date: {
     fontFamily: systemFont,

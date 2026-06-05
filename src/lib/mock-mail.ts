@@ -18,6 +18,7 @@ export type Message = {
   hasAttachment?: boolean;
   htmlBody?: string;
   fromEmail?: string;
+  threadId?: string;
   keywords?: Record<string, true>;
   mailboxIds?: Record<string, true>;
   mailboxName?: string;

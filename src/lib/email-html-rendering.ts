@@ -89,14 +89,24 @@ export function getEmailBodyHeightScript(contentWidth: number) {
           phase: phase,
           imageCount: images.length,
           images: images.map(function (image) {
+            var rect = image.getBoundingClientRect();
+            var parent = image.parentElement;
+            var parentRect = parent ? parent.getBoundingClientRect() : null;
+
             return {
               complete: Boolean(image.complete),
               currentSrcHost: getHost(image.currentSrc || ''),
+              heightAttr: image.getAttribute('height') || '',
               naturalHeight: image.naturalHeight || 0,
               naturalWidth: image.naturalWidth || 0,
+              parentTag: parent ? parent.tagName.toLowerCase() : '',
+              parentWidth: parentRect ? Math.round(parentRect.width) : 0,
+              renderedHeight: Math.round(rect.height),
+              renderedWidth: Math.round(rect.width),
               srcHost: getHost(image.getAttribute('src') || image.src || ''),
               srcPrefix: (image.getAttribute('src') || image.src || '').slice(0, 160),
-              status: image.getAttribute('data-nativemail-image-status') || 'snapshot'
+              status: image.getAttribute('data-nativemail-image-status') || 'snapshot',
+              widthAttr: image.getAttribute('width') || ''
             };
           })
         };
@@ -252,8 +262,10 @@ function getEmailHtmlStyles(
       padding-left: 12px;
     }
     img {
-      max-width: 100% !important;
-      height: auto !important;
+      max-width: 100%;
+    }
+    img[width][height] {
+      max-width: none;
     }
     pre, code {
       white-space: pre-wrap;
@@ -263,17 +275,16 @@ function getEmailHtmlStyles(
 
 function getEmailHtmlParts(html: string) {
   const sanitized = sanitizeEmailHtml(html);
-  const headMatch = sanitized.match(/<head\b[^>]*>([\s\S]*?)<\/head>/i);
-  const bodyMatch = sanitized.match(/<body\b([^>]*)>([\s\S]*?)<\/body>/i);
-  const head = headMatch?.[1] ?? '';
+  const head = getCombinedHeadHtml(sanitized);
+  const bodyMatches = Array.from(sanitized.matchAll(/<body\b([^>]*)>([\s\S]*?)<\/body>/gi));
 
-  if (bodyMatch) {
-    const bodyAttributes = bodyMatch[1] ?? '';
+  if (bodyMatches.length) {
+    const bodyAttributes = bodyMatches[0]?.[1] ?? '';
 
     return {
-      body: bodyMatch[2],
+      body: bodyMatches.map((match) => match[2] ?? '').join('\n'),
       bodyAttributes: sanitizeEmailBodyAttributes(bodyAttributes),
-      hasBodyMarginAttributes: hasEmailBodyMarginAttributes(bodyAttributes),
+      hasBodyMarginAttributes: bodyMatches.some((match) => hasEmailBodyMarginAttributes(match[1] ?? '')),
       head,
     };
   }
@@ -287,6 +298,12 @@ function getEmailHtmlParts(html: string) {
     hasBodyMarginAttributes: false,
     head,
   };
+}
+
+function getCombinedHeadHtml(html: string) {
+  return Array.from(html.matchAll(/<head\b[^>]*>([\s\S]*?)<\/head>/gi))
+    .map((match) => match[1] ?? '')
+    .join('\n');
 }
 
 function hasEmailBodyMarginAttributes(attributes: string) {

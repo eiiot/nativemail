@@ -9,6 +9,7 @@ import {
   fetchJmapMessageBody,
   type JmapMailboxSnapshot,
   type JmapMessageBody,
+  type JmapThread,
 } from '@/lib/jmap-client';
 import type { Message } from '@/lib/mock-mail';
 
@@ -19,6 +20,7 @@ const messageBodyFetches = new Map<string, Promise<JmapMessageBody | null>>();
 type MailStoreState = {
   messageBodies: Record<string, JmapMessageBody>;
   snapshots: Record<string, JmapMailboxSnapshot>;
+  threads: Record<string, JmapThread>;
   applyMailboxSnapshot: (snapshot: JmapMailboxSnapshot, mailboxId?: string | null) => void;
   applyMessageBody: (messageId: string, body: JmapMessageBody) => void;
   patchMessage: (messageId: string, patch: MessagePatch) => void;
@@ -28,10 +30,12 @@ type MailStoreState = {
 export const useMailStore = create<MailStoreState>((set) => ({
   messageBodies: {},
   snapshots: {},
+  threads: {},
   applyMailboxSnapshot: (snapshot, mailboxId) => {
     set((state) => {
       const messageBodies = { ...state.messageBodies };
       const snapshots = { ...state.snapshots };
+      const threads = { ...state.threads, ...(snapshot.threads ?? {}) };
 
       for (const key of getSnapshotKeys(snapshot, mailboxId)) {
         snapshots[key] = snapshot;
@@ -45,7 +49,7 @@ export const useMailStore = create<MailStoreState>((set) => ({
         }
       }
 
-      return { messageBodies, snapshots };
+      return { messageBodies, snapshots, threads };
     });
   },
   applyMessageBody: (messageId, body) => {
@@ -63,7 +67,9 @@ export const useMailStore = create<MailStoreState>((set) => ({
         messages: snapshot.messages.map((message) =>
           message.id === messageId ? patchMessage(message, patch) : message,
         ),
+        threads: snapshot.threads ? patchThreads(snapshot.threads, messageId, patch) : snapshot.threads,
       })),
+      threads: patchThreads(state.threads, messageId, patch),
     }));
   },
   removeMessageFromMailbox: (messageId, mailboxId) => {
@@ -102,6 +108,13 @@ export function selectMessageBody(
   messageId?: string | null,
 ) {
   return messageId ? state.messageBodies[messageId] ?? null : null;
+}
+
+export function selectThread(
+  state: MailStoreState,
+  threadId?: string | null,
+) {
+  return threadId ? state.threads[threadId] ?? null : null;
 }
 
 export async function hydrateMailboxSnapshotFromCache(mailboxId?: string | null) {
@@ -274,6 +287,25 @@ function patchMessage(message: Message, patch: MessagePatch): Message {
     ...(patch.pinned === undefined ? {} : { pinned: patch.pinned }),
     ...(patch.unread === undefined ? {} : { unread: patch.unread }),
   };
+}
+
+function patchThreads(
+  threads: Record<string, JmapThread>,
+  messageId: string,
+  patch: MessagePatch,
+) {
+  const nextThreads: Record<string, JmapThread> = {};
+
+  for (const [threadId, thread] of Object.entries(threads)) {
+    nextThreads[threadId] = {
+      ...thread,
+      messages: thread.messages.map((message) =>
+        message.id === messageId ? patchMessage(message, patch) : message,
+      ),
+    };
+  }
+
+  return nextThreads;
 }
 
 function getMessageBodyFromMessage(message: Message): JmapMessageBody | null {

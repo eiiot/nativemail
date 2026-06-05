@@ -6,6 +6,7 @@ import {
 } from '@/components/attachment-thumbnail-view';
 import {
   archiveJmapEmail,
+  fetchJmapThreadMessages,
   setJmapEmailPinned,
   setJmapEmailUnread,
   trashJmapEmail,
@@ -21,10 +22,11 @@ import {
   getEmailHtmlDocument,
   minEmailBodyWebViewHeight,
 } from '@/lib/email-html-rendering';
+import { splitEmailReplyHtml, splitEmailReplyText } from '@/lib/email-reply-history';
 import {
   hydrateMessageBodyFromCache,
   loadMessageBody,
-  selectMessageBody,
+  selectThread,
   useMailStore,
 } from '@/lib/mail-store';
 import { getMessageById, type Message, type MessageAttachment } from '@/lib/mock-mail';
@@ -57,9 +59,10 @@ import * as Haptics from 'expo-haptics';
 import { Stack, router, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { MenuView, type MenuAction, type NativeActionEvent } from '@expo/ui/community/menu';
-import { ComponentProps, PropsWithChildren, useCallback, useEffect, useId, useMemo, useState } from 'react';
+import { ComponentProps, PropsWithChildren, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   Clipboard,
+  InteractionManager,
   Linking,
   Platform,
   Pressable,
@@ -69,6 +72,7 @@ import {
   View,
   type StyleProp,
   type ViewStyle,
+  useColorScheme,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import WebView, { type WebViewMessageEvent } from 'react-native-webview';
@@ -76,6 +80,7 @@ import WebView, { type WebViewMessageEvent } from 'react-native-webview';
 const textScale = { maxFontSizeMultiplier: 1.12 };
 const messageDetailHorizontalPadding = 20;
 const messageBodyFetchRevision = 8;
+const threadScrollOffset = 12;
 const systemFont = Platform.select({ ios: 'system-ui', default: undefined });
 const roundedFont = Platform.select({ ios: 'ui-rounded', default: undefined });
 const pressHaptic = () => {
@@ -89,11 +94,17 @@ type EmailWebViewImageDebug = {
   images: {
     complete: boolean;
     currentSrcHost: string;
+    heightAttr: string;
     naturalHeight: number;
     naturalWidth: number;
+    parentTag: string;
+    parentWidth: number;
+    renderedHeight: number;
+    renderedWidth: number;
     srcHost: string;
     srcPrefix: string;
     status: string;
+    widthAttr: string;
   }[];
   phase: string;
 };
@@ -115,17 +126,24 @@ export default function MessageScreen() {
     sender?: string;
     source?: string;
     subject?: string;
+    threadId?: string;
     to?: string;
     unread?: string;
+    wasUnreadOnOpen?: string;
   }>();
   const { id, mailboxName, source } = params;
   const insets = useSafeAreaInsets();
-  const colors = lightColors;
+  const scheme = useColorScheme();
+  const colors = scheme === 'dark' ? darkColors : lightColors;
   const messageId = Array.isArray(id) ? id[0] : id;
   const fallbackMessage = getMessageById(messageId);
   const routeMessage = getRouteMessage(params, fallbackMessage);
   const routeKeywordsText = getRouteParam(params.keywords) ?? '';
-  const storeMessageBody = useMailStore((state) => selectMessageBody(state, messageId));
+  const wasUnreadOnOpen = getRouteParam(params.wasUnreadOnOpen) === '1';
+  const routeThreadId = routeMessage.threadId;
+  const messageBodies = useMailStore((state) => state.messageBodies);
+  const cachedThread = useMailStore((state) => selectThread(state, routeThreadId));
+  const storeMessageBody = messageBodies[messageId] ?? null;
   const applyMessageBody = useMailStore((state) => state.applyMessageBody);
   const patchStoreMessage = useMailStore((state) => state.patchMessage);
   const [localFlags, setLocalFlags] = useState({
@@ -133,6 +151,12 @@ export default function MessageScreen() {
     unread: routeMessage.unread,
   });
   const [pendingAction, setPendingAction] = useState<MessageAction | null>(null);
+  const [threadMessages, setThreadMessages] = useState<Message[] | null>(null);
+  const [focusedThreadMessageId, setFocusedThreadMessageId] = useState(messageId);
+  const [expandedThreadMessageIds, setExpandedThreadMessageIds] = useState<Set<string>>(
+    () => new Set([messageId]),
+  );
+  const cachedThreadMessagesRef = useRef<Message[] | null>(null);
   const jmapBody = source === 'jmap' ? storeMessageBody : null;
   const message = {
     ...routeMessage,
@@ -147,6 +171,23 @@ export default function MessageScreen() {
     pinned: localFlags.pinned,
     unread: localFlags.unread,
   };
+  const cachedThreadMessages = cachedThread?.messages ?? null;
+  const cachedThreadMessageKey = useMemo(
+    () => cachedThreadMessages?.map((threadMessage) => threadMessage.id).join('\n') ?? '',
+    [cachedThreadMessages],
+  );
+  const detailMessages = useMemo(
+    () => mergeThreadMessagesWithBodies(threadMessages ?? cachedThreadMessages ?? [routeMessage], messageBodies, message),
+    [cachedThreadMessages, message, messageBodies, routeMessage, threadMessages],
+  );
+  const expandedThreadMessageKey = useMemo(
+    () => Array.from(expandedThreadMessageIds).sort().join('\n'),
+    [expandedThreadMessageIds],
+  );
+
+  useEffect(() => {
+    cachedThreadMessagesRef.current = cachedThreadMessages;
+  }, [cachedThreadMessages]);
 
   useEffect(() => {
     setLocalFlags({
@@ -154,7 +195,59 @@ export default function MessageScreen() {
       unread: routeMessage.unread,
     });
     setPendingAction(null);
+    setThreadMessages(null);
+    setFocusedThreadMessageId(messageId);
+    setExpandedThreadMessageIds(new Set([messageId]));
   }, [messageId, routeMessage.pinned, routeMessage.unread]);
+
+  useEffect(() => {
+    const cachedMessages = cachedThreadMessagesRef.current;
+
+    if (!cachedMessages?.length) {
+      return;
+    }
+
+    const focusId = getThreadFocusMessageId(cachedMessages, messageId, wasUnreadOnOpen);
+
+    setFocusedThreadMessageId(focusId);
+    setExpandedThreadMessageIds(getInitialExpandedThreadMessageIds(cachedMessages, focusId));
+  }, [cachedThreadMessageKey, messageId, wasUnreadOnOpen]);
+
+  useEffect(() => {
+    if (source !== 'jmap' || !messageId) {
+      return;
+    }
+
+    if (cachedThreadMessages?.length) {
+      return;
+    }
+
+    const controller = new AbortController();
+
+    fetchJmapThreadMessages({
+      messageId,
+      signal: controller.signal,
+      threadId: routeMessage.threadId,
+    })
+      .then((messages) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        const nextMessages = messages.length ? messages : [routeMessage];
+        const focusId = getThreadFocusMessageId(nextMessages, messageId, wasUnreadOnOpen);
+        const expandedIds = getInitialExpandedThreadMessageIds(nextMessages, focusId);
+
+        setThreadMessages(nextMessages);
+        setFocusedThreadMessageId(focusId);
+        setExpandedThreadMessageIds(expandedIds);
+      })
+      .catch(() => {});
+
+    return () => {
+      controller.abort();
+    };
+  }, [cachedThreadMessageKey, cachedThreadMessages, messageId, routeMessage.threadId, source, wasUnreadOnOpen]);
 
   useEffect(() => {
     const shouldLoadJmap = source === 'jmap';
@@ -173,6 +266,18 @@ export default function MessageScreen() {
       })
       .catch(() => {});
   }, [applyMessageBody, messageId, source, messageBodyFetchRevision]);
+  useEffect(() => {
+    if (source !== 'jmap') {
+      return;
+    }
+
+    const messageIds = Array.from(expandedThreadMessageIds);
+
+    for (const threadMessageId of messageIds) {
+      void hydrateMessageBodyFromCache(threadMessageId).catch(() => {});
+      void loadMessageBody(threadMessageId, { refresh: true }).catch(() => {});
+    }
+  }, [expandedThreadMessageKey, expandedThreadMessageIds, source]);
   useEffect(() => {
     if (source !== 'jmap' || !messageId || !routeMessage.unread) {
       return;
@@ -283,7 +388,6 @@ export default function MessageScreen() {
         transparent
         style={{
           backgroundColor: 'transparent',
-          color: colors.text,
           shadowColor: 'transparent',
         }}
       />
@@ -296,15 +400,14 @@ export default function MessageScreen() {
             router.back();
           }}
           separateBackground
-          tintColor={colors.text}
         />
-        <Stack.Toolbar.Button icon="chevron.up" onPress={pressHaptic} tintColor={colors.text} />
-        <Stack.Toolbar.Button icon="chevron.down" onPress={pressHaptic} tintColor={colors.text} />
+        <Stack.Toolbar.Button icon="chevron.up" onPress={pressHaptic} />
+        <Stack.Toolbar.Button icon="chevron.down" onPress={pressHaptic} />
       </Stack.Toolbar>
       <Stack.Toolbar placement="right">
-        <Stack.Toolbar.Button disabled icon="tag" onPress={pressHaptic} tintColor={colors.secondaryText} />
-        <Stack.Toolbar.Button disabled icon="folder" onPress={pressHaptic} tintColor={colors.secondaryText} />
-        <Stack.Toolbar.Menu icon="ellipsis" separateBackground tintColor={colors.text}>
+        <Stack.Toolbar.Button disabled icon="tag" onPress={pressHaptic} />
+        <Stack.Toolbar.Button disabled icon="folder" onPress={pressHaptic} />
+        <Stack.Toolbar.Menu icon="ellipsis" separateBackground>
           <Stack.Toolbar.Menu inline palette>
             <Stack.Toolbar.MenuAction
               disabled={actionDisabled}
@@ -361,19 +464,17 @@ export default function MessageScreen() {
           disabled={actionDisabled}
           icon="archivebox"
           onPress={() => runMessageAction('archive')}
-          tintColor={colors.text}
         />
         <Stack.Toolbar.Button
           disabled={actionDisabled}
           icon={message.unread ? 'envelope.open' : 'envelope.badge'}
           onPress={() => runMessageAction('toggle-unread')}
-          tintColor={colors.text}
         />
         <Stack.Toolbar.Button
           disabled={actionDisabled}
           icon={message.pinned ? 'pin.fill' : 'pin'}
           onPress={() => runMessageAction('toggle-pin')}
-          tintColor={message.pinned ? colors.pin : colors.text}
+          tintColor={message.pinned ? colors.pin : undefined}
         />
         <Stack.Toolbar.Spacer width={1} />
         <Stack.Toolbar.Button
@@ -381,7 +482,6 @@ export default function MessageScreen() {
           icon="arrowshape.turn.up.left"
           onPress={() => runMessageAction('reply')}
           separateBackground
-          tintColor={colors.text}
         />
         <Stack.Toolbar.Spacer />
         <Stack.Toolbar.Button
@@ -389,7 +489,6 @@ export default function MessageScreen() {
           icon="trash"
           onPress={() => runMessageAction('trash')}
           separateBackground
-          tintColor={colors.text}
         />
       </Stack.Toolbar>
 
@@ -397,10 +496,31 @@ export default function MessageScreen() {
         <MessageDetail
           bodyDebug={jmapBody?.debug}
           colors={colors}
+          expandedMessageIds={expandedThreadMessageIds}
+          focusedMessageId={focusedThreadMessageId}
           insetsTop={insets.top}
           mailboxName={mailboxName}
           message={message}
+          messages={detailMessages}
           onAction={runMessageAction}
+          onExpandAll={() => {
+            pressHaptic();
+            setExpandedThreadMessageIds(new Set(detailMessages.map((detailMessage) => detailMessage.id)));
+          }}
+          onToggleMessage={(threadMessageId) => {
+            pressHaptic();
+            setExpandedThreadMessageIds((currentIds) => {
+              const nextIds = new Set(currentIds);
+
+              if (nextIds.has(threadMessageId)) {
+                nextIds.delete(threadMessageId);
+              } else {
+                nextIds.add(threadMessageId);
+              }
+
+              return nextIds;
+            });
+          }}
         />
       </View>
     </>
@@ -620,9 +740,67 @@ function getRouteMessage(
     preview: getRouteParam(params.preview) || fallbackMessage.preview,
     sender: getRouteParam(params.sender) || fallbackMessage.sender,
     subject: getRouteParam(params.subject) || fallbackMessage.subject,
+    threadId: getRouteParam(params.threadId) || fallbackMessage.threadId,
     to: getRouteParam(params.to) || fallbackMessage.to,
     unread: unread ? unread === '1' : fallbackMessage.unread,
   };
+}
+
+function mergeThreadMessagesWithBodies(
+  messages: Message[],
+  bodies: Record<string, { attachments: MessageAttachment[]; html: string | null; text: string | null }>,
+  focusedMessage: Message,
+) {
+  return messages.map((threadMessage) => {
+    const body = bodies[threadMessage.id];
+    const mergedMessage = {
+      ...threadMessage,
+      attachments: body?.attachments ?? threadMessage.attachments,
+      body: body?.text ?? threadMessage.body,
+      hasAttachment: Boolean(
+        threadMessage.hasAttachment ||
+        threadMessage.attachments?.length ||
+        body?.attachments.length
+      ),
+      htmlBody: body?.html ?? threadMessage.htmlBody,
+    };
+
+    return threadMessage.id === focusedMessage.id
+      ? {
+          ...mergedMessage,
+          ...focusedMessage,
+          attachments: body?.attachments ?? focusedMessage.attachments ?? mergedMessage.attachments,
+          body: body?.text ?? focusedMessage.body ?? mergedMessage.body,
+          htmlBody: body?.html ?? focusedMessage.htmlBody ?? mergedMessage.htmlBody,
+        }
+      : mergedMessage;
+  });
+}
+
+function getThreadFocusMessageId(
+  messages: Message[],
+  fallbackMessageId: string,
+  preferFallbackMessage: boolean,
+) {
+  if (preferFallbackMessage && messages.some((message) => message.id === fallbackMessageId)) {
+    return fallbackMessageId;
+  }
+
+  const unreadMessage = [...messages].reverse().find((message) => message.unread);
+
+  return unreadMessage?.id ?? messages[messages.length - 1]?.id ?? fallbackMessageId;
+}
+
+function getInitialExpandedThreadMessageIds(messages: Message[], focusMessageId: string) {
+  const unreadIds = messages
+    .filter((message) => message.unread)
+    .map((message) => message.id);
+
+  const expandedIds = new Set(unreadIds.length ? unreadIds : [focusMessageId]);
+
+  expandedIds.add(focusMessageId);
+
+  return expandedIds;
 }
 
 function getRouteParam(value: string | string[] | undefined) {
@@ -755,22 +933,233 @@ function getMessageActionRequest(
 function MessageDetail({
   bodyDebug,
   colors,
+  expandedMessageIds,
+  focusedMessageId,
   insetsTop,
   mailboxName,
   message,
+  messages,
   onAction,
+  onExpandAll,
+  onToggleMessage,
 }: {
   bodyDebug?: JmapMessageBodyDebug;
   colors: ColorSet;
+  expandedMessageIds: Set<string>;
+  focusedMessageId: string;
   insetsTop: number;
   mailboxName?: string;
   message: Message;
+  messages: Message[];
   onAction: (action: MessageAction) => void;
+  onExpandAll: () => void;
+  onToggleMessage: (messageId: string) => void;
+}) {
+  const scrollViewRef = useRef<ScrollView>(null);
+  const didScrollToFocusedMessageRef = useRef(false);
+  const collapsedMessageCount = messages.filter((threadMessage) => !expandedMessageIds.has(threadMessage.id)).length;
+  const shouldAutoScrollThread = messages.length > 4;
+  const threadTitle = messages[0]?.subject ?? message.subject;
+  const canToggleThreadMessages = messages.length > 1;
+  const canExpandThread = collapsedMessageCount > 0;
+
+  useEffect(() => {
+    didScrollToFocusedMessageRef.current = false;
+  }, [focusedMessageId, messages.length]);
+
+  const handleThreadItemLayout = useCallback(
+    (threadMessageId: string, y: number) => {
+      if (
+        !shouldAutoScrollThread ||
+        threadMessageId !== focusedMessageId ||
+        didScrollToFocusedMessageRef.current
+      ) {
+        return;
+      }
+
+      didScrollToFocusedMessageRef.current = true;
+      const scrollTask = InteractionManager.runAfterInteractions(() => {
+        scrollViewRef.current?.scrollTo({
+          animated: false,
+          y: Math.max(0, y - threadScrollOffset),
+        });
+      });
+
+      setTimeout(() => scrollTask.cancel(), 500);
+    },
+    [focusedMessageId, shouldAutoScrollThread],
+  );
+
+  return (
+    <ScrollView
+      ref={scrollViewRef}
+      contentContainerStyle={[
+        styles.messageDetailContent,
+        { paddingBottom: 128, paddingTop: insetsTop + 74 },
+      ]}
+      showsVerticalScrollIndicator={false}>
+      <View style={styles.messageTitleRow}>
+        <Text {...textScale} style={[styles.messageDetailTitle, { color: colors.text }]}>
+          {threadTitle}
+        </Text>
+        {canExpandThread ? (
+          <Pressable
+            accessibilityLabel="Expand conversation history"
+            accessibilityRole="button"
+            onPress={onExpandAll}
+            style={({ pressed }) => [styles.threadExpandAllButton, pressed && styles.pressed]}>
+            <SymbolView
+              name="rectangle.expand.vertical"
+              tintColor={colors.secondaryText}
+              size={22}
+              weight="regular"
+            />
+          </Pressable>
+        ) : null}
+      </View>
+      <Text
+        {...textScale}
+        numberOfLines={1}
+        style={[
+          styles.mailboxChip,
+          styles.mailboxChipText,
+          { backgroundColor: colors.messageChip, color: colors.text },
+        ]}>
+        {message.mailboxName ?? mailboxName ?? 'Inbox'}
+      </Text>
+
+      <View style={styles.threadList}>
+        {messages.map((threadMessage, index) => {
+          const expanded = !canToggleThreadMessages || expandedMessageIds.has(threadMessage.id);
+
+          return (
+            <MessageThreadItem
+              bodyDebug={threadMessage.id === message.id ? bodyDebug : undefined}
+              canToggle={canToggleThreadMessages}
+              colors={colors}
+              expanded={expanded}
+              focused={threadMessage.id === focusedMessageId}
+              isLast={index === messages.length - 1}
+              key={threadMessage.id}
+              message={threadMessage}
+              onAction={onAction}
+              onLayout={handleThreadItemLayout}
+              onToggle={() => onToggleMessage(threadMessage.id)}
+              showMenu={threadMessage.id === focusedMessageId}
+            />
+          );
+        })}
+      </View>
+    </ScrollView>
+  );
+}
+
+function MessageThreadItem({
+  bodyDebug,
+  canToggle,
+  colors,
+  expanded,
+  focused,
+  isLast,
+  message,
+  onAction,
+  onLayout,
+  onToggle,
+  showMenu,
+}: {
+  bodyDebug?: JmapMessageBodyDebug;
+  canToggle: boolean;
+  colors: ColorSet;
+  expanded: boolean;
+  focused: boolean;
+  isLast: boolean;
+  message: Message;
+  onAction: (action: MessageAction) => void;
+  onLayout: (messageId: string, y: number) => void;
+  onToggle: () => void;
+  showMenu: boolean;
+}) {
+  return (
+    <View
+      onLayout={(event) => onLayout(message.id, event.nativeEvent.layout.y)}
+      style={!isLast ? [styles.threadSeparator, { borderBottomColor: colors.groupDivider }] : null}>
+      {expanded ? (
+        <ExpandedThreadMessage
+          bodyDebug={bodyDebug}
+          colors={colors}
+          focused={focused}
+          message={message}
+          onAction={onAction}
+          onToggle={canToggle ? onToggle : undefined}
+          showMenu={showMenu}
+        />
+      ) : (
+        <CollapsedThreadMessage
+          colors={colors}
+          message={message}
+          onPress={onToggle}
+        />
+      )}
+    </View>
+  );
+}
+
+function CollapsedThreadMessage({
+  colors,
+  message,
+  onPress,
+}: {
+  colors: ColorSet;
+  message: Message;
+  onPress: () => void;
+}) {
+  return (
+    <View style={styles.threadCollapsedItem}>
+      <ThreadMessageHeader
+        colors={colors}
+        message={message}
+        onPress={onPress}
+        showMenu={false}
+      />
+    </View>
+  );
+}
+
+function ExpandedThreadMessage({
+  bodyDebug,
+  colors,
+  focused,
+  message,
+  onAction,
+  onToggle,
+  showMenu,
+}: {
+  bodyDebug?: JmapMessageBodyDebug;
+  colors: ColorSet;
+  focused: boolean;
+  message: Message;
+  onAction: (action: MessageAction) => void;
+  onToggle?: () => void;
+  showMenu: boolean;
 }) {
   const debugMode = useDebugMode();
-  const body = message.body ?? getMockMessageBody();
+  const body = message.body ?? message.preview ?? getMockMessageBody();
   const rawHtmlBody = message.htmlBody;
   const htmlBody = rawHtmlBody?.trim();
+  const htmlReplySplit = useMemo(
+    () => (htmlBody ? splitEmailReplyHtml(htmlBody) : null),
+    [htmlBody],
+  );
+  const textReplySplit = useMemo(
+    () => (!htmlBody ? splitEmailReplyText(body) : null),
+    [body, htmlBody],
+  );
+  const [quoteHistoryExpanded, setQuoteHistoryExpanded] = useState(false);
+  const visibleHtmlBody = htmlReplySplit?.bodyHtml ?? htmlBody;
+  const quoteHtmlBody = htmlReplySplit?.quoteHtml ?? null;
+  const visibleTextBody = textReplySplit?.bodyText ?? body;
+  const quoteTextBody = textReplySplit?.quoteText ?? null;
+  const hasQuoteHistory = Boolean(quoteHtmlBody || quoteTextBody);
   const attachments = message.attachments ?? [];
   const [imageDebug, setImageDebug] = useState<EmailWebViewImageDebug | null>(null);
   const messageMenuActions = useMemo(
@@ -781,6 +1170,10 @@ function MessageDetail({
   useEffect(() => {
     setImageDebug(null);
   }, [htmlBody]);
+  useEffect(() => {
+    setQuoteHistoryExpanded(false);
+  }, [body, htmlBody, message.id]);
+
   const handleMenuAction = (event: NativeActionEvent) => {
     const action = event.nativeEvent.event;
 
@@ -793,85 +1186,49 @@ function MessageDetail({
       pressHaptic();
     }
   };
+  const handleHistoryButtonPress = () => {
+    pressHaptic();
+    setQuoteHistoryExpanded((expanded) => !expanded);
+  };
 
   return (
-    <ScrollView
-      contentContainerStyle={[
-        styles.messageDetailContent,
-        { paddingBottom: 128, paddingTop: insetsTop + 74 },
-      ]}
-      showsVerticalScrollIndicator={false}>
-      <Text {...textScale} style={[styles.messageDetailTitle, { color: colors.text }]}>
-        {message.subject}
-      </Text>
-      <Text
-        {...textScale}
-        numberOfLines={1}
-        style={[
-          styles.mailboxChip,
-          styles.mailboxChipText,
-          { backgroundColor: colors.messageChip, color: colors.text },
-        ]}>
-        {message.mailboxName ?? mailboxName ?? 'Inbox'}
-      </Text>
+    <View style={[styles.threadExpandedItem, focused && styles.threadFocusedItem]}>
+      <ThreadMessageHeader
+        colors={colors}
+        menuActions={messageMenuActions}
+        message={message}
+        onMenuAction={handleMenuAction}
+        onPress={onToggle}
+        showMenu={showMenu}
+      />
 
-      <View style={styles.messageHeaderRow}>
-        <GradientAvatar
-          color={message.avatarColor}
-          label={message.avatar}
-          size={38}
-          style={styles.detailAvatar}
-          textSize={(message.avatar?.length ?? 1) > 1 ? 15 : 20}
-        />
-        <View style={styles.messageSenderBlock}>
-          <View style={styles.messageSenderTopRow}>
-            <Text {...textScale} numberOfLines={1} style={[styles.messageSender, { color: colors.text }]}>
-              {message.sender}
-            </Text>
-            <View style={styles.messageHeaderMeta}>
-              {message.hasAttachment ? (
-                <SymbolView name="paperclip" tintColor={colors.secondaryText} size={15} weight="semibold" />
-              ) : null}
-              <Text
-                {...textScale}
-                numberOfLines={1}
-                style={[styles.messageDetailDate, { color: colors.secondaryText }]}>
-                {message.date}
-              </Text>
-            </View>
-          </View>
-          <View style={styles.messageSenderBottomRow}>
-            <View style={styles.messageRecipientRow}>
-              <Text {...textScale} numberOfLines={1} style={[styles.messageRecipient, { color: colors.secondaryText }]}>
-                {message.to ? `To: ${message.to}` : 'To: Me'}
-              </Text>
-              <SymbolView name="chevron.down" tintColor={colors.secondaryText} size={12} weight="semibold" />
-            </View>
-            <MenuView
-              actions={messageMenuActions}
-              onPressAction={handleMenuAction}
-              style={styles.messageMenuHost}>
-              <View style={styles.messageEllipsisButton}>
-                <SymbolView name="ellipsis" tintColor={colors.secondaryText} size={20} weight="semibold" />
-              </View>
-            </MenuView>
-          </View>
-        </View>
-      </View>
-
-      {htmlBody ? (
+      {visibleHtmlBody ? (
         <>
           <EmailBodyWebView
             colors={colors}
-            html={htmlBody}
+            html={visibleHtmlBody}
             onImageDebug={setImageDebug}
           />
+          {hasQuoteHistory ? (
+            <EmailHistoryButton
+              colors={colors}
+              expanded={quoteHistoryExpanded}
+              onPress={handleHistoryButtonPress}
+            />
+          ) : null}
+          {quoteHtmlBody && quoteHistoryExpanded ? (
+            <EmailBodyWebView
+              colors={colors}
+              html={quoteHtmlBody}
+              onImageDebug={() => {}}
+            />
+          ) : null}
           <AttachmentList attachments={attachments} colors={colors} />
           {debugMode ? (
             <EmailBodyDebugReport
               colors={colors}
               debug={bodyDebug}
-              html={htmlBody}
+              html={htmlBody ?? visibleHtmlBody}
               imageDebug={imageDebug}
             />
           ) : null}
@@ -879,8 +1236,22 @@ function MessageDetail({
       ) : (
         <>
           <Text {...textScale} style={[styles.messageBodyText, { color: colors.text }]}>
-            {body}
+            {visibleTextBody}
           </Text>
+          {hasQuoteHistory ? (
+            <EmailHistoryButton
+              colors={colors}
+              expanded={quoteHistoryExpanded}
+              onPress={handleHistoryButtonPress}
+            />
+          ) : null}
+          {quoteTextBody && quoteHistoryExpanded ? (
+            <Text
+              {...textScale}
+              style={[styles.messageBodyText, styles.messageQuoteText, { color: colors.secondaryText }]}>
+              {quoteTextBody}
+            </Text>
+          ) : null}
           <AttachmentList attachments={attachments} colors={colors} />
           {debugMode ? (
             <Text style={[styles.renderingModeNote, { color: colors.secondaryText }]}>
@@ -889,7 +1260,101 @@ function MessageDetail({
           ) : null}
         </>
       )}
-    </ScrollView>
+    </View>
+  );
+}
+
+function EmailHistoryButton({
+  colors,
+  expanded,
+  onPress,
+}: {
+  colors: ColorSet;
+  expanded: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      accessibilityLabel={expanded ? 'Collapse quoted history' : 'Expand quoted history'}
+      accessibilityRole="button"
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.threadHistoryButton,
+        { backgroundColor: colors.messageChip },
+        pressed && styles.pressed,
+      ]}>
+      <SymbolView name="ellipsis" tintColor={colors.secondaryText} size={18} weight="semibold" />
+    </Pressable>
+  );
+}
+
+function ThreadMessageHeader({
+  colors,
+  menuActions,
+  message,
+  onMenuAction,
+  onPress,
+  showMenu,
+}: {
+  colors: ColorSet;
+  menuActions?: MenuAction[];
+  message: Message;
+  onMenuAction?: (event: NativeActionEvent) => void;
+  onPress?: () => void;
+  showMenu: boolean;
+}) {
+  return (
+    <Pressable
+      accessibilityRole={onPress ? 'button' : undefined}
+      disabled={!onPress}
+      onPress={onPress}
+      style={({ pressed }) => [styles.messageHeaderRow, pressed && styles.pressed]}>
+      <GradientAvatar
+        color={message.avatarColor}
+        label={message.avatar}
+        size={38}
+        style={styles.detailAvatar}
+        textSize={(message.avatar?.length ?? 1) > 1 ? 15 : 20}
+      />
+      <View style={styles.messageSenderBlock}>
+        <View style={styles.messageSenderTopRow}>
+          <Text {...textScale} numberOfLines={1} style={[styles.messageSender, { color: colors.text }]}>
+            {message.sender}
+          </Text>
+          <View style={styles.messageHeaderMeta}>
+            {message.hasAttachment ? (
+              <SymbolView name="paperclip" tintColor={colors.secondaryText} size={15} weight="semibold" />
+            ) : null}
+            <Text
+              {...textScale}
+              numberOfLines={1}
+              style={[styles.messageDetailDate, { color: colors.secondaryText }]}>
+              {message.date}
+            </Text>
+          </View>
+        </View>
+        <View style={styles.messageSenderBottomRow}>
+          <View style={styles.messageRecipientRow}>
+            <Text {...textScale} numberOfLines={1} style={[styles.messageRecipient, { color: colors.secondaryText }]}>
+              {message.to ? `To: ${message.to}` : 'To: Me'}
+            </Text>
+            <SymbolView name="chevron.down" tintColor={colors.secondaryText} size={12} weight="semibold" />
+          </View>
+          {showMenu && menuActions && onMenuAction ? (
+            <MenuView
+              actions={menuActions}
+              onPressAction={onMenuAction}
+              style={styles.messageMenuHost}>
+              <View style={styles.messageEllipsisButton}>
+                <SymbolView name="ellipsis" tintColor={colors.secondaryText} size={20} weight="semibold" />
+              </View>
+            </MenuView>
+          ) : (
+            <View style={styles.messageMenuHost} />
+          )}
+        </View>
+      </View>
+    </Pressable>
   );
 }
 
@@ -1111,6 +1576,9 @@ function getEmailImageDebugText(imageDebug: EmailWebViewImageDebug | null) {
             `current=${image.currentSrcHost || 'none'}`,
             `complete=${image.complete ? 'yes' : 'no'}`,
             `natural=${image.naturalWidth}x${image.naturalHeight}`,
+            `rendered=${image.renderedWidth}x${image.renderedHeight}`,
+            `attr=${image.widthAttr || 'none'}x${image.heightAttr || 'none'}`,
+            `parent=${image.parentTag || 'none'}:${image.parentWidth}`,
             `prefix=${image.srcPrefix}`,
           ].join(' '),
         )
@@ -1136,17 +1604,22 @@ function EmailBodyWebView({
   const [contentWidth, setContentWidth] = useState(defaultEmailBodyWidth);
   const [webViewHeight, setWebViewHeight] = useState(minEmailBodyWebViewHeight);
   const measuredContentWidth = Math.max(1, Math.round(contentWidth));
+  const emailBackground = colors.emailBackground;
+  const emailColors = useMemo(
+    () => ({ ...colors, background: emailBackground }),
+    [colors, emailBackground],
+  );
   const source = useMemo(
     () => ({
       html: getEmailHtmlDocument({
-        colors,
+        colors: emailColors,
         contentWidth: measuredContentWidth,
         horizontalPadding: messageDetailHorizontalPadding,
         html,
       }),
       baseUrl: 'about:blank',
     }),
-    [colors, html, measuredContentWidth],
+    [emailColors, html, measuredContentWidth],
   );
   const heightMeasurementScript = useMemo(
     () => getEmailBodyHeightScript(measuredContentWidth),
@@ -1242,7 +1715,7 @@ function EmailBodyWebView({
         showsHorizontalScrollIndicator={false}
         showsVerticalScrollIndicator={false}
         source={source}
-        style={[styles.htmlBodyWebView, { backgroundColor: colors.background }]}
+        style={[styles.htmlBodyWebView, { backgroundColor: emailBackground }]}
         thirdPartyCookiesEnabled={false}
       />
     </View>
@@ -1265,6 +1738,7 @@ type ColorSet = typeof lightColors;
 
 const lightColors = {
   background: '#FFFFFF',
+  emailBackground: '#FFFFFF',
   text: '#050505',
   secondaryText: '#7E7E82',
   attachmentImage: '#FF3B30',
@@ -1275,6 +1749,21 @@ const lightColors = {
   glassTint: 'rgba(255, 255, 255, 0.62)',
   fallbackGlass: 'rgba(255, 255, 255, 0.86)',
   fallbackBorder: 'rgba(255, 255, 255, 0.65)',
+};
+
+const darkColors: ColorSet = {
+  background: '#090909',
+  emailBackground: '#1C1C1E',
+  text: '#F5F5F5',
+  secondaryText: '#A8A8AE',
+  attachmentImage: '#FF453A',
+  attachmentPreviewBackground: '#2A2A2C',
+  groupDivider: 'rgba(235, 235, 245, 0.16)',
+  messageChip: 'rgba(118, 118, 128, 0.28)',
+  pin: '#FF453A',
+  glassTint: 'rgba(36, 36, 38, 0.64)',
+  fallbackGlass: 'rgba(36, 36, 38, 0.88)',
+  fallbackBorder: 'rgba(255, 255, 255, 0.1)',
 };
 
 const styles = StyleSheet.create({
@@ -1300,12 +1789,25 @@ const styles = StyleSheet.create({
   messageDetailContent: {
     paddingHorizontal: messageDetailHorizontalPadding,
   },
+  messageTitleRow: {
+    alignItems: 'flex-start',
+    flexDirection: 'row',
+    gap: 12,
+  },
   messageDetailTitle: {
+    flex: 1,
     fontFamily: systemFont,
     fontSize: 26,
     fontWeight: '800',
     letterSpacing: 0,
     lineHeight: 32,
+  },
+  threadExpandAllButton: {
+    alignItems: 'center',
+    height: 32,
+    justifyContent: 'center',
+    marginRight: -4,
+    width: 30,
   },
   mailboxChip: {
     alignSelf: 'flex-start',
@@ -1324,10 +1826,37 @@ const styles = StyleSheet.create({
     fontWeight: '500',
     lineHeight: 18,
   },
+  threadList: {
+    marginTop: 14,
+  },
+  threadSeparator: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  threadCollapsedItem: {
+    paddingBottom: 16,
+    paddingTop: 16,
+  },
+  threadExpandedItem: {
+    paddingBottom: 16,
+    paddingTop: 16,
+  },
+  threadFocusedItem: {
+  },
+  threadHistoryButton: {
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    borderRadius: 7,
+    height: 18,
+    justifyContent: 'center',
+    marginTop: 14,
+    width: 36,
+  },
+  pressed: {
+    opacity: 0.72,
+  },
   messageHeaderRow: {
     alignItems: 'flex-start',
     flexDirection: 'row',
-    marginTop: 22,
   },
   detailAvatar: {
     alignItems: 'center',
@@ -1405,6 +1934,9 @@ const styles = StyleSheet.create({
     fontWeight: '400',
     lineHeight: 23,
     marginTop: 20,
+  },
+  messageQuoteText: {
+    marginTop: 14,
   },
   renderingModeNote: {
     fontFamily: systemFont,
