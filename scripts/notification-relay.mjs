@@ -2,6 +2,7 @@
 
 import { createServer } from 'node:http';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -10,8 +11,14 @@ const MAIL_CAPABILITY = 'urn:ietf:params:jmap:mail';
 const FASTMAIL_SESSION_URL = 'https://api.fastmail.com/jmap/session';
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const PORT = Number.parseInt(process.env.PORT ?? '8787', 10);
-const POLL_MS = Number.parseInt(process.env.NOTIFICATION_POLL_MS ?? '60000', 10);
-const STORE_PATH = path.join(process.cwd(), '.nativemail', 'notification-relay.json');
+const FALLBACK_POLL_MS = Number.parseInt(
+  process.env.NOTIFICATION_FALLBACK_POLL_MS ?? process.env.NOTIFICATION_POLL_MS ?? '60000',
+  10
+);
+const STORE_PATH =
+  process.env.NOTIFICATION_RELAY_STORE_PATH ??
+  path.join(homedir(), '.nativemail', 'fastmail-glass', 'notification-relay.json');
+const LEGACY_STORE_PATH = path.join(process.cwd(), '.nativemail', 'notification-relay.json');
 
 /** @type {Map<string, Subscriber>} */
 const subscribers = new Map();
@@ -189,22 +196,25 @@ async function startSubscriber(subscriber, { rehydrate }) {
     }
   }
 
+  if (subscriber.eventSourceUrl) {
+    subscriber.abortController = new AbortController();
+    void readEventSourceLoop(subscriber, subscriber.abortController.signal);
+  } else {
+    startPolling(subscriber);
+    subscriber.status = 'polling; no JMAP eventSourceUrl';
+    await saveStore();
+  }
+}
+
+function startPolling(subscriber) {
   subscriber.pollTimer = setInterval(() => {
     void refreshInbox(subscriber, { notify: true, reason: 'poll' }).catch((error) => {
       subscriber.status = `poll error: ${describeError(error)}`;
       console.error('[relay] poll failed', subscriber.deviceId, error);
       void saveStore();
     });
-  }, POLL_MS);
+  }, FALLBACK_POLL_MS);
   subscriber.pollTimer.unref?.();
-
-  if (subscriber.eventSourceUrl) {
-    subscriber.abortController = new AbortController();
-    void readEventSourceLoop(subscriber, subscriber.abortController.signal);
-  } else {
-    subscriber.status = 'polling; no JMAP eventSourceUrl';
-    await saveStore();
-  }
 }
 
 function stopSubscriber(subscriber) {
@@ -550,7 +560,7 @@ function toPublicSubscriber(subscriber) {
     inboxMailboxId: subscriber.inboxMailboxId,
     knownInboxEmailIds: subscriber.knownInboxEmailIds.length,
     mailboxName: subscriber.mailboxName,
-    pollingMs: POLL_MS,
+    pollingMs: subscriber.pollTimer ? FALLBACK_POLL_MS : null,
     status: subscriber.status,
     username: subscriber.username,
   };
@@ -558,7 +568,13 @@ function toPublicSubscriber(subscriber) {
 
 async function loadStore() {
   try {
-    const text = await readFile(STORE_PATH, 'utf8');
+    const text = await readFile(STORE_PATH, 'utf8').catch(async (error) => {
+      if (error?.code === 'ENOENT' && STORE_PATH !== LEGACY_STORE_PATH) {
+        return await readFile(LEGACY_STORE_PATH, 'utf8');
+      }
+
+      throw error;
+    });
     const data = JSON.parse(text);
 
     for (const subscriber of data.subscribers ?? []) {

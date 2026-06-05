@@ -204,16 +204,16 @@ function formatRelaySubscriberStatus(subscriber: unknown) {
   const value = subscriber as {
     eventSource?: boolean;
     mailboxName?: string;
-    pollingMs?: number;
+    pollingMs?: number | null;
     status?: string;
     username?: string;
   };
-  const mode = value.eventSource ? 'JMAP event source + polling' : 'polling';
+  const mode = value.eventSource ? 'JMAP event source' : 'server polling fallback';
 
   return [
     `Registered ${value.username ?? 'account'} ${value.mailboxName ?? 'Inbox'}`,
     `Mode: ${mode}`,
-    value.pollingMs ? `Poll: ${Math.round(value.pollingMs / 1000)}s` : null,
+    value.pollingMs ? `Fallback poll: ${Math.round(value.pollingMs / 1000)}s` : null,
     value.status ? `Status: ${value.status}` : null,
   ]
     .filter(Boolean)
