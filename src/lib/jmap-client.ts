@@ -1293,7 +1293,10 @@ function normalizeTrueRecord(
     return normalized
 }
 
-function getPlainTextBody(email: EmailObject) {
+function getPlainTextBody(
+    email: EmailObject,
+    { allowPreviewFallback = false }: { allowPreviewFallback?: boolean } = {}
+) {
     const chunks = email.textBody
         ?.map((part) =>
             part.partId ? email.bodyValues?.[part.partId]?.value : null
@@ -1304,7 +1307,7 @@ function getPlainTextBody(email: EmailObject) {
         return chunks.join('\n\n')
     }
 
-    return email.preview?.trim() || null
+    return allowPreviewFallback ? email.preview?.trim() || null : null
 }
 
 async function getEmailBody(
@@ -1330,7 +1333,7 @@ async function getEmailBody(
         ),
         debug: inlinedHtml?.debug,
         html: inlinedHtml?.html ?? null,
-        text: getPlainTextBody(email),
+        text: getPlainTextBody(email, { allowPreviewFallback: true }),
     }
 }
 

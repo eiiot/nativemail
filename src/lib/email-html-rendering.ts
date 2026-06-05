@@ -52,9 +52,10 @@ export function getEmailBodyHeightScript(contentWidth: number, darkMode = false)
       var darkTextColor = 'rgb(242, 242, 247)';
       var darkSecondaryTextColor = 'rgb(174, 174, 178)';
       var darkBorderColor = 'rgb(58, 58, 60)';
-      var darkLinkColor = 'rgb(106, 159, 255)';
+      var darkLinkColor = 'rgb(255, 159, 10)';
       var darkSurfaceRgb = { r: 28, g: 28, b: 30, a: 1 };
       var darkModeDebug = {
+        accentTextCount: 0,
         backgroundCount: 0,
         borderCount: 0,
         linkCount: 0,
@@ -154,6 +155,10 @@ export function getEmailBodyHeightScript(contentWidth: number, darkMode = false)
         return getColorRange(color) <= 24;
       }
 
+      function isSaturatedColor(color) {
+        return getColorRange(color) >= 56;
+      }
+
       function isNearWhiteSurface(color) {
         return color.a > 0.65 && getLuminance(color) >= 0.78 && isNeutralColor(color);
       }
@@ -182,6 +187,97 @@ export function getEmailBodyHeightScript(contentWidth: number, darkMode = false)
 
       function setImportantStyle(element, property, value) {
         element.style.setProperty(property, value, 'important');
+      }
+
+      function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, value));
+      }
+
+      function rgbToHsl(color) {
+        var r = color.r / 255;
+        var g = color.g / 255;
+        var b = color.b / 255;
+        var max = Math.max(r, g, b);
+        var min = Math.min(r, g, b);
+        var h = 0;
+        var s = 0;
+        var l = (max + min) / 2;
+        var delta = max - min;
+
+        if (delta) {
+          s = l > 0.5 ? delta / (2 - max - min) : delta / (max + min);
+
+          if (max === r) {
+            h = (g - b) / delta + (g < b ? 6 : 0);
+          } else if (max === g) {
+            h = (b - r) / delta + 2;
+          } else {
+            h = (r - g) / delta + 4;
+          }
+
+          h /= 6;
+        }
+
+        return { h: h, l: l, s: s };
+      }
+
+      function hslToRgb(hsl) {
+        function hueToRgb(p, q, t) {
+          if (t < 0) {
+            t += 1;
+          }
+
+          if (t > 1) {
+            t -= 1;
+          }
+
+          if (t < 1 / 6) {
+            return p + (q - p) * 6 * t;
+          }
+
+          if (t < 1 / 2) {
+            return q;
+          }
+
+          if (t < 2 / 3) {
+            return p + (q - p) * (2 / 3 - t) * 6;
+          }
+
+          return p;
+        }
+
+        if (!hsl.s) {
+          var gray = Math.round(hsl.l * 255);
+
+          return { r: gray, g: gray, b: gray, a: 1 };
+        }
+
+        var q = hsl.l < 0.5 ? hsl.l * (1 + hsl.s) : hsl.l + hsl.s - hsl.l * hsl.s;
+        var p = 2 * hsl.l - q;
+
+        return {
+          a: 1,
+          b: Math.round(hueToRgb(p, q, hsl.h - 1 / 3) * 255),
+          g: Math.round(hueToRgb(p, q, hsl.h) * 255),
+          r: Math.round(hueToRgb(p, q, hsl.h + 1 / 3) * 255)
+        };
+      }
+
+      function toRgbString(color) {
+        return 'rgb(' + Math.round(color.r) + ', ' + Math.round(color.g) + ', ' + Math.round(color.b) + ')';
+      }
+
+      function getReadableAccentColor(color) {
+        var hsl = rgbToHsl(color);
+        var nextColor = hslToRgb({
+          h: hsl.h,
+          l: clamp(Math.max(hsl.l, 0.64), 0.64, 0.76),
+          s: clamp(Math.max(hsl.s, 0.55), 0.55, 0.9)
+        });
+
+        return getContrastRatio(nextColor, darkSurfaceRgb) >= 4.5
+          ? toRgbString(nextColor)
+          : darkLinkColor;
       }
 
       function maybeTransformBorder(element, computedStyle, side) {
@@ -259,18 +355,26 @@ export function getEmailBodyHeightScript(contentWidth: number, darkMode = false)
 
           if (tagName === 'a') {
             if (getContrastRatio(textColor, darkSurfaceRgb) < 4.5) {
-              setImportantStyle(element, 'color', darkLinkColor);
-              setImportantStyle(element, 'text-decoration-color', darkLinkColor);
+              var hasInlineLinkColor = Boolean(element.style && element.style.color);
+              var nextLinkColor = hasInlineLinkColor && isSaturatedColor(textColor)
+                ? getReadableAccentColor(textColor)
+                : darkLinkColor;
+
+              setImportantStyle(element, 'color', nextLinkColor);
+              setImportantStyle(element, 'text-decoration-color', nextLinkColor);
               darkModeDebug.linkCount += 1;
             }
 
             return;
           }
 
-          if (isDarkReadableText(textColor) || getContrastRatio(textColor, darkSurfaceRgb) < 4.5) {
+          if (!isNeutralColor(textColor) && isSaturatedColor(textColor) && getContrastRatio(textColor, darkSurfaceRgb) < 4.5) {
+            setImportantStyle(element, 'color', getReadableAccentColor(textColor));
+            darkModeDebug.accentTextCount += 1;
+          } else if (isDarkReadableText(textColor) || getContrastRatio(textColor, darkSurfaceRgb) < 4.5) {
             setImportantStyle(element, 'color', darkTextColor);
             darkModeDebug.textCount += 1;
-          } else if (getContrastRatio(textColor, darkSurfaceRgb) < 7) {
+          } else if (isNeutralColor(textColor) && getContrastRatio(textColor, darkSurfaceRgb) < 7) {
             setImportantStyle(element, 'color', darkSecondaryTextColor);
             darkModeDebug.textCount += 1;
           }

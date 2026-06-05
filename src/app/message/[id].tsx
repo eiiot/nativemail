@@ -110,6 +110,7 @@ type EmailWebViewImageDebug = {
 };
 
 type EmailWebViewDarkModeDebug = {
+  accentTextCount: number;
   backgroundCount: number;
   borderCount: number;
   linkCount: number;
@@ -1153,7 +1154,22 @@ function ExpandedThreadMessage({
 }) {
   const debugMode = useDebugMode();
   const body = message.body ?? message.preview ?? getMockMessageBody();
-  const rawHtmlBody = message.htmlBody;
+  const messageHtmlBody = message.htmlBody;
+  const retainedHtmlBodyRef = useRef<{ html: string | null; messageId: string }>({
+    html: messageHtmlBody?.trim() ? messageHtmlBody : null,
+    messageId: message.id,
+  });
+
+  if (retainedHtmlBodyRef.current.messageId !== message.id) {
+    retainedHtmlBodyRef.current = {
+      html: messageHtmlBody?.trim() ? messageHtmlBody : null,
+      messageId: message.id,
+    };
+  } else if (messageHtmlBody?.trim()) {
+    retainedHtmlBodyRef.current.html = messageHtmlBody;
+  }
+
+  const rawHtmlBody = messageHtmlBody?.trim() ? messageHtmlBody : retainedHtmlBodyRef.current.html;
   const htmlBody = rawHtmlBody?.trim();
   const htmlReplySplit = useMemo(
     () => (htmlBody ? splitEmailReplyHtml(htmlBody) : null),
@@ -1590,6 +1606,7 @@ function getEmailDarkModeDebugText(darkModeDebug: EmailWebViewDarkModeDebug | nu
     'dark mode transform:',
     `backgrounds=${darkModeDebug.backgroundCount}`,
     `text=${darkModeDebug.textCount}`,
+    `accents=${darkModeDebug.accentTextCount}`,
     `links=${darkModeDebug.linkCount}`,
     `borders=${darkModeDebug.borderCount}`,
     `skipped colored=${darkModeDebug.skippedColoredBackgroundCount}`,

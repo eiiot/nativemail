@@ -45,7 +45,7 @@ export const useMailStore = create<MailStoreState>((set) => ({
         const body = getMessageBodyFromMessage(message);
 
         if (body) {
-          messageBodies[message.id] = body;
+          messageBodies[message.id] = mergeMessageBodies(messageBodies[message.id], body);
         }
       }
 
