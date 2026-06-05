@@ -109,6 +109,15 @@ type EmailWebViewImageDebug = {
   phase: string;
 };
 
+type EmailWebViewDarkModeDebug = {
+  backgroundCount: number;
+  borderCount: number;
+  linkCount: number;
+  skippedBackgroundImageCount: number;
+  skippedColoredBackgroundCount: number;
+  textCount: number;
+};
+
 export default function MessageScreen() {
   const params = useLocalSearchParams<{
     avatar?: string;
@@ -1162,6 +1171,7 @@ function ExpandedThreadMessage({
   const hasQuoteHistory = Boolean(quoteHtmlBody || quoteTextBody);
   const attachments = message.attachments ?? [];
   const [imageDebug, setImageDebug] = useState<EmailWebViewImageDebug | null>(null);
+  const [darkModeDebug, setDarkModeDebug] = useState<EmailWebViewDarkModeDebug | null>(null);
   const messageMenuActions = useMemo(
     () => getMessageMenuActions(message, debugMode, Boolean(htmlBody)),
     [debugMode, htmlBody, message.pinned, message.unread],
@@ -1169,6 +1179,7 @@ function ExpandedThreadMessage({
 
   useEffect(() => {
     setImageDebug(null);
+    setDarkModeDebug(null);
   }, [htmlBody]);
   useEffect(() => {
     setQuoteHistoryExpanded(false);
@@ -1207,6 +1218,7 @@ function ExpandedThreadMessage({
           <EmailBodyWebView
             colors={colors}
             html={visibleHtmlBody}
+            onDarkModeDebug={setDarkModeDebug}
             onImageDebug={setImageDebug}
           />
           {hasQuoteHistory ? (
@@ -1228,6 +1240,7 @@ function ExpandedThreadMessage({
             <EmailBodyDebugReport
               colors={colors}
               debug={bodyDebug}
+              darkModeDebug={darkModeDebug}
               html={htmlBody ?? visibleHtmlBody}
               imageDebug={imageDebug}
             />
@@ -1490,16 +1503,18 @@ function formatAttachmentSize(size: number) {
 function EmailBodyDebugReport({
   colors,
   debug,
+  darkModeDebug,
   html,
   imageDebug,
 }: {
   colors: ColorSet;
   debug?: JmapMessageBodyDebug;
+  darkModeDebug: EmailWebViewDarkModeDebug | null;
   html: string;
   imageDebug: EmailWebViewImageDebug | null;
 }) {
   const renderedCidCount = html.match(/\bcid:/gi)?.length ?? 0;
-  const reportText = getEmailDebugReportText(debug, renderedCidCount, imageDebug);
+  const reportText = getEmailDebugReportText(debug, renderedCidCount, imageDebug, darkModeDebug);
   const copyReport = () => {
     Clipboard.setString(reportText);
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -1522,13 +1537,16 @@ function getEmailDebugReportText(
   debug: JmapMessageBodyDebug | undefined,
   renderedCidCount: number,
   imageDebug: EmailWebViewImageDebug | null,
+  darkModeDebug: EmailWebViewDarkModeDebug | null,
 ) {
   const imageDebugText = getEmailImageDebugText(imageDebug);
+  const darkModeDebugText = getEmailDarkModeDebugText(darkModeDebug);
 
   if (!debug) {
     return [
       `HTML debug unavailable. Rendered HTML cid refs: ${renderedCidCount}.`,
       imageDebugText,
+      darkModeDebugText,
     ].join('\n');
   }
 
@@ -1559,7 +1577,24 @@ function getEmailDebugReportText(
     `inline image error details:\n${inlineImageErrors}`,
     `parts:\n${imageParts}`,
     imageDebugText,
+    darkModeDebugText,
   ].join('\n');
+}
+
+function getEmailDarkModeDebugText(darkModeDebug: EmailWebViewDarkModeDebug | null) {
+  if (!darkModeDebug) {
+    return 'dark mode transform: pending/disabled';
+  }
+
+  return [
+    'dark mode transform:',
+    `backgrounds=${darkModeDebug.backgroundCount}`,
+    `text=${darkModeDebug.textCount}`,
+    `links=${darkModeDebug.linkCount}`,
+    `borders=${darkModeDebug.borderCount}`,
+    `skipped colored=${darkModeDebug.skippedColoredBackgroundCount}`,
+    `skipped image bg=${darkModeDebug.skippedBackgroundImageCount}`,
+  ].join(' ');
 }
 
 function getEmailImageDebugText(imageDebug: EmailWebViewImageDebug | null) {
@@ -1595,10 +1630,12 @@ function getEmailImageDebugText(imageDebug: EmailWebViewImageDebug | null) {
 function EmailBodyWebView({
   colors,
   html,
+  onDarkModeDebug,
   onImageDebug,
 }: {
   colors: ColorSet;
   html: string;
+  onDarkModeDebug?: (debug: EmailWebViewDarkModeDebug) => void;
   onImageDebug: (debug: EmailWebViewImageDebug) => void;
 }) {
   const [contentWidth, setContentWidth] = useState(defaultEmailBodyWidth);
@@ -1622,8 +1659,8 @@ function EmailBodyWebView({
     [emailColors, html, measuredContentWidth],
   );
   const heightMeasurementScript = useMemo(
-    () => getEmailBodyHeightScript(measuredContentWidth),
-    [measuredContentWidth],
+    () => getEmailBodyHeightScript(measuredContentWidth, colors.emailBackground !== lightColors.emailBackground),
+    [colors.emailBackground, measuredContentWidth],
   );
   const handleLayout = (event: { nativeEvent: { layout: { width: number } } }) => {
     const nextWidth = event.nativeEvent.layout.width;
@@ -1652,10 +1689,12 @@ function EmailBodyWebView({
           );
         } else if (message?.type === 'image-debug' && message.imageDebug) {
           onImageDebug(message.imageDebug);
+        } else if (message?.type === 'dark-mode-debug' && message.darkModeDebug) {
+          onDarkModeDebug?.(message.darkModeDebug);
         }
       } catch {}
     },
-    [onImageDebug],
+    [onDarkModeDebug, onImageDebug],
   );
   const handleShouldStartLoadWithRequest = (request: {
     isTopFrame?: boolean;

@@ -42,11 +42,26 @@ export function getEmailHtmlDocument({
   ].join('');
 }
 
-export function getEmailBodyHeightScript(contentWidth: number) {
+export function getEmailBodyHeightScript(contentWidth: number, darkMode = false) {
   return `
     (function () {
       var lastHeight = 0;
       var displayWidth = ${contentWidth};
+      var darkMode = ${darkMode ? 'true' : 'false'};
+      var darkSurfaceColor = 'rgb(28, 28, 30)';
+      var darkTextColor = 'rgb(242, 242, 247)';
+      var darkSecondaryTextColor = 'rgb(174, 174, 178)';
+      var darkBorderColor = 'rgb(58, 58, 60)';
+      var darkLinkColor = 'rgb(106, 159, 255)';
+      var darkSurfaceRgb = { r: 28, g: 28, b: 30, a: 1 };
+      var darkModeDebug = {
+        backgroundCount: 0,
+        borderCount: 0,
+        linkCount: 0,
+        skippedBackgroundImageCount: 0,
+        skippedColoredBackgroundCount: 0,
+        textCount: 0
+      };
 
       function getNaturalWidth() {
         var body = document.body;
@@ -80,6 +95,191 @@ export function getEmailBodyHeightScript(contentWidth: number) {
         } catch (error) {
           return '';
         }
+      }
+
+      function parseColor(value) {
+        if (!value || value === 'transparent') {
+          return null;
+        }
+
+        var match = value.match(/rgba?\\(([^)]+)\\)/i);
+
+        if (!match) {
+          return null;
+        }
+
+        var parts = match[1].split(',').map(function (part) {
+          return part.trim();
+        });
+        var alpha = parts.length > 3 ? parseFloat(parts[3]) : 1;
+
+        if (parts.length < 3 || alpha <= 0.05) {
+          return null;
+        }
+
+        return {
+          a: Number.isFinite(alpha) ? alpha : 1,
+          b: parseFloat(parts[2]),
+          g: parseFloat(parts[1]),
+          r: parseFloat(parts[0])
+        };
+      }
+
+      function getLuminance(color) {
+        function channel(value) {
+          var normalized = value / 255;
+
+          return normalized <= 0.03928
+            ? normalized / 12.92
+            : Math.pow((normalized + 0.055) / 1.055, 2.4);
+        }
+
+        return 0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b);
+      }
+
+      function getContrastRatio(first, second) {
+        var firstLuminance = getLuminance(first);
+        var secondLuminance = getLuminance(second);
+        var lighter = Math.max(firstLuminance, secondLuminance);
+        var darker = Math.min(firstLuminance, secondLuminance);
+
+        return (lighter + 0.05) / (darker + 0.05);
+      }
+
+      function getColorRange(color) {
+        return Math.max(color.r, color.g, color.b) - Math.min(color.r, color.g, color.b);
+      }
+
+      function isNeutralColor(color) {
+        return getColorRange(color) <= 24;
+      }
+
+      function isNearWhiteSurface(color) {
+        return color.a > 0.65 && getLuminance(color) >= 0.78 && isNeutralColor(color);
+      }
+
+      function isDarkReadableText(color) {
+        return color.a > 0.65 && getLuminance(color) <= 0.42;
+      }
+
+      function hasOpaqueBackground(computedStyle) {
+        return Boolean(parseColor(computedStyle.backgroundColor));
+      }
+
+      function hasTransformedSurfaceAncestor(element) {
+        var current = element;
+
+        while (current && current !== document.documentElement) {
+          if (current.getAttribute && current.getAttribute('data-nativemail-dark-surface') === '1') {
+            return true;
+          }
+
+          current = current.parentElement;
+        }
+
+        return false;
+      }
+
+      function setImportantStyle(element, property, value) {
+        element.style.setProperty(property, value, 'important');
+      }
+
+      function maybeTransformBorder(element, computedStyle, side) {
+        var width = parseFloat(computedStyle.getPropertyValue('border-' + side + '-width') || '0');
+
+        if (!width) {
+          return;
+        }
+
+        var color = parseColor(computedStyle.getPropertyValue('border-' + side + '-color'));
+
+        if (color && isNearWhiteSurface(color)) {
+          setImportantStyle(element, 'border-' + side + '-color', darkBorderColor);
+          darkModeDebug.borderCount += 1;
+        }
+      }
+
+      function applyDarkModeTransform() {
+        if (!darkMode || !document.body || document.body.__nativemailDarkModeApplied) {
+          return;
+        }
+
+        document.body.__nativemailDarkModeApplied = true;
+        document.documentElement.style.setProperty('color-scheme', 'dark', 'important');
+        document.documentElement.style.setProperty('background-color', darkSurfaceColor, 'important');
+        document.body.style.setProperty('background-color', darkSurfaceColor, 'important');
+        document.body.style.setProperty('color', darkTextColor, 'important');
+
+        var elements = Array.prototype.slice.call(document.body.querySelectorAll(
+          'body, table, tbody, thead, tfoot, tr, td, th, div, p, section, article, main, header, footer, center, span, font, blockquote, ul, ol, li, h1, h2, h3, h4, h5, h6, a'
+        ));
+
+        elements.unshift(document.body);
+
+        elements.forEach(function (element) {
+          var tagName = element.tagName ? element.tagName.toLowerCase() : '';
+
+          if (tagName === 'img' || tagName === 'svg' || tagName === 'picture') {
+            return;
+          }
+
+          var computedStyle = window.getComputedStyle(element);
+          var background = parseColor(computedStyle.backgroundColor);
+          var hasBackgroundImage = computedStyle.backgroundImage && computedStyle.backgroundImage !== 'none';
+          var transformedSurface = false;
+
+          if (background && isNearWhiteSurface(background)) {
+            if (hasBackgroundImage) {
+              darkModeDebug.skippedBackgroundImageCount += 1;
+            } else {
+              setImportantStyle(element, 'background-color', darkSurfaceColor);
+              element.setAttribute('data-nativemail-dark-surface', '1');
+              transformedSurface = true;
+              darkModeDebug.backgroundCount += 1;
+            }
+          } else if (background && getLuminance(background) >= 0.56 && !isNeutralColor(background)) {
+            darkModeDebug.skippedColoredBackgroundCount += 1;
+          }
+
+          maybeTransformBorder(element, computedStyle, 'top');
+          maybeTransformBorder(element, computedStyle, 'right');
+          maybeTransformBorder(element, computedStyle, 'bottom');
+          maybeTransformBorder(element, computedStyle, 'left');
+
+          var textColor = parseColor(computedStyle.color);
+          var hasSurface = transformedSurface || hasTransformedSurfaceAncestor(element);
+          var hasOwnNonTransformedBackground =
+            hasOpaqueBackground(computedStyle) &&
+            !transformedSurface &&
+            element.getAttribute('data-nativemail-dark-surface') !== '1';
+
+          if (!textColor || !hasSurface || hasOwnNonTransformedBackground) {
+            return;
+          }
+
+          if (tagName === 'a') {
+            if (getContrastRatio(textColor, darkSurfaceRgb) < 4.5) {
+              setImportantStyle(element, 'color', darkLinkColor);
+              setImportantStyle(element, 'text-decoration-color', darkLinkColor);
+              darkModeDebug.linkCount += 1;
+            }
+
+            return;
+          }
+
+          if (isDarkReadableText(textColor) || getContrastRatio(textColor, darkSurfaceRgb) < 4.5) {
+            setImportantStyle(element, 'color', darkTextColor);
+            darkModeDebug.textCount += 1;
+          } else if (getContrastRatio(textColor, darkSurfaceRgb) < 7) {
+            setImportantStyle(element, 'color', darkSecondaryTextColor);
+            darkModeDebug.textCount += 1;
+          }
+        });
+
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: 'dark-mode-debug',
+          darkModeDebug: darkModeDebug
+        }));
       }
 
       function getImageDebug(phase) {
@@ -166,26 +366,31 @@ export function getEmailBodyHeightScript(contentWidth: number) {
         }));
       }
 
+      applyDarkModeTransform();
       attachImageDebug();
       postImageDebug('initial');
       postHeight();
       window.addEventListener('load', function () {
+        applyDarkModeTransform();
         attachImageDebug();
         postImageDebug('window-load');
         postHeight();
       });
       window.addEventListener('resize', postHeight);
       setTimeout(function () {
+        applyDarkModeTransform();
         attachImageDebug();
         postImageDebug('timer-50');
         postHeight();
       }, 50);
       setTimeout(function () {
+        applyDarkModeTransform();
         attachImageDebug();
         postImageDebug('timer-250');
         postHeight();
       }, 250);
       setTimeout(function () {
+        applyDarkModeTransform();
         attachImageDebug();
         postImageDebug('timer-1000');
         postHeight();
