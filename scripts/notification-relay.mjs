@@ -118,6 +118,18 @@ async function route(request, response) {
     return;
   }
 
+  if (request.method === 'GET' && url.pathname.startsWith('/register/')) {
+    const deviceId = sanitizeDeviceId(decodeURIComponent(url.pathname.slice('/register/'.length)));
+    const subscriber = subscribers.get(deviceId);
+
+    sendJson(response, 200, {
+      ok: true,
+      registered: Boolean(subscriber),
+      subscriber: subscriber ? toPublicSubscriber(subscriber) : null,
+    });
+    return;
+  }
+
   if (request.method === 'DELETE' && url.pathname.startsWith('/register/')) {
     const deviceId = sanitizeDeviceId(decodeURIComponent(url.pathname.slice('/register/'.length)));
     const subscriber = subscribers.get(deviceId);
@@ -411,8 +423,27 @@ async function sendExpoPush(subscriber, message) {
     throw new Error(`Expo push failed with HTTP ${response.status}: ${JSON.stringify(payload)}`);
   }
 
+  assertExpoPushTicketOk(payload);
+
   console.log('[relay] sent notification', subscriber.deviceId, message.title, message.subtitle ?? '');
   return payload;
+}
+
+function assertExpoPushTicketOk(payload) {
+  const tickets = Array.isArray(payload?.data) ? payload.data : payload?.data ? [payload.data] : [];
+  const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+  const failedTicket = tickets.find((ticket) => ticket?.status === 'error');
+  const requestError = errors[0];
+
+  if (!failedTicket && !requestError) {
+    return;
+  }
+
+  const error = failedTicket ?? requestError;
+  const detailCode = error?.details?.error ? ` (${error.details.error})` : '';
+  const message = error?.message ?? JSON.stringify(error);
+
+  throw new Error(`Expo push ticket error${detailCode}: ${message}`);
 }
 
 async function discoverJmapSession(token) {

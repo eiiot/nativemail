@@ -20,6 +20,12 @@ export type InboxNotificationRegistrationResult = {
   status: string;
 };
 
+export type InboxNotificationRegistrationStatus = {
+  registered: boolean;
+  relayUrl: string;
+  status: string;
+};
+
 export async function getNotificationRelayUrl() {
   const storedUrl = await SecureStore.getItemAsync(notificationRelayUrlKey, secureStoreOptions);
 
@@ -112,6 +118,49 @@ export async function sendInboxNotificationTest(relayUrlInput?: string) {
   return 'Test notification sent';
 }
 
+export async function getInboxNotificationRegistrationStatus(
+  relayUrlInput?: string,
+): Promise<InboxNotificationRegistrationStatus> {
+  const relayUrl = relayUrlInput
+    ? await saveNotificationRelayUrl(relayUrlInput)
+    : await getNotificationRelayUrl();
+  const deviceId = await getStoredNotificationDeviceId();
+
+  if (!deviceId) {
+    return {
+      registered: false,
+      relayUrl,
+      status: 'This device has not registered for Inbox notifications yet.',
+    };
+  }
+
+  const response = await fetch(`${relayUrl}/register/${encodeURIComponent(deviceId)}`, {
+    headers: {
+      Accept: 'application/json',
+    },
+    method: 'GET',
+  });
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(payload?.error ?? `Notification relay status failed with HTTP ${response.status}.`);
+  }
+
+  if (!payload?.registered) {
+    return {
+      registered: false,
+      relayUrl,
+      status: 'This device is not registered with the notification relay.',
+    };
+  }
+
+  return {
+    registered: true,
+    relayUrl,
+    status: formatRelaySubscriberStatus(payload.subscriber),
+  };
+}
+
 export async function unregisterInboxNotifications(relayUrlInput?: string) {
   const relayUrl = relayUrlInput
     ? await saveNotificationRelayUrl(relayUrlInput)
@@ -177,6 +226,10 @@ async function getNotificationDeviceId() {
   await SecureStore.setItemAsync(notificationDeviceIdKey, nextId, secureStoreOptions);
 
   return nextId;
+}
+
+async function getStoredNotificationDeviceId() {
+  return SecureStore.getItemAsync(notificationDeviceIdKey, secureStoreOptions);
 }
 
 function getExpoProjectId() {

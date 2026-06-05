@@ -5,6 +5,7 @@ import {
 } from '@/lib/fastmail-token';
 import { setDebugMode, useDebugMode } from '@/lib/debug-mode';
 import {
+  getInboxNotificationRegistrationStatus,
   getNotificationRelayUrl,
   registerForInboxNotifications,
   sendInboxNotificationTest,
@@ -55,6 +56,7 @@ export default function SettingsScreen() {
   const [testing, setTesting] = useState(false);
   const [diagnosticText, setDiagnosticText] = useState('');
   const [notificationBusy, setNotificationBusy] = useState(false);
+  const [notificationRegistered, setNotificationRegistered] = useState(false);
   const [notificationRelayUrl, setNotificationRelayUrl] = useState('');
   const [notificationStatusText, setNotificationStatusText] = useState('');
   const [tokenInput, setTokenInput] = useState('');
@@ -97,13 +99,22 @@ export default function SettingsScreen() {
     let mounted = true;
 
     getNotificationRelayUrl()
-      .then((relayUrl) => {
+      .then(async (relayUrl) => {
         if (mounted) {
           setNotificationRelayUrl(relayUrl);
+          setNotificationStatusText('Checking notification registration...');
+        }
+
+        const status = await getInboxNotificationRegistrationStatus(relayUrl);
+
+        if (mounted) {
+          setNotificationRegistered(status.registered);
+          setNotificationStatusText(status.status);
         }
       })
       .catch((error: unknown) => {
         if (mounted) {
+          setNotificationRegistered(false);
           setNotificationStatusText(describeJmapError(error));
         }
       });
@@ -187,9 +198,11 @@ export default function SettingsScreen() {
     try {
       const result = await registerForInboxNotifications(notificationRelayUrl);
 
+      setNotificationRegistered(true);
       setNotificationRelayUrl(result.relayUrl);
       setNotificationStatusText(result.status);
     } catch (error) {
+      setNotificationRegistered(false);
       setNotificationStatusText(describeJmapError(error));
     } finally {
       setNotificationBusy(false);
@@ -222,6 +235,7 @@ export default function SettingsScreen() {
     setNotificationStatusText('Unregistering notifications...');
 
     try {
+      setNotificationRegistered(false);
       setNotificationStatusText(await unregisterInboxNotifications(notificationRelayUrl));
     } catch (error) {
       setNotificationStatusText(describeJmapError(error));
@@ -390,11 +404,11 @@ export default function SettingsScreen() {
               <View
                 style={[
                   styles.statusBadge,
-                  { backgroundColor: notificationStatusText ? colors.configuredBadge : colors.missingBadge },
+                  { backgroundColor: notificationRegistered ? colors.configuredBadge : colors.missingBadge },
                 ]}>
                 <SymbolView
-                  name={notificationStatusText ? 'bell.badge' : 'bell'}
-                  tintColor={notificationStatusText ? colors.configuredText : colors.missingText}
+                  name={notificationRegistered ? 'bell.badge' : 'bell'}
+                  tintColor={notificationRegistered ? colors.configuredText : colors.missingText}
                   size={14}
                   weight="bold"
                 />
@@ -438,7 +452,7 @@ export default function SettingsScreen() {
             <View style={styles.actionRow}>
               <Pressable
                 accessibilityRole="button"
-                disabled={notificationBusy || !notificationRelayUrl.trim()}
+                disabled={notificationBusy || !notificationRegistered || !notificationRelayUrl.trim()}
                 onPress={testNotifications}
                 style={({ pressed }) => [
                   styles.primaryButton,
