@@ -1,5 +1,7 @@
 import { hydrateMailboxSnapshotFromCache } from '@/lib/mail-store';
-import { Stack, ThemeProvider, DarkTheme, DefaultTheme } from 'expo-router';
+import { getNotificationMessageRoute } from '@/lib/inbox-notifications';
+import * as Notifications from 'expo-notifications';
+import { Stack, ThemeProvider, DarkTheme, DefaultTheme, router } from 'expo-router';
 import { useEffect } from 'react';
 import { Text, TextInput, useColorScheme, type TextInputProps, type TextProps } from 'react-native';
 import { KeyboardProvider } from 'react-native-keyboard-controller';
@@ -20,6 +22,15 @@ DefaultTextInput.defaultProps = {
   maxFontSizeMultiplier: APP_MAX_FONT_SIZE_MULTIPLIER,
 };
 
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldPlaySound: false,
+    shouldSetBadge: false,
+    shouldShowBanner: true,
+    shouldShowList: true,
+  }),
+});
+
 export const unstable_settings = {
   initialRouteName: 'folders',
 };
@@ -29,6 +40,25 @@ export default function RootLayout() {
 
   useEffect(() => {
     void hydrateMailboxSnapshotFromCache().catch(() => {});
+  }, []);
+  useEffect(() => {
+    const openNotificationMessage = (response: Notifications.NotificationResponse | null) => {
+      const data = response?.notification.request.content.data;
+      const route = data ? getNotificationMessageRoute(data) : null;
+
+      if (route) {
+        router.push(route);
+      }
+    };
+    const subscription = Notifications.addNotificationResponseReceivedListener(openNotificationMessage);
+
+    Notifications.getLastNotificationResponseAsync()
+      .then(openNotificationMessage)
+      .catch(() => {});
+
+    return () => {
+      subscription.remove();
+    };
   }, []);
 
   return (

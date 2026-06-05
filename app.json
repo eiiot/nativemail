@@ -45,7 +45,8 @@
           }
         }
       ],
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-notifications"
     ],
     "owner": "elioth",
     "experiments": {

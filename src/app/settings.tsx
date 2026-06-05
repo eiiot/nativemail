@@ -4,6 +4,12 @@ import {
   saveFastmailJmapToken,
 } from '@/lib/fastmail-token';
 import { setDebugMode, useDebugMode } from '@/lib/debug-mode';
+import {
+  getNotificationRelayUrl,
+  registerForInboxNotifications,
+  sendInboxNotificationTest,
+  unregisterInboxNotifications,
+} from '@/lib/inbox-notifications';
 import { describeJmapError, diagnoseFastmailJmap } from '@/lib/jmap-client';
 import {
   getNavigationDebugReport,
@@ -48,10 +54,14 @@ export default function SettingsScreen() {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [diagnosticText, setDiagnosticText] = useState('');
+  const [notificationBusy, setNotificationBusy] = useState(false);
+  const [notificationRelayUrl, setNotificationRelayUrl] = useState('');
+  const [notificationStatusText, setNotificationStatusText] = useState('');
   const [tokenInput, setTokenInput] = useState('');
   const [statusText, setStatusText] = useState('');
   const canSave = tokenInput.trim().length > 0 && !saving;
   const canTest = configured && !saving && !testing;
+  const canRegisterNotifications = configured && !saving && !notificationBusy && notificationRelayUrl.trim().length > 0;
 
   useEffect(() => {
     let mounted = true;
@@ -76,6 +86,25 @@ export default function SettingsScreen() {
       .finally(() => {
         if (mounted) {
           setLoading(false);
+        }
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+  useEffect(() => {
+    let mounted = true;
+
+    getNotificationRelayUrl()
+      .then((relayUrl) => {
+        if (mounted) {
+          setNotificationRelayUrl(relayUrl);
+        }
+      })
+      .catch((error: unknown) => {
+        if (mounted) {
+          setNotificationStatusText(describeJmapError(error));
         }
       });
 
@@ -145,6 +174,60 @@ export default function SettingsScreen() {
   const updateDebugMode = (enabled: boolean) => {
     pressHaptic();
     setDebugMode(enabled);
+  };
+  const registerNotifications = async () => {
+    if (!canRegisterNotifications) {
+      return;
+    }
+
+    pressHaptic();
+    setNotificationBusy(true);
+    setNotificationStatusText('Registering device with notification relay...');
+
+    try {
+      const result = await registerForInboxNotifications(notificationRelayUrl);
+
+      setNotificationRelayUrl(result.relayUrl);
+      setNotificationStatusText(result.status);
+    } catch (error) {
+      setNotificationStatusText(describeJmapError(error));
+    } finally {
+      setNotificationBusy(false);
+    }
+  };
+  const testNotifications = async () => {
+    if (!notificationRelayUrl.trim() || notificationBusy) {
+      return;
+    }
+
+    pressHaptic();
+    setNotificationBusy(true);
+    setNotificationStatusText('Sending test notification...');
+
+    try {
+      setNotificationStatusText(await sendInboxNotificationTest(notificationRelayUrl));
+    } catch (error) {
+      setNotificationStatusText(describeJmapError(error));
+    } finally {
+      setNotificationBusy(false);
+    }
+  };
+  const unregisterNotifications = async () => {
+    if (!notificationRelayUrl.trim() || notificationBusy) {
+      return;
+    }
+
+    pressHaptic();
+    setNotificationBusy(true);
+    setNotificationStatusText('Unregistering notifications...');
+
+    try {
+      setNotificationStatusText(await unregisterInboxNotifications(notificationRelayUrl));
+    } catch (error) {
+      setNotificationStatusText(describeJmapError(error));
+    } finally {
+      setNotificationBusy(false);
+    }
   };
 
   return (
@@ -294,6 +377,104 @@ export default function SettingsScreen() {
             ) : null}
           </View>
 
+          <View style={[styles.card, styles.notificationsCard, { backgroundColor: colors.card }]}>
+            <View style={styles.cardHeader}>
+              <View style={styles.cardHeaderText}>
+                <Text {...textScale} style={[styles.cardTitle, { color: colors.text }]}>
+                  Inbox notifications
+                </Text>
+                <Text {...textScale} style={[styles.cardSubtitle, { color: colors.secondaryText }]}>
+                  Prototype push relay for new Inbox mail
+                </Text>
+              </View>
+              <View
+                style={[
+                  styles.statusBadge,
+                  { backgroundColor: notificationStatusText ? colors.configuredBadge : colors.missingBadge },
+                ]}>
+                <SymbolView
+                  name={notificationStatusText ? 'bell.badge' : 'bell'}
+                  tintColor={notificationStatusText ? colors.configuredText : colors.missingText}
+                  size={14}
+                  weight="bold"
+                />
+              </View>
+            </View>
+
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              maxFontSizeMultiplier={1.12}
+              onChangeText={setNotificationRelayUrl}
+              placeholder="Notification relay URL"
+              placeholderTextColor={colors.placeholder}
+              returnKeyType="done"
+              selectionColor={tint}
+              style={[
+                styles.tokenInput,
+                {
+                  backgroundColor: colors.inputBackground,
+                  color: colors.text,
+                },
+              ]}
+              textContentType="URL"
+              value={notificationRelayUrl}
+            />
+
+            <Pressable
+              accessibilityRole="button"
+              disabled={!canRegisterNotifications}
+              onPress={registerNotifications}
+              style={({ pressed }) => [
+                styles.testButton,
+                { backgroundColor: canRegisterNotifications ? tint : colors.disabledButton },
+                pressed && styles.pressed,
+              ]}>
+              <Text {...textScale} style={[styles.primaryButtonText, { color: colors.primaryButtonText }]}>
+                {notificationBusy ? 'Working' : 'Register Device'}
+              </Text>
+            </Pressable>
+
+            <View style={styles.actionRow}>
+              <Pressable
+                accessibilityRole="button"
+                disabled={notificationBusy || !notificationRelayUrl.trim()}
+                onPress={testNotifications}
+                style={({ pressed }) => [
+                  styles.primaryButton,
+                  { backgroundColor: colors.secondaryButton },
+                  pressed && styles.pressed,
+                ]}>
+                <Text {...textScale} style={[styles.secondaryButtonText, { color: colors.text }]}>
+                  Send Test
+                </Text>
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                disabled={notificationBusy || !notificationRelayUrl.trim()}
+                onPress={unregisterNotifications}
+                style={({ pressed }) => [
+                  styles.secondaryButton,
+                  { backgroundColor: colors.secondaryButton },
+                  pressed && styles.pressed,
+                ]}>
+                <Text {...textScale} style={[styles.secondaryButtonText, { color: colors.text }]}>
+                  Stop
+                </Text>
+              </Pressable>
+            </View>
+
+            {notificationStatusText ? (
+              <Text selectable style={[styles.diagnosticText, { backgroundColor: colors.inputBackground, color: colors.text }]}>
+                {notificationStatusText}
+              </Text>
+            ) : (
+              <Text {...textScale} style={[styles.statusText, { color: colors.secondaryText }]}>
+                Requires this dev client to include expo-notifications.
+              </Text>
+            )}
+          </View>
+
           <View style={[styles.card, styles.debugCard, { backgroundColor: colors.card }]}>
             <View style={styles.debugRow}>
               <View style={styles.debugTextBlock}>
@@ -422,6 +603,9 @@ const styles = StyleSheet.create({
   debugCard: {
     marginTop: 14,
   },
+  notificationsCard: {
+    marginTop: 14,
+  },
   debugRow: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -471,6 +655,10 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     marginBottom: 16,
+  },
+  cardHeaderText: {
+    flex: 1,
+    paddingRight: 12,
   },
   cardTitle: {
     fontFamily: systemFont,
