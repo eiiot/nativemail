@@ -87,6 +87,7 @@ const pressHaptic = () => {
   void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 };
 type MessageAction = 'archive' | 'reply' | 'reply-all' | 'toggle-pin' | 'toggle-unread' | 'trash';
+type MessageStatusPatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 const copyEmailHtmlAction = 'copy-email-html';
 
 type EmailWebViewImageDebug = {
@@ -148,7 +149,6 @@ export default function MessageScreen() {
   const messageId = Array.isArray(id) ? id[0] : id;
   const fallbackMessage = getMessageById(messageId);
   const routeMessage = getRouteMessage(params, fallbackMessage);
-  const routeKeywordsText = getRouteParam(params.keywords) ?? '';
   const wasUnreadOnOpen = getRouteParam(params.wasUnreadOnOpen) === '1';
   const routeThreadId = routeMessage.threadId;
   const messageBodies = useMailStore((state) => state.messageBodies);
@@ -190,9 +190,69 @@ export default function MessageScreen() {
     () => mergeThreadMessagesWithBodies(threadMessages ?? cachedThreadMessages ?? [routeMessage], messageBodies, message),
     [cachedThreadMessages, message, messageBodies, routeMessage, threadMessages],
   );
+  const actionTargetMessage = detailMessages.find((detailMessage) => detailMessage.id === focusedThreadMessageId) ?? message;
   const expandedThreadMessageKey = useMemo(
     () => Array.from(expandedThreadMessageIds).sort().join('\n'),
     [expandedThreadMessageIds],
+  );
+  const patchVisibleMessage = useCallback(
+    (targetMessageId: string, patch: MessageStatusPatch) => {
+      setThreadMessages((currentMessages) =>
+        currentMessages
+          ? currentMessages.map((threadMessage) =>
+              threadMessage.id === targetMessageId ? applyMessageStatusPatch(threadMessage, patch) : threadMessage,
+            )
+          : currentMessages,
+      );
+      patchStoreMessage(targetMessageId, patch);
+
+      if (targetMessageId === messageId) {
+        setLocalFlags((currentFlags) => ({
+          pinned: patch.pinned ?? currentFlags.pinned,
+          unread: patch.unread ?? currentFlags.unread,
+        }));
+      }
+    },
+    [messageId, patchStoreMessage],
+  );
+  const markVisibleMessageRead = useCallback(
+    (targetMessage: Message) => {
+      if (source !== 'jmap' || !targetMessage.id || !targetMessage.unread) {
+        return;
+      }
+
+      const nextKeywords = updateMessageKeyword(targetMessage.keywords, '$seen', true);
+      const optimisticPatch = {
+        keywords: nextKeywords,
+        unread: false,
+      };
+
+      patchVisibleMessage(targetMessage.id, optimisticPatch);
+      void updateCachedEmail(targetMessage.id, optimisticPatch).catch(() => {});
+
+      setJmapEmailUnread(targetMessage.id, false)
+        .then((result) => {
+          const resultPatch = {
+            keywords: result.keywords,
+            pinned: result.pinned,
+            unread: result.unread,
+          };
+
+          patchVisibleMessage(targetMessage.id, resultPatch);
+          void updateCachedEmail(targetMessage.id, resultPatch).catch(() => {});
+        })
+        .catch(() => {
+          const rollbackPatch = {
+            keywords: targetMessage.keywords,
+            pinned: targetMessage.pinned,
+            unread: targetMessage.unread,
+          };
+
+          patchVisibleMessage(targetMessage.id, rollbackPatch);
+          void updateCachedEmail(targetMessage.id, rollbackPatch).catch(() => {});
+        });
+    },
+    [patchVisibleMessage, source],
   );
 
   useEffect(() => {
@@ -289,51 +349,8 @@ export default function MessageScreen() {
     }
   }, [expandedThreadMessageKey, expandedThreadMessageIds, source]);
   useEffect(() => {
-    if (source !== 'jmap' || !messageId || !routeMessage.unread) {
-      return;
-    }
-
-    const nextKeywords = updateMessageKeyword(routeMessage.keywords, '$seen', true);
-
-    setLocalFlags((currentFlags) => ({ ...currentFlags, unread: false }));
-    patchStoreMessage(messageId, {
-      keywords: nextKeywords,
-      unread: false,
-    });
-    void updateCachedEmail(messageId, {
-      keywords: nextKeywords,
-      unread: false,
-    }).catch(() => {});
-
-    setJmapEmailUnread(messageId, false)
-      .then((result) => {
-        patchStoreMessage(messageId, {
-          keywords: result.keywords,
-          pinned: result.pinned,
-          unread: result.unread,
-        });
-        void updateCachedEmail(messageId, {
-          keywords: result.keywords,
-          pinned: result.pinned,
-          unread: result.unread,
-        }).catch(() => {});
-        setLocalFlags((currentFlags) => ({
-          pinned: result.pinned ?? currentFlags.pinned,
-          unread: result.unread ?? currentFlags.unread,
-        }));
-      })
-      .catch(() => {
-        setLocalFlags((currentFlags) => ({ ...currentFlags, unread: routeMessage.unread }));
-        patchStoreMessage(messageId, {
-          keywords: routeMessage.keywords,
-          unread: routeMessage.unread,
-        });
-        void updateCachedEmail(messageId, {
-          keywords: routeMessage.keywords,
-          unread: routeMessage.unread,
-        }).catch(() => {});
-      });
-  }, [messageId, patchStoreMessage, routeKeywordsText, routeMessage.unread, source]);
+    markVisibleMessageRead(actionTargetMessage);
+  }, [actionTargetMessage.id, actionTargetMessage.unread, markVisibleMessageRead]);
   const runMessageAction = (action: MessageAction) => {
     pressHaptic();
 
@@ -345,13 +362,18 @@ export default function MessageScreen() {
       return;
     }
 
-    const previousFlags = localFlags;
+    const targetMessage = actionTargetMessage;
+    const previousPatch = {
+      keywords: targetMessage.keywords,
+      pinned: targetMessage.pinned,
+      unread: targetMessage.unread,
+    };
 
     if (source !== 'jmap') {
       if (action === 'toggle-pin') {
-        setLocalFlags((currentFlags) => ({ ...currentFlags, pinned: !currentFlags.pinned }));
+        patchVisibleMessage(targetMessage.id, { pinned: !targetMessage.pinned });
       } else if (action === 'toggle-unread') {
-        setLocalFlags((currentFlags) => ({ ...currentFlags, unread: !currentFlags.unread }));
+        patchVisibleMessage(targetMessage.id, { unread: !targetMessage.unread });
       }
 
       return;
@@ -360,14 +382,22 @@ export default function MessageScreen() {
     setPendingAction(action);
 
     if (action === 'toggle-pin') {
-      setLocalFlags((currentFlags) => ({ ...currentFlags, pinned: !currentFlags.pinned }));
+      const nextPinned = !targetMessage.pinned;
+      patchVisibleMessage(targetMessage.id, {
+        keywords: updateMessageKeyword(targetMessage.keywords, '$flagged', nextPinned),
+        pinned: nextPinned,
+      });
     }
 
     if (action === 'toggle-unread') {
-      setLocalFlags((currentFlags) => ({ ...currentFlags, unread: !currentFlags.unread }));
+      const nextUnread = !targetMessage.unread;
+      patchVisibleMessage(targetMessage.id, {
+        keywords: updateMessageKeyword(targetMessage.keywords, '$seen', !nextUnread),
+        unread: nextUnread,
+      });
     }
 
-    const request = getMessageActionRequest(action, messageId, message);
+    const request = getMessageActionRequest(action, targetMessage.id, targetMessage);
 
     request
       .then((result) => {
@@ -376,13 +406,18 @@ export default function MessageScreen() {
           return;
         }
 
-        setLocalFlags((currentFlags) => ({
-          pinned: result.pinned ?? currentFlags.pinned,
-          unread: result.unread ?? currentFlags.unread,
-        }));
+        const resultPatch = {
+          keywords: result.keywords,
+          pinned: result.pinned,
+          unread: result.unread,
+        };
+
+        patchVisibleMessage(targetMessage.id, resultPatch);
+        void updateCachedEmail(targetMessage.id, resultPatch).catch(() => {});
       })
       .catch((error: unknown) => {
-        setLocalFlags(previousFlags);
+        patchVisibleMessage(targetMessage.id, previousPatch);
+        void updateCachedEmail(targetMessage.id, previousPatch).catch(() => {});
       })
       .finally(() => {
         setPendingAction(null);
@@ -477,14 +512,14 @@ export default function MessageScreen() {
         />
         <Stack.Toolbar.Button
           disabled={actionDisabled}
-          icon={message.unread ? 'envelope.open' : 'envelope.badge'}
+          icon={actionTargetMessage.unread ? 'envelope.open' : 'envelope.badge'}
           onPress={() => runMessageAction('toggle-unread')}
         />
         <Stack.Toolbar.Button
           disabled={actionDisabled}
-          icon={message.pinned ? 'pin.fill' : 'pin'}
+          icon={actionTargetMessage.pinned ? 'pin.fill' : 'pin'}
           onPress={() => runMessageAction('toggle-pin')}
-          tintColor={message.pinned ? colors.pin : undefined}
+          tintColor={actionTargetMessage.pinned ? colors.pin : undefined}
         />
         <Stack.Toolbar.Spacer width={1} />
         <Stack.Toolbar.Button
@@ -854,6 +889,15 @@ function updateMessageKeyword(
   }
 
   return nextKeywords;
+}
+
+function applyMessageStatusPatch(message: Message, patch: MessageStatusPatch): Message {
+  return {
+    ...message,
+    ...(patch.keywords === undefined ? {} : { keywords: patch.keywords }),
+    ...(patch.pinned === undefined ? {} : { pinned: patch.pinned }),
+    ...(patch.unread === undefined ? {} : { unread: patch.unread }),
+  };
 }
 
 function getMessageMenuActions(message: Message, debugMode: boolean, hasHtmlBody: boolean): MenuAction[] {

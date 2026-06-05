@@ -234,52 +234,6 @@ export default function InboxScreen() {
   const messageRouteSource = liveMessages ? 'jmap' : 'mock';
   const navTitleVisible = scrollY >= titleRevealStart;
   const listIsScrolling = listScrollPhase !== 'idle';
-  const markMessageReadOnOpen = useCallback(
-    (item: Message) => {
-      if (!liveMessages || !item.unread) {
-        return item;
-      }
-
-      const nextKeywords = updateMessageKeyword(item.keywords, '$seen', true);
-      const nextMessage = {
-        ...item,
-        keywords: nextKeywords,
-        unread: false,
-      };
-
-      patchStoreMessage(item.id, {
-        keywords: nextKeywords,
-        unread: false,
-      });
-      void updateCachedEmail(item.id, {
-        keywords: nextKeywords,
-        unread: false,
-      }).catch(() => {});
-
-      setJmapEmailUnread(item.id, false)
-        .then((result) => {
-          patchStoreMessage(item.id, {
-            keywords: result.keywords,
-            pinned: result.pinned,
-            unread: result.unread,
-          });
-          void updateCachedEmail(item.id, {
-            keywords: result.keywords,
-            pinned: result.pinned,
-            unread: result.unread,
-          }).catch(() => {});
-        })
-        .catch((error: unknown) => {
-          if (snapshot) {
-            applyMailboxSnapshot(snapshot, mailboxId);
-          }
-          console.warn('JMAP mark read on open failed', describeJmapError(error));
-        });
-
-      return nextMessage;
-    },
-    [applyMailboxSnapshot, liveMessages, mailboxId, patchStoreMessage, snapshot],
-  );
   const scrollGeometryModifier = useScrollGeometryChange(
     useCallback((geometry) => {
       if (initialScrollOffsetYRef.current === null) {
@@ -828,8 +782,7 @@ export default function InboxScreen() {
       clearPendingMessageNavigation();
     }, messageNavigationGuardMs);
 
-    const openedMessage = markMessageReadOnOpen(item);
-    const messageHref = getMessageRouteHref(openedMessage, activeMailboxName, messageRouteSource);
+    const messageHref = getMessageRouteHref(item, activeMailboxName, messageRouteSource);
 
     if (liveMessages) {
       void hydrateMessageBodyFromCache(item.id).catch(() => {});
