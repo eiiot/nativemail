@@ -53,12 +53,16 @@ export const useMailStore = create<MailStoreState>((set) => ({
     });
   },
   applyMessageBody: (messageId, body) => {
-    set((state) => ({
-      messageBodies: {
-        ...state.messageBodies,
-        [messageId]: body,
-      },
-    }));
+    set((state) => {
+      const currentBody = state.messageBodies[messageId];
+
+      return {
+        messageBodies: {
+          ...state.messageBodies,
+          [messageId]: mergeMessageBodies(currentBody, body),
+        },
+      };
+    });
   },
   patchMessage: (messageId, patch) => {
     set((state) => ({
@@ -318,4 +322,24 @@ function getMessageBodyFromMessage(message: Message): JmapMessageBody | null {
     html: message.htmlBody ?? null,
     text: message.body ?? null,
   };
+}
+
+function mergeMessageBodies(
+  currentBody: JmapMessageBody | undefined,
+  nextBody: JmapMessageBody,
+): JmapMessageBody {
+  if (!currentBody) {
+    return nextBody;
+  }
+
+  return {
+    attachments: nextBody.attachments.length ? nextBody.attachments : currentBody.attachments,
+    debug: nextBody.debug ?? currentBody.debug,
+    html: getPreferredBodyValue(nextBody.html, currentBody.html),
+    text: getPreferredBodyValue(nextBody.text, currentBody.text),
+  };
+}
+
+function getPreferredBodyValue(nextValue: string | null, currentValue: string | null) {
+  return nextValue?.trim() ? nextValue : currentValue;
 }
