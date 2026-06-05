@@ -89,6 +89,7 @@ const pressHaptic = () => {
 type MessageAction = 'archive' | 'reply' | 'reply-all' | 'toggle-pin' | 'toggle-unread' | 'trash';
 type MessageStatusPatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 const copyEmailHtmlAction = 'copy-email-html';
+const maxReadDebugEvents = 24;
 
 type EmailWebViewImageDebug = {
   imageCount: number;
@@ -145,6 +146,7 @@ export default function MessageScreen() {
   const { id, mailboxName, source } = params;
   const insets = useSafeAreaInsets();
   const scheme = useColorScheme();
+  const debugMode = useDebugMode();
   const colors = scheme === 'dark' ? darkColors : lightColors;
   const messageId = Array.isArray(id) ? id[0] : id;
   const fallbackMessage = getMessageById(messageId);
@@ -161,6 +163,7 @@ export default function MessageScreen() {
     unread: routeMessage.unread,
   });
   const [pendingAction, setPendingAction] = useState<MessageAction | null>(null);
+  const [readDebugEvents, setReadDebugEvents] = useState<string[]>([]);
   const [threadMessages, setThreadMessages] = useState<Message[] | null>(null);
   const [focusedThreadMessageId, setFocusedThreadMessageId] = useState(messageId);
   const [expandedThreadMessageIds, setExpandedThreadMessageIds] = useState<Set<string>>(
@@ -191,9 +194,50 @@ export default function MessageScreen() {
     [cachedThreadMessages, message, messageBodies, routeMessage, threadMessages],
   );
   const actionTargetMessage = detailMessages.find((detailMessage) => detailMessage.id === focusedThreadMessageId) ?? message;
+  const expandedUnreadMessages = useMemo(
+    () => detailMessages.filter((detailMessage) =>
+      expandedThreadMessageIds.has(detailMessage.id) && detailMessage.unread
+    ),
+    [detailMessages, expandedThreadMessageIds],
+  );
+  const expandedUnreadMessageKey = useMemo(
+    () => expandedUnreadMessages.map((detailMessage) => detailMessage.id).join('\n'),
+    [expandedUnreadMessages],
+  );
   const expandedThreadMessageKey = useMemo(
     () => Array.from(expandedThreadMessageIds).sort().join('\n'),
     [expandedThreadMessageIds],
+  );
+  const appendReadDebugEvent = useCallback((event: string) => {
+    setReadDebugEvents((currentEvents) =>
+      [
+        ...currentEvents,
+        `${new Date().toISOString()} ${event}`,
+      ].slice(-maxReadDebugEvents),
+    );
+  }, []);
+  const threadReadDebugText = useMemo(
+    () =>
+      getThreadReadDebugText({
+        actionTargetMessage,
+        detailMessages,
+        expandedMessageIds: expandedThreadMessageIds,
+        focusedMessageId: focusedThreadMessageId,
+        readDebugEvents,
+        routeMessage,
+        source,
+        wasUnreadOnOpen,
+      }),
+    [
+      actionTargetMessage,
+      detailMessages,
+      expandedThreadMessageIds,
+      focusedThreadMessageId,
+      readDebugEvents,
+      routeMessage,
+      source,
+      wasUnreadOnOpen,
+    ],
   );
   const patchVisibleMessage = useCallback(
     (targetMessageId: string, patch: MessageStatusPatch) => {
@@ -227,6 +271,9 @@ export default function MessageScreen() {
         unread: false,
       };
 
+      appendReadDebugEvent(
+        `mark-read start id=${targetMessage.id} thread=${targetMessage.threadId ?? 'none'} unread=${targetMessage.unread ? '1' : '0'} seen=${targetMessage.keywords?.$seen === true ? '1' : '0'}`,
+      );
       patchVisibleMessage(targetMessage.id, optimisticPatch);
       void updateCachedEmail(targetMessage.id, optimisticPatch).catch(() => {});
 
@@ -240,8 +287,11 @@ export default function MessageScreen() {
 
           patchVisibleMessage(targetMessage.id, resultPatch);
           void updateCachedEmail(targetMessage.id, resultPatch).catch(() => {});
+          appendReadDebugEvent(
+            `mark-read success id=${targetMessage.id} unread=${result.unread === true ? '1' : '0'} seen=${result.keywords?.$seen === true ? '1' : '0'}`,
+          );
         })
-        .catch(() => {
+        .catch((error: unknown) => {
           const rollbackPatch = {
             keywords: targetMessage.keywords,
             pinned: targetMessage.pinned,
@@ -250,9 +300,12 @@ export default function MessageScreen() {
 
           patchVisibleMessage(targetMessage.id, rollbackPatch);
           void updateCachedEmail(targetMessage.id, rollbackPatch).catch(() => {});
+          appendReadDebugEvent(
+            `mark-read failed id=${targetMessage.id} error=${error instanceof Error ? error.message : String(error)}`,
+          );
         });
     },
-    [patchVisibleMessage, source],
+    [appendReadDebugEvent, patchVisibleMessage, source],
   );
 
   useEffect(() => {
@@ -265,6 +318,7 @@ export default function MessageScreen() {
       unread: routeMessage.unread,
     });
     setPendingAction(null);
+    setReadDebugEvents([]);
     setThreadMessages(null);
     setFocusedThreadMessageId(messageId);
     setExpandedThreadMessageIds(new Set([messageId]));
@@ -308,16 +362,23 @@ export default function MessageScreen() {
         const focusId = getThreadFocusMessageId(nextMessages, messageId, wasUnreadOnOpen);
         const expandedIds = getInitialExpandedThreadMessageIds(nextMessages, focusId);
 
+        appendReadDebugEvent(
+          `thread fetch ids=${nextMessages.map((threadMessage) => `${threadMessage.id}:${threadMessage.unread ? 'unread' : 'read'}`).join(',')} focus=${focusId}`,
+        );
         setThreadMessages(nextMessages);
         setFocusedThreadMessageId(focusId);
         setExpandedThreadMessageIds(expandedIds);
       })
-      .catch(() => {});
+      .catch((error: unknown) => {
+        appendReadDebugEvent(
+          `thread fetch failed error=${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
 
     return () => {
       controller.abort();
     };
-  }, [cachedThreadMessageKey, cachedThreadMessages, messageId, routeMessage.threadId, source, wasUnreadOnOpen]);
+  }, [appendReadDebugEvent, cachedThreadMessageKey, cachedThreadMessages, messageId, routeMessage.threadId, source, wasUnreadOnOpen]);
 
   useEffect(() => {
     const shouldLoadJmap = source === 'jmap';
@@ -349,8 +410,10 @@ export default function MessageScreen() {
     }
   }, [expandedThreadMessageKey, expandedThreadMessageIds, source]);
   useEffect(() => {
-    markVisibleMessageRead(actionTargetMessage);
-  }, [actionTargetMessage.id, actionTargetMessage.unread, markVisibleMessageRead]);
+    for (const unreadMessage of expandedUnreadMessages) {
+      markVisibleMessageRead(unreadMessage);
+    }
+  }, [expandedUnreadMessageKey, expandedUnreadMessages, markVisibleMessageRead]);
   const runMessageAction = (action: MessageAction) => {
     pressHaptic();
 
@@ -383,18 +446,22 @@ export default function MessageScreen() {
 
     if (action === 'toggle-pin') {
       const nextPinned = !targetMessage.pinned;
-      patchVisibleMessage(targetMessage.id, {
+      const optimisticPatch = {
         keywords: updateMessageKeyword(targetMessage.keywords, '$flagged', nextPinned),
         pinned: nextPinned,
-      });
+      };
+
+      patchVisibleMessage(targetMessage.id, optimisticPatch);
     }
 
     if (action === 'toggle-unread') {
       const nextUnread = !targetMessage.unread;
-      patchVisibleMessage(targetMessage.id, {
+      const optimisticPatch = {
         keywords: updateMessageKeyword(targetMessage.keywords, '$seen', !nextUnread),
         unread: nextUnread,
-      });
+      };
+
+      patchVisibleMessage(targetMessage.id, optimisticPatch);
     }
 
     const request = getMessageActionRequest(action, targetMessage.id, targetMessage);
@@ -566,6 +633,7 @@ export default function MessageScreen() {
               return nextIds;
             });
           }}
+          threadDebugText={debugMode ? threadReadDebugText : null}
         />
       </View>
     </>
@@ -900,6 +968,71 @@ function applyMessageStatusPatch(message: Message, patch: MessageStatusPatch): M
   };
 }
 
+function getThreadReadDebugText({
+  actionTargetMessage,
+  detailMessages,
+  expandedMessageIds,
+  focusedMessageId,
+  readDebugEvents,
+  routeMessage,
+  source,
+  wasUnreadOnOpen,
+}: {
+  actionTargetMessage: Message;
+  detailMessages: Message[];
+  expandedMessageIds: Set<string>;
+  focusedMessageId: string;
+  readDebugEvents: string[];
+  routeMessage: Message;
+  source?: string | string[];
+  wasUnreadOnOpen: boolean;
+}) {
+  const expandedIds = Array.from(expandedMessageIds);
+  const unreadIds = detailMessages
+    .filter((message) => message.unread)
+    .map((message) => message.id);
+  const sourceText = Array.isArray(source) ? source[0] : source;
+
+  return [
+    `source: ${sourceText ?? 'unknown'}`,
+    `route id: ${routeMessage.id}`,
+    `route thread: ${routeMessage.threadId ?? 'none'}`,
+    `route unread: ${routeMessage.unread ? 'yes' : 'no'}`,
+    `route $seen: ${routeMessage.keywords?.$seen === true ? 'yes' : 'no'}`,
+    `wasUnreadOnOpen: ${wasUnreadOnOpen ? 'yes' : 'no'}`,
+    `focused id: ${focusedMessageId}`,
+    `action target id: ${actionTargetMessage.id}`,
+    `expanded ids: ${expandedIds.length ? expandedIds.join(', ') : 'none'}`,
+    `unread ids: ${unreadIds.length ? unreadIds.join(', ') : 'none'}`,
+    `messages: ${detailMessages.length}`,
+    ...detailMessages.map((message, index) => formatThreadMessageDebugLine(message, index)),
+    'events:',
+    readDebugEvents.length ? readDebugEvents.join('\n') : 'none',
+  ].join('\n');
+}
+
+function formatThreadMessageDebugLine(message: Message, index: number) {
+  return [
+    `${index + 1}. id=${message.id}`,
+    `thread=${message.threadId ?? 'none'}`,
+    `unread=${message.unread ? '1' : '0'}`,
+    `$seen=${message.keywords?.$seen === true ? '1' : '0'}`,
+    `keywords=${formatDebugRecordKeys(message.keywords)}`,
+    `pinned=${message.pinned ? '1' : '0'}`,
+    `date=${message.date || 'none'}`,
+    `from=${message.fromEmail || 'none'}`,
+    `mailboxes=${formatDebugRecordKeys(message.mailboxIds)}`,
+    `subject=${JSON.stringify(message.subject)}`,
+    `sender=${JSON.stringify(message.sender)}`,
+  ].join(' ');
+}
+
+function formatDebugRecordKeys(record: Record<string, true> | undefined) {
+  const keys = Object.keys(record ?? {});
+
+  return keys.length ? keys.join(',') : 'none';
+}
+
 function getMessageMenuActions(message: Message, debugMode: boolean, hasHtmlBody: boolean): MenuAction[] {
   const actions: MenuAction[] = [
     {
@@ -996,6 +1129,7 @@ function MessageDetail({
   onAction,
   onExpandAll,
   onToggleMessage,
+  threadDebugText,
 }: {
   bodyDebug?: JmapMessageBodyDebug;
   colors: ColorSet;
@@ -1008,6 +1142,7 @@ function MessageDetail({
   onAction: (action: MessageAction) => void;
   onExpandAll: () => void;
   onToggleMessage: (messageId: string) => void;
+  threadDebugText: string | null;
 }) {
   const scrollViewRef = useRef<ScrollView>(null);
   const didScrollToFocusedMessageRef = useRef(false);
@@ -1104,6 +1239,13 @@ function MessageDetail({
           );
         })}
       </View>
+      {threadDebugText ? (
+        <EmailDebugReport
+          colors={colors}
+          label="Thread Read Debug"
+          text={threadDebugText}
+        />
+      ) : null}
     </ScrollView>
   );
 }
@@ -1575,20 +1717,33 @@ function EmailBodyDebugReport({
 }) {
   const renderedCidCount = html.match(/\bcid:/gi)?.length ?? 0;
   const reportText = getEmailDebugReportText(debug, renderedCidCount, imageDebug, darkModeDebug);
+
+  return <EmailDebugReport colors={colors} label="Email HTML Debug" text={reportText} />;
+}
+
+function EmailDebugReport({
+  colors,
+  label,
+  text,
+}: {
+  colors: ColorSet;
+  label: string;
+  text: string;
+}) {
   const copyReport = () => {
-    Clipboard.setString(reportText);
+    Clipboard.setString(text);
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   };
 
   return (
     <View style={[styles.emailDebugBox, { borderColor: colors.groupDivider }]}>
       <View style={styles.emailDebugHeader}>
-        <Text style={[styles.emailDebugLabel, { color: colors.secondaryText }]}>Email HTML Debug</Text>
+        <Text style={[styles.emailDebugLabel, { color: colors.secondaryText }]}>{label}</Text>
         <Pressable accessibilityRole="button" onPress={copyReport} style={styles.emailDebugCopyButton}>
           <Text style={[styles.emailDebugCopyText, { color: colors.text }]}>Copy</Text>
         </Pressable>
       </View>
-      <Text style={[styles.emailDebugText, { color: colors.secondaryText }]}>{reportText}</Text>
+      <Text style={[styles.emailDebugText, { color: colors.secondaryText }]}>{text}</Text>
     </View>
   );
 }

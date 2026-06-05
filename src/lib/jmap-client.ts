@@ -941,7 +941,13 @@ async function updateJmapEmailKeywords(
             delete keywords[keyword]
         }
 
-        await updateEmail(client, accountId, messageId, { keywords }, signal)
+        await updateEmail(
+            client,
+            accountId,
+            messageId,
+            { [`keywords/${keyword}`]: enabled ? true : null },
+            signal
+        )
 
         return {
             keywords,

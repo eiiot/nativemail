@@ -352,48 +352,52 @@ export default function InboxScreen() {
 
       if (action === 'toggle-pin') {
         const nextPinned = !item.pinned;
-        patchStoreMessage(item.id, {
+        const optimisticPatch = {
           keywords: updateMessageKeyword(item.keywords, '$flagged', nextPinned),
           pinned: nextPinned,
-        });
+        };
+
+        patchStoreMessage(item.id, optimisticPatch);
 
         setJmapEmailPinned(item.id, nextPinned)
           .then((result) => {
-            patchStoreMessage(item.id, {
+            const resultPatch = {
               keywords: result.keywords,
               pinned: result.pinned,
               unread: result.unread,
-            });
-            void updateCachedEmail(item.id, {
-              keywords: result.keywords,
-              pinned: result.pinned,
-              unread: result.unread,
-            }).catch(() => {});
+            };
+
+            patchStoreMessage(item.id, resultPatch);
+            void updateCachedEmail(item.id, resultPatch).catch(() => {});
           })
-          .catch(restoreMessages);
+          .catch(() => {
+            restoreMessages();
+          });
         return;
       }
 
       const nextUnread = !item.unread;
-      patchStoreMessage(item.id, {
+      const optimisticPatch = {
         keywords: updateMessageKeyword(item.keywords, '$seen', !nextUnread),
         unread: nextUnread,
-      });
+      };
+
+      patchStoreMessage(item.id, optimisticPatch);
 
       setJmapEmailUnread(item.id, nextUnread)
         .then((result) => {
-          patchStoreMessage(item.id, {
+          const resultPatch = {
             keywords: result.keywords,
             pinned: result.pinned,
             unread: result.unread,
-          });
-          void updateCachedEmail(item.id, {
-            keywords: result.keywords,
-            pinned: result.pinned,
-            unread: result.unread,
-          }).catch(() => {});
+          };
+
+          patchStoreMessage(item.id, resultPatch);
+          void updateCachedEmail(item.id, resultPatch).catch(() => {});
         })
-        .catch(restoreMessages);
+        .catch(() => {
+          restoreMessages();
+        });
     },
     [
       applyMailboxSnapshot,
@@ -898,6 +902,14 @@ export default function InboxScreen() {
                   activeMailboxName={activeMailboxName}
                   colors={colors}
                   debugMode={debugMode}
+                  mailboxDebugText={getMailboxDebugReport({
+                    bodyCacheDebugStates,
+                    mailboxId: liveMailboxId,
+                    mailboxName: activeMailboxName,
+                    mailboxRole: liveMailboxRole,
+                    messages: renderedMessages,
+                    totalRows: sourceMessages.length,
+                  })}
                   navigationDebugTrace={navigationDebugTrace}
                 />
               </RNHostView>
@@ -1110,15 +1122,79 @@ function getBodyCacheDebugLabel(state: BodyCacheDebugState) {
   }
 }
 
+function getInboxRowDebugLabel(item: Message, state?: BodyCacheDebugState) {
+  return [
+    state ? `body=${getBodyCacheDebugLabel(state)}` : null,
+    `id=${formatShortDebugId(item.id)}`,
+    item.threadId ? `thread=${formatShortDebugId(item.threadId)}` : null,
+    `unread=${item.unread ? '1' : '0'}`,
+    `seen=${item.keywords?.$seen === true ? '1' : '0'}`,
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+function getMailboxDebugReport({
+  bodyCacheDebugStates,
+  mailboxId,
+  mailboxName,
+  mailboxRole,
+  messages,
+  totalRows,
+}: {
+  bodyCacheDebugStates: Record<string, BodyCacheDebugState>;
+  mailboxId: string | null;
+  mailboxName: string;
+  mailboxRole: string | null;
+  messages: Message[];
+  totalRows: number;
+}) {
+  return [
+    `mailbox: ${mailboxName}`,
+    `mailbox id: ${mailboxId ?? 'none'}`,
+    `mailbox role: ${mailboxRole ?? 'none'}`,
+    `rendered rows: ${messages.length}`,
+    `total memory rows: ${totalRows}`,
+    ...messages.map((message, index) =>
+      [
+        `${index + 1}. id=${message.id}`,
+        `thread=${message.threadId ?? 'none'}`,
+        `unread=${message.unread ? '1' : '0'}`,
+        `$seen=${message.keywords?.$seen === true ? '1' : '0'}`,
+        `keywords=${formatDebugRecordKeys(message.keywords)}`,
+        `pinned=${message.pinned ? '1' : '0'}`,
+        `body=${bodyCacheDebugStates[message.id] ?? 'unknown'}`,
+        `date=${message.date || 'none'}`,
+        `from=${message.fromEmail || 'none'}`,
+        `mailboxes=${formatDebugRecordKeys(message.mailboxIds)}`,
+        `subject=${JSON.stringify(message.subject)}`,
+        `sender=${JSON.stringify(message.sender)}`,
+      ].join(' '),
+    ),
+  ].join('\n');
+}
+
+function formatShortDebugId(id: string) {
+  return id.length > 10 ? `${id.slice(0, 5)}...${id.slice(-4)}` : id;
+}
+
+function formatDebugRecordKeys(record: Record<string, true> | undefined) {
+  const keys = Object.keys(record ?? {});
+
+  return keys.length ? keys.join(',') : 'none';
+}
+
 function InboxListHeader({
   activeMailboxName,
   colors,
   debugMode,
+  mailboxDebugText,
   navigationDebugTrace,
 }: {
   activeMailboxName: string;
   colors: ColorSet;
   debugMode: boolean;
+  mailboxDebugText: string;
   navigationDebugTrace: NavigationDebugTrace | null;
 }) {
   const { width } = useWindowDimensions();
@@ -1132,7 +1208,52 @@ function InboxListHeader({
         {activeMailboxName}
       </Text>
       {debugMode ? (
-        <NavigationDebugPanel colors={colors} trace={navigationDebugTrace} />
+        <>
+          <MailboxDebugPanel colors={colors} report={mailboxDebugText} />
+          <NavigationDebugPanel colors={colors} trace={navigationDebugTrace} />
+        </>
+      ) : null}
+    </View>
+  );
+}
+
+function MailboxDebugPanel({
+  colors,
+  report,
+}: {
+  colors: ColorSet;
+  report: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const copyReport = () => {
+    Clipboard.setString(report);
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+  };
+
+  return (
+    <View style={[styles.navigationDebugBox, { borderColor: colors.groupDivider }]}>
+      <View style={[styles.navigationDebugHeader, expanded ? styles.navigationDebugHeaderExpanded : null]}>
+        <Text style={[styles.navigationDebugLabel, { color: colors.secondaryText }]}>
+          Mailbox Debug
+        </Text>
+        <View style={styles.navigationDebugActions}>
+          <Pressable
+            accessibilityRole="button"
+            onPress={() => setExpanded((current) => !current)}
+            style={styles.navigationDebugCopyButton}>
+            <Text style={[styles.navigationDebugCopyText, { color: colors.text }]}>
+              {expanded ? 'Hide' : 'Show'}
+            </Text>
+          </Pressable>
+          <Pressable accessibilityRole="button" onPress={copyReport} style={styles.navigationDebugCopyButton}>
+            <Text style={[styles.navigationDebugCopyText, { color: colors.text }]}>Copy</Text>
+          </Pressable>
+        </View>
+      </View>
+      {expanded ? (
+        <Text selectable style={[styles.navigationDebugText, { color: colors.secondaryText }]}>
+          {report}
+        </Text>
       ) : null}
     </View>
   );
@@ -1469,9 +1590,7 @@ function MessageRow({
   const attachments = item.attachments ?? [];
   const avatarTextSize = (item.avatar?.length ?? 1) > 1 ? 16 : 22;
   const isArchiveMailbox = mailboxRole === 'archive' || mailboxName.trim().toLowerCase() === 'archive';
-  const bodyCacheDebugLabel = bodyCacheDebugState
-    ? getBodyCacheDebugLabel(bodyCacheDebugState)
-    : null;
+  const debugLabel = bodyCacheDebugState ? getInboxRowDebugLabel(item, bodyCacheDebugState) : null;
   const tapRow = () => {
     pressHaptic();
     onPress();
@@ -1547,14 +1666,14 @@ function MessageRow({
             {item.preview}
           </SwiftText>
           <SwiftInboxAttachmentPreview attachments={attachments} colors={colors} />
-          {bodyCacheDebugLabel ? (
+          {debugLabel ? (
             <SwiftText
               modifiers={[
                 font({ size: 8, weight: 'regular' }),
                 foregroundColor(colors.secondaryText),
                 lineLimit(1),
               ]}>
-              {bodyCacheDebugLabel}
+              {debugLabel}
             </SwiftText>
           ) : null}
         </VStack>
