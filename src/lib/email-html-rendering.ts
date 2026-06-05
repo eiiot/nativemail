@@ -305,6 +305,7 @@ export function getEmailBodyHeightScript(contentWidth: number, darkMode = false)
         document.documentElement.style.setProperty('background-color', darkSurfaceColor, 'important');
         document.body.style.setProperty('background-color', darkSurfaceColor, 'important');
         document.body.style.setProperty('color', darkTextColor, 'important');
+        document.body.setAttribute('data-nativemail-dark-surface', '1');
 
         var elements = Array.prototype.slice.call(document.body.querySelectorAll(
           'body, table, tbody, thead, tfoot, tr, td, th, div, p, section, article, main, header, footer, center, span, font, blockquote, ul, ol, li, h1, h2, h3, h4, h5, h6, a'
@@ -579,6 +580,11 @@ function getEmailHtmlStyles(
     pre, code {
       white-space: pre-wrap;
     }
+    .nativemail-outside-body {
+      font: inherit;
+      margin: 16px 0 0;
+      white-space: pre-wrap;
+    }
   `;
 }
 
@@ -589,9 +595,12 @@ function getEmailHtmlParts(html: string) {
 
   if (bodyMatches.length) {
     const bodyAttributes = bodyMatches[0]?.[1] ?? '';
+    const bodyHtml = bodyMatches.map((match) => match[2] ?? '').join('\n');
+    const trailingHtml = getTrailingHtmlAfterLastBody(sanitized, bodyMatches);
+    const body = trailingHtml ? `${bodyHtml}\n${trailingHtml}` : bodyHtml;
 
     return {
-      body: bodyMatches.map((match) => match[2] ?? '').join('\n'),
+      body,
       bodyAttributes: sanitizeEmailBodyAttributes(bodyAttributes),
       hasBodyMarginAttributes: bodyMatches.some((match) => hasEmailBodyMarginAttributes(match[1] ?? '')),
       head,
@@ -613,6 +622,24 @@ function getCombinedHeadHtml(html: string) {
   return Array.from(html.matchAll(/<head\b[^>]*>([\s\S]*?)<\/head>/gi))
     .map((match) => match[1] ?? '')
     .join('\n');
+}
+
+function getTrailingHtmlAfterLastBody(html: string, bodyMatches: RegExpMatchArray[]) {
+  const lastBodyMatch = bodyMatches[bodyMatches.length - 1];
+  const trailingText = html
+    .slice((lastBodyMatch.index ?? 0) + lastBodyMatch[0].length)
+    .replace(/<\/?html\b[^>]*>/gi, '')
+    .trim();
+
+  if (!trailingText) {
+    return '';
+  }
+
+  if (/<[a-z][\s\S]*>/i.test(trailingText)) {
+    return trailingText;
+  }
+
+  return `<pre class="nativemail-outside-body">${escapeHtml(trailingText)}</pre>`;
 }
 
 function hasEmailBodyMarginAttributes(attributes: string) {
@@ -643,4 +670,11 @@ function sanitizeEmailHtml(html: string) {
     .replace(/\s+(href|src)\s*=\s*"javascript:[^"]*"/gi, ' $1="#"')
     .replace(/\s+(href|src)\s*=\s*'javascript:[^']*'/gi, " $1='#'")
     .replace(/\s+(href|src)\s*=\s*javascript:[^\s>]+/gi, ' $1="#"');
+}
+
+function escapeHtml(text: string) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
