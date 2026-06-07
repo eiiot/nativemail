@@ -3,6 +3,7 @@ import { getFastmailJmapToken } from '@/lib/fastmail-token';
 import { archiveJmapEmail, fetchJmapMailboxes, fetchJmapMessageNotificationStates } from '@/lib/jmap-client';
 import { removeCachedEmailFromMailbox } from '@/lib/mail-cache';
 import { recordLocalMailAction, useMailStore } from '@/lib/mail-store';
+import { observeDuration, observeError, observeEvent } from '@/lib/observability';
 import Constants from 'expo-constants';
 import * as Device from 'expo-device';
 import * as Notifications from 'expo-notifications';
@@ -88,6 +89,12 @@ export async function archiveInboxNotificationResponse(
   }
 
   const mailboxId = getString(data?.mailboxId);
+  const startedAt = Date.now();
+
+  observeEvent('notification.archive.start', {
+    mailboxId: mailboxId || 'none',
+    messageId,
+  });
 
   recordLocalMailAction();
   useMailStore.getState().removeMessageFromMailbox(messageId, mailboxId || undefined);
@@ -96,7 +103,19 @@ export async function archiveInboxNotificationResponse(
   void adjustInboxUnreadBadgeCount(-1).catch(() => {});
   void recordInboxNotificationLocalAction(messageId).catch(() => {});
 
-  await archiveJmapEmail(messageId);
+  try {
+    await archiveJmapEmail(messageId);
+    observeDuration('notification.archive.success', startedAt, {
+      mailboxId: mailboxId || 'none',
+      messageId,
+    });
+  } catch (error: unknown) {
+    observeError('notification.archive.failed', error, {
+      mailboxId: mailboxId || 'none',
+      messageId,
+    });
+    throw error;
+  }
 
   return { messageId };
 }

@@ -45,6 +45,7 @@ import {
   useNavigationDebugTrace,
   type NavigationDebugTrace,
 } from '@/lib/navigation-debug';
+import { observeDuration, observeError, observeEvent } from '@/lib/observability';
 import {
   adjustInboxUnreadBadgeCount,
   dismissInboxNotificationForMessage,
@@ -344,7 +345,18 @@ export default function InboxScreen() {
       };
 
       if (action === 'archive' || action === 'delete' || action === 'unarchive') {
+        const actionStartedAt = Date.now();
+        const swipeProperties = {
+          action,
+          mailboxId: liveMailboxId ?? mailboxId ?? 'none',
+          messageId: item.id,
+          unread: item.unread,
+        };
+
+        observeEvent('inbox.swipe.action.start', swipeProperties);
+
         if (pendingDestructiveSwipeMessageIdsRef.current.has(item.id)) {
+          observeEvent('inbox.swipe.action.duplicate', swipeProperties, 'warn');
           return;
         }
 
@@ -364,12 +376,16 @@ export default function InboxScreen() {
             removedFromStore = true;
             removalTimer = null;
             removeStoreMessageFromMailbox(item.id, liveMailboxId);
+            observeDuration('inbox.swipe.optimistic-remove', actionStartedAt, swipeProperties);
             resolve();
           }, inboxSwipeRemovalDelayMs);
         });
 
         const mutation = new Promise<void>((resolve, reject) => {
+          const mutationStartedAt = Date.now();
+
           InteractionManager.runAfterInteractions(() => {
+            observeEvent('inbox.swipe.mutation.start', swipeProperties);
             const request =
               action === 'archive'
                 ? archiveJmapEmail(item.id)
@@ -377,15 +393,25 @@ export default function InboxScreen() {
                   ? unarchiveJmapEmail(item.id)
                   : trashJmapEmail(item.id);
 
-            request.then(() => resolve()).catch(reject);
+            request
+              .then(() => {
+                observeDuration('inbox.swipe.mutation.success', mutationStartedAt, swipeProperties);
+                resolve();
+              })
+              .catch((error: unknown) => {
+                observeError('inbox.swipe.mutation.failed', error, swipeProperties);
+                reject(error);
+              });
           });
         });
 
         Promise.all([removalDelay, mutation])
           .then(() => {
+            observeDuration('inbox.swipe.action.success', actionStartedAt, swipeProperties);
             void removeCachedEmailFromMailbox(item.id, liveMailboxId).catch(() => {});
           })
-          .catch(() => {
+          .catch((error: unknown) => {
+            observeError('inbox.swipe.action.rollback', error, swipeProperties);
             if (removalTimer) {
               clearTimeout(removalTimer);
               removalTimer = null;
@@ -399,12 +425,14 @@ export default function InboxScreen() {
             }
           })
           .finally(() => {
+            observeDuration('inbox.swipe.action.finished', actionStartedAt, swipeProperties);
             pendingDestructiveSwipeMessageIdsRef.current.delete(item.id);
           });
         return;
       }
 
       if (action === 'toggle-pin') {
+        const actionStartedAt = Date.now();
         const nextPinned = !item.pinned;
         const previousPatch = {
           keywords: item.keywords,
@@ -421,13 +449,24 @@ export default function InboxScreen() {
         void updateCachedEmail(item.id, optimisticPatch).catch(() => {});
 
         setJmapEmailPinned(item.id, nextPinned)
-          .catch(() => {
+          .then(() => {
+            observeDuration('inbox.action.toggle-pin.success', actionStartedAt, {
+              messageId: item.id,
+              nextPinned,
+            });
+          })
+          .catch((error: unknown) => {
+            observeError('inbox.action.toggle-pin.failed', error, {
+              messageId: item.id,
+              nextPinned,
+            });
             restoreMessages();
             void updateCachedEmail(item.id, previousPatch).catch(() => {});
           });
         return;
       }
 
+      const actionStartedAt = Date.now();
       const nextUnread = !item.unread;
       const previousPatch = {
         keywords: item.keywords,
@@ -450,7 +489,17 @@ export default function InboxScreen() {
       }
 
       setJmapEmailUnread(item.id, nextUnread)
-        .catch(() => {
+        .then(() => {
+          observeDuration('inbox.action.toggle-unread.success', actionStartedAt, {
+            messageId: item.id,
+            nextUnread,
+          });
+        })
+        .catch((error: unknown) => {
+          observeError('inbox.action.toggle-unread.failed', error, {
+            messageId: item.id,
+            nextUnread,
+          });
           restoreMessages();
           void updateCachedEmail(item.id, previousPatch).catch(() => {});
           if (isInboxView) {
@@ -486,12 +535,44 @@ export default function InboxScreen() {
       signal?: AbortSignal;
       tracePrefix: string;
     }) => {
+      const refreshStartedAt = Date.now();
+
       markNavigationTrace(`${tracePrefix} start`, `position=${position} limit=${limit}`);
-      const snapshot = await fetchJmapMailboxSnapshot({
+      observeEvent('mailbox.refresh.start', {
+        apply,
         limit,
-        mailboxId,
+        mailboxId: mailboxId ?? 'inbox',
         position,
-        signal,
+        tracePrefix,
+      });
+      let snapshot: JmapMailboxSnapshot;
+
+      try {
+        snapshot = await fetchJmapMailboxSnapshot({
+          limit,
+          mailboxId,
+          position,
+          signal,
+        });
+      } catch (error: unknown) {
+        observeError('mailbox.refresh.failed', error, {
+          apply,
+          limit,
+          mailboxId: mailboxId ?? 'inbox',
+          position,
+          tracePrefix,
+        });
+        throw error;
+      }
+
+      observeDuration('mailbox.refresh.success', refreshStartedAt, {
+        apply,
+        limit,
+        mailboxId: snapshot.mailbox?.id ?? mailboxId ?? 'inbox',
+        messages: snapshot.messages.length,
+        position: snapshot.position ?? position,
+        total: snapshot.total ?? -1,
+        tracePrefix,
       });
       markNavigationTrace(
         `${tracePrefix} finished`,
@@ -584,6 +665,14 @@ export default function InboxScreen() {
     }
 
     const nextPosition = currentMessages.length;
+    const loadMoreStartedAt = Date.now();
+
+    observeEvent('inbox.load-more.start', {
+      currentRows: currentMessages.length,
+      mailboxId: mailboxId ?? 'inbox',
+      position: nextPosition,
+      rowRenderLimit,
+    });
 
     const loadMore = refreshMailboxFromServer({
       apply: false,
@@ -606,12 +695,21 @@ export default function InboxScreen() {
           return nextLimit;
         });
         scheduleMailboxCacheWrite('inbox page cache write', () => writeCachedMailboxPage(page));
+        observeDuration('inbox.load-more.success', loadMoreStartedAt, {
+          mergedRows: mergedSnapshot.messages.length,
+          pageRows: page.messages.length,
+          position: nextPosition,
+          total: page.total ?? -1,
+        });
       })
       .catch((error: unknown) => {
         if (!(error instanceof Error && error.name === 'FastmailJmapTokenMissingError')) {
           console.warn('JMAP inbox load more failed', describeJmapError(error));
         }
         markNavigationTrace('inbox load more failed', describeJmapError(error));
+        observeError('inbox.load-more.failed', error, {
+          position: nextPosition,
+        });
       })
       .finally(() => {
         loadMoreInFlightRef.current = null;

@@ -2,7 +2,7 @@
 
 import { Buffer } from 'node:buffer';
 import { createServer } from 'node:http';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -25,6 +25,10 @@ const STORE_PATH =
   process.env.NOTIFICATION_RELAY_STORE_PATH ??
   path.join(homedir(), '.nativemail', 'fastmail-glass', 'notification-relay.json');
 const LEGACY_STORE_PATH = path.join(process.cwd(), '.nativemail', 'notification-relay.json');
+const OBSERVABILITY_LOG_PATH =
+  process.env.NOTIFICATION_RELAY_OBSERVABILITY_PATH ??
+  path.join(homedir(), '.nativemail', 'fastmail-glass', 'observability.jsonl');
+const OBSERVABILITY_EVENT_LIMIT = 100;
 
 /** @type {Map<string, Subscriber>} */
 const subscribers = new Map();
@@ -110,6 +114,33 @@ async function route(request, response) {
       registered: Boolean(subscriber),
       subscriber: subscriber ? toPublicSubscriber(subscriber, { includeDebug: true }) : null,
     });
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname === '/observability') {
+    const limit = Math.min(
+      OBSERVABILITY_EVENT_LIMIT,
+      Math.max(1, Number.parseInt(url.searchParams.get('limit') ?? '50', 10) || 50)
+    );
+
+    sendJson(response, 200, {
+      events: await readRecentObservabilityEvents(limit),
+      ok: true,
+    });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/observability') {
+    const body = await readJson(request);
+    const events = normalizeObservabilityEvents(body);
+
+    if (!events.length) {
+      sendJson(response, 200, { accepted: 0, ok: true });
+      return;
+    }
+
+    await appendObservabilityEvents(events);
+    sendJson(response, 200, { accepted: events.length, ok: true });
     return;
   }
 
@@ -1079,4 +1110,89 @@ async function saveStore() {
       }),
     }, null, 2)
   );
+}
+
+async function appendObservabilityEvents(events) {
+  await mkdir(path.dirname(OBSERVABILITY_LOG_PATH), { recursive: true });
+  await appendFile(
+    OBSERVABILITY_LOG_PATH,
+    `${events.map((event) => JSON.stringify(event)).join('\n')}\n`
+  );
+}
+
+async function readRecentObservabilityEvents(limit) {
+  const text = await readFile(OBSERVABILITY_LOG_PATH, 'utf8').catch((error) => {
+    if (error?.code === 'ENOENT') {
+      return '';
+    }
+
+    throw error;
+  });
+  const lines = text.trim().split('\n').filter(Boolean).slice(-limit);
+
+  return lines.map((line) => {
+    try {
+      return JSON.parse(line);
+    } catch {
+      return { parseError: true, raw: line.slice(0, 500) };
+    }
+  });
+}
+
+function normalizeObservabilityEvents(body) {
+  const deviceId = sanitizeDeviceId(getOptionalString(body, 'deviceId') ?? 'unknown');
+  const platform = getOptionalString(body, 'platform') ?? 'unknown';
+  const appVersion = getOptionalString(body, 'appVersion');
+  const rawEvents = Array.isArray(body?.events) ? body.events : [];
+
+  return rawEvents
+    .slice(0, 50)
+    .map((event) => normalizeObservabilityEvent(event, { appVersion, deviceId, platform }))
+    .filter(Boolean);
+}
+
+function normalizeObservabilityEvent(event, envelope) {
+  if (!event || typeof event !== 'object') {
+    return null;
+  }
+
+  const name = getOptionalString(event, 'name');
+
+  if (!name) {
+    return null;
+  }
+
+  return {
+    appVersion: envelope.appVersion,
+    at: getOptionalString(event, 'at') ?? new Date().toISOString(),
+    deviceId: envelope.deviceId,
+    id: getOptionalString(event, 'id') ?? null,
+    level: getOptionalString(event, 'level') ?? 'info',
+    name: name.slice(0, 120),
+    platform: envelope.platform,
+    properties: normalizeObservabilityProperties(event.properties),
+    serverAt: new Date().toISOString(),
+  };
+}
+
+function normalizeObservabilityProperties(properties) {
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) {
+    return {};
+  }
+
+  const normalized = {};
+
+  for (const [key, value] of Object.entries(properties).slice(0, 60)) {
+    if (
+      value === null ||
+      typeof value === 'boolean' ||
+      typeof value === 'number'
+    ) {
+      normalized[key.slice(0, 80)] = value;
+    } else if (typeof value === 'string') {
+      normalized[key.slice(0, 80)] = value.slice(0, 500);
+    }
+  }
+
+  return normalized;
 }

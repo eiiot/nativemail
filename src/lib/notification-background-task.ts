@@ -8,6 +8,7 @@ import {
   type CachedInboxStateMessageInput,
 } from '@/lib/mail-cache';
 import { hydrateMailboxSnapshotFromCache } from '@/lib/mail-store';
+import { flushObservabilityEvents, observeDuration, observeError, observeEvent } from '@/lib/observability';
 import * as Notifications from 'expo-notifications';
 
 const inboxNotificationBackgroundTaskName = 'nativemail-inbox-notification-background';
@@ -43,7 +44,13 @@ if (TaskManager && !TaskManager.isTaskDefined(inboxNotificationBackgroundTaskNam
 export async function handleInboxNotificationPayload(payload: Record<string, unknown> | null) {
   const work = inboxNotificationPayloadQueue
     .catch(() => {})
-    .then(() => handleInboxNotificationPayloadNow(payload));
+    .then(async () => {
+      try {
+        return await handleInboxNotificationPayloadNow(payload);
+      } finally {
+        await flushObservabilityEvents().catch(() => {});
+      }
+    });
 
   inboxNotificationPayloadQueue = work.then(() => undefined, () => undefined);
 
@@ -51,10 +58,25 @@ export async function handleInboxNotificationPayload(payload: Record<string, unk
 }
 
 async function handleInboxNotificationPayloadNow(payload: Record<string, unknown> | null) {
+  const startedAt = Date.now();
   const messageId = getDismissMessageId(payload);
 
   if (messageId) {
-    await dismissInboxNotificationForMessage(messageId);
+    observeEvent('notification.background.dismiss.start', {
+      messageId,
+    });
+
+    try {
+      await dismissInboxNotificationForMessage(messageId);
+      observeDuration('notification.background.dismiss.success', startedAt, {
+        messageId,
+      });
+    } catch (error: unknown) {
+      observeError('notification.background.dismiss.failed', error, {
+        messageId,
+      });
+      throw error;
+    }
 
     return true;
   }
@@ -62,14 +84,34 @@ async function handleInboxNotificationPayloadNow(payload: Record<string, unknown
   const inboxState = getInboxStateSnapshot(payload);
 
   if (inboxState) {
-    await runWithSqliteLockRetry(async () => {
-      await writeCachedInboxStateSnapshot(inboxState);
-      await hydrateMailboxSnapshotFromCache(inboxState.mailboxId);
+    observeEvent('notification.background.inbox-state.start', {
+      mailboxId: inboxState.mailboxId,
+      messages: inboxState.messages.length,
+      unread: inboxState.inboxUnreadEmails ?? -1,
     });
+
+    try {
+      await runWithSqliteLockRetry(async () => {
+        await writeCachedInboxStateSnapshot(inboxState);
+        await hydrateMailboxSnapshotFromCache(inboxState.mailboxId);
+      });
+    } catch (error: unknown) {
+      observeError('notification.background.inbox-state.failed', error, {
+        mailboxId: inboxState.mailboxId,
+        messages: inboxState.messages.length,
+      });
+      throw error;
+    }
 
     if (typeof inboxState.inboxUnreadEmails === 'number') {
       await setInboxUnreadBadgeCount(inboxState.inboxUnreadEmails);
     }
+
+    observeDuration('notification.background.inbox-state.success', startedAt, {
+      mailboxId: inboxState.mailboxId,
+      messages: inboxState.messages.length,
+      unread: inboxState.inboxUnreadEmails ?? -1,
+    });
 
     return true;
   }
@@ -78,6 +120,9 @@ async function handleInboxNotificationPayloadNow(payload: Record<string, unknown
 
   if (badgeCount !== null) {
     await setInboxUnreadBadgeCount(badgeCount);
+    observeDuration('notification.background.badge.success', startedAt, {
+      badgeCount,
+    });
 
     return true;
   }
@@ -85,17 +130,38 @@ async function handleInboxNotificationPayloadNow(payload: Record<string, unknown
   const inboxMessage = getInboxNotificationMessage(payload);
 
   if (!inboxMessage) {
+    observeDuration('notification.background.noop', startedAt);
     return false;
   }
 
-  await runWithSqliteLockRetry(async () => {
-    await writeCachedInboxNotificationMessage(inboxMessage);
-    await hydrateMailboxSnapshotFromCache(inboxMessage.mailboxId);
+  observeEvent('notification.background.message.start', {
+    mailboxId: inboxMessage.mailboxId,
+    messageId: inboxMessage.messageId,
+    unread: true,
   });
+
+  try {
+    await runWithSqliteLockRetry(async () => {
+      await writeCachedInboxNotificationMessage(inboxMessage);
+      await hydrateMailboxSnapshotFromCache(inboxMessage.mailboxId);
+    });
+  } catch (error: unknown) {
+    observeError('notification.background.message.failed', error, {
+      mailboxId: inboxMessage.mailboxId,
+      messageId: inboxMessage.messageId,
+    });
+    throw error;
+  }
 
   if (typeof inboxMessage.inboxUnreadEmails === 'number') {
     await setInboxUnreadBadgeCount(inboxMessage.inboxUnreadEmails);
   }
+
+  observeDuration('notification.background.message.success', startedAt, {
+    mailboxId: inboxMessage.mailboxId,
+    messageId: inboxMessage.messageId,
+    unread: true,
+  });
 
   return true;
 }

@@ -12,6 +12,7 @@ import {
   type JmapThread,
 } from '@/lib/jmap-client';
 import type { Message } from '@/lib/mock-mail';
+import { observeDuration, observeError, observeEvent } from '@/lib/observability';
 
 type MessagePatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 
@@ -242,10 +243,25 @@ export async function loadMessageBody(
     refresh?: boolean;
   } = {},
 ) {
+  const startedAt = Date.now();
+
+  observeEvent('mail.body.load.start', {
+    messageId,
+    priority,
+    refresh,
+  });
+
   if (!refresh) {
     const cachedOrMemoryBody = await hydrateMessageBodyFromCache(messageId);
 
     if (cachedOrMemoryBody) {
+      observeDuration('mail.body.load.cache-hit', startedAt, {
+        html: cachedOrMemoryBody.html?.trim() ? cachedOrMemoryBody.html.length : 0,
+        messageId,
+        priority,
+        refresh,
+        text: cachedOrMemoryBody.text?.trim() ? cachedOrMemoryBody.text.length : 0,
+      });
       return cachedOrMemoryBody;
     }
   }
@@ -254,9 +270,17 @@ export async function loadMessageBody(
 
   if (existingFetch) {
     if (priority === 'foreground' && existingFetch.priority === 'background') {
+      observeEvent('mail.body.fetch.abort-background', {
+        messageId,
+      }, 'warn');
       existingFetch.controller.abort();
       messageBodyFetches.delete(messageId);
     } else {
+      observeEvent('mail.body.fetch.join', {
+        existingPriority: existingFetch.priority,
+        messageId,
+        priority,
+      });
       return existingFetch.promise;
     }
   }
@@ -267,18 +291,43 @@ export async function loadMessageBody(
   }
 
   const controller = new AbortController();
+  const networkStartedAt = Date.now();
+
+  observeEvent('mail.body.fetch.start', {
+    messageId,
+    priority,
+    refresh,
+  });
+
   const fetchPromise = fetchJmapMessageBody({
     inlineCidImageData: false,
     messageId,
     signal: controller.signal,
   })
     .then(async (body) => {
+      observeDuration('mail.body.fetch.success', networkStartedAt, {
+        attachments: body?.attachments?.length ?? 0,
+        hasBody: Boolean(body),
+        html: body?.html?.trim() ? body.html.length : 0,
+        messageId,
+        priority,
+        text: body?.text?.trim() ? body.text.length : 0,
+      });
+
       if (body) {
         useMailStore.getState().applyMessageBody(messageId, body);
         await writeCachedEmailBody(messageId, body).catch(() => {});
       }
 
       return body;
+    })
+    .catch((error: unknown) => {
+      observeError('mail.body.fetch.failed', error, {
+        messageId,
+        priority,
+        refresh,
+      });
+      throw error;
     })
     .finally(() => {
       if (priority === 'foreground') {
@@ -366,6 +415,10 @@ function abortBackgroundMessageBodyFetches(exceptMessageId?: string) {
       continue;
     }
 
+    observeEvent('mail.body.fetch.abort-background', {
+      exceptMessageId: exceptMessageId ?? 'none',
+      messageId,
+    }, 'warn');
     fetchEntry.controller.abort();
     messageBodyFetches.delete(messageId);
   }

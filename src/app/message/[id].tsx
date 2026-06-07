@@ -41,6 +41,7 @@ import {
   selectThread,
   useMailStore,
 } from '@/lib/mail-store';
+import { observeDuration, observeError, observeEvent } from '@/lib/observability';
 import { getMessageById, type Message, type MessageAttachment } from '@/lib/mock-mail';
 import {
   GlassEffectContainer,
@@ -511,14 +512,28 @@ export default function MessageScreen() {
 
     const startedAt = Date.now();
 
+    observeEvent('message.body.load.start', {
+      messageId,
+      source: Array.isArray(source) ? source[0] ?? 'unknown' : source ?? 'unknown',
+    });
     appendReadDebugEvent(`body cache start id=${messageId}`);
     void hydrateMessageBodyFromCache(messageId)
       .then((body) => {
+        observeDuration('message.body.cache', startedAt, {
+          attachments: body?.attachments?.length ?? 0,
+          hit: Boolean(body),
+          html: body?.html?.trim() ? body.html.length : 0,
+          messageId,
+          text: body?.text?.trim() ? body.text.length : 0,
+        });
         appendReadDebugEvent(
           `body cache ${body ? 'hit' : 'miss'} id=${messageId} +${Date.now() - startedAt}ms ${getBodyLoadDebugSummary(body)}`,
         );
       })
       .catch((error: unknown) => {
+        observeError('message.body.cache.failed', error, {
+          messageId,
+        });
         appendReadDebugEvent(
           `body cache failed id=${messageId} +${Date.now() - startedAt}ms error=${error instanceof Error ? error.message : String(error)}`,
         );
@@ -527,6 +542,13 @@ export default function MessageScreen() {
     appendReadDebugEvent(`body fetch start id=${messageId}`);
     void loadMessageBody(messageId, { refresh: true })
       .then((body) => {
+        observeDuration('message.body.fetch', startedAt, {
+          attachments: body?.attachments?.length ?? 0,
+          hit: Boolean(body),
+          html: body?.html?.trim() ? body.html.length : 0,
+          messageId,
+          text: body?.text?.trim() ? body.text.length : 0,
+        });
         appendReadDebugEvent(
           `body fetch ${body ? 'finished' : 'empty'} id=${messageId} +${Date.now() - startedAt}ms ${getBodyLoadDebugSummary(body)}`,
         );
@@ -536,6 +558,9 @@ export default function MessageScreen() {
         }
       })
       .catch((error: unknown) => {
+        observeError('message.body.fetch.failed', error, {
+          messageId,
+        });
         appendReadDebugEvent(
           `body fetch failed id=${messageId} +${Date.now() - startedAt}ms error=${error instanceof Error ? error.message : String(error)}`,
         );
@@ -602,8 +627,17 @@ export default function MessageScreen() {
     setPendingAction(action);
 
     if (isOptimisticMailboxExitAction(action)) {
+      const actionStartedAt = Date.now();
       const actionMailboxId = getActionMailboxId(targetMessage, routeMailboxId, mailboxName);
       const previousSnapshot = selectMailboxSnapshot(useMailStore.getState(), actionMailboxId);
+      const actionProperties = {
+        action,
+        mailboxId: actionMailboxId ?? 'none',
+        messageId: targetMessage.id,
+        unread: targetMessage.unread,
+      };
+
+      observeEvent('message.action.optimistic-exit.start', actionProperties);
 
       recordOptimisticMailAction(targetMessage.id);
       hideMessageInMailbox(targetMessage.id, actionMailboxId);
@@ -615,6 +649,7 @@ export default function MessageScreen() {
 
       getMessageActionRequest(action, targetMessage.id, targetMessage)
         .then(() => {
+          observeDuration('message.action.optimistic-exit.success', actionStartedAt, actionProperties);
           removeStoreMessageFromMailbox(targetMessage.id, actionMailboxId);
           if (actionMailboxId) {
             void removeCachedEmailFromMailbox(targetMessage.id, actionMailboxId).catch(() => {});
@@ -623,7 +658,8 @@ export default function MessageScreen() {
             clearHiddenMessageInMailbox(targetMessage.id, actionMailboxId);
           }, optimisticMailboxHideTtlMs);
         })
-        .catch(() => {
+        .catch((error: unknown) => {
+          observeError('message.action.optimistic-exit.failed', error, actionProperties);
           clearHiddenMessageInMailbox(targetMessage.id, actionMailboxId);
           if (previousSnapshot) {
             applyMailboxSnapshot(previousSnapshot, actionMailboxId);

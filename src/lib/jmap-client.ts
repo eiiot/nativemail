@@ -6,6 +6,7 @@ import {
 } from '@/lib/avatar-photos'
 import { getFastmailJmapToken } from '@/lib/fastmail-token'
 import type { Message, MessageAttachment } from '@/lib/mock-mail'
+import { observeDuration, observeError, observeEvent } from '@/lib/observability'
 import {
     EMAIL_CAPABILITY_URI,
     Email,
@@ -285,6 +286,7 @@ export async function fetchJmapMailboxSnapshot({
     position?: number
     signal?: AbortSignal
 } = {}): Promise<JmapMailboxSnapshot> {
+    const startedAt = Date.now()
     const { accountId, client } = await createFastmailJmapClient(signal)
 
     try {
@@ -312,8 +314,7 @@ export async function fetchJmapMailboxSnapshot({
         const messages = page?.messages
             ? applyThreadCountsToMessages(page.messages, threads)
             : []
-
-        return {
+        const snapshot = {
             accountId,
             mailbox,
             mailboxes,
@@ -323,6 +324,24 @@ export async function fetchJmapMailboxSnapshot({
             total: page?.total ?? null,
             username: client.username,
         }
+
+        observeDuration('jmap.mailbox-snapshot.success', startedAt, {
+            limit,
+            mailboxId: mailbox?.id ?? mailboxId ?? 'inbox',
+            mailboxRole: mailbox?.role ?? 'none',
+            messages: snapshot.messages.length,
+            position: snapshot.position,
+            total: snapshot.total ?? -1,
+        })
+
+        return snapshot
+    } catch (error: unknown) {
+        observeError('jmap.mailbox-snapshot.failed', error, {
+            limit,
+            mailboxId: mailboxId ?? 'inbox',
+            position,
+        })
+        throw error
     } finally {
         await client.disconnect()
     }
@@ -359,6 +378,7 @@ export async function fetchJmapMessageBody({
     messageId: string
     signal?: AbortSignal
 }): Promise<JmapMessageBody | null> {
+    const startedAt = Date.now()
     const { accountId, client, token } = await createFastmailJmapClient(signal)
 
     try {
@@ -370,13 +390,29 @@ export async function fetchJmapMessageBody({
             signal
         )
         const message = messages[0]
-
-        return message
+        const body = message
             ? await getEmailBody(client, accountId, token, message, {
                   inlineCidImageData,
                   signal,
               })
             : null
+
+        observeDuration('jmap.message-body.success', startedAt, {
+            attachments: body?.attachments?.length ?? 0,
+            hasBody: Boolean(body),
+            html: body?.html?.trim() ? body.html.length : 0,
+            inlineCidImageData,
+            messageId,
+            text: body?.text?.trim() ? body.text.length : 0,
+        })
+
+        return body
+    } catch (error: unknown) {
+        observeError('jmap.message-body.failed', error, {
+            inlineCidImageData,
+            messageId,
+        })
+        throw error
     } finally {
         await client.disconnect()
     }
@@ -951,6 +987,11 @@ async function moveJmapEmailToRole(
     role: 'archive' | 'inbox' | 'trash',
     signal?: AbortSignal
 ): Promise<JmapMessageActionResult> {
+    const startedAt = Date.now()
+    observeEvent('jmap.message.move.start', {
+        messageId,
+        role,
+    })
     const { accountId, client } = await createFastmailJmapClient(signal)
 
     try {
@@ -987,7 +1028,19 @@ async function moveJmapEmailToRole(
 
         await updateEmail(client, accountId, messageId, { mailboxIds }, signal)
 
+        observeDuration('jmap.message.move.success', startedAt, {
+            mailboxCount: Object.keys(mailboxIds).length,
+            messageId,
+            role,
+        })
+
         return { mailboxIds }
+    } catch (error: unknown) {
+        observeError('jmap.message.move.failed', error, {
+            messageId,
+            role,
+        })
+        throw error
     } finally {
         await client.disconnect()
     }
@@ -999,6 +1052,12 @@ async function updateJmapEmailKeywords(
     enabled: boolean,
     signal?: AbortSignal
 ): Promise<JmapMessageActionResult> {
+    const startedAt = Date.now()
+    observeEvent('jmap.message.keyword.start', {
+        enabled,
+        keyword,
+        messageId,
+    })
     const { accountId, client } = await createFastmailJmapClient(signal)
 
     try {
@@ -1024,11 +1083,27 @@ async function updateJmapEmailKeywords(
             signal
         )
 
-        return {
+        const result = {
             keywords,
             pinned: keywords.$flagged === true,
             unread: keywords.$seen !== true,
         }
+
+        observeDuration('jmap.message.keyword.success', startedAt, {
+            enabled,
+            keyword,
+            messageId,
+            unread: keywords.$seen !== true,
+        })
+
+        return result
+    } catch (error: unknown) {
+        observeError('jmap.message.keyword.failed', error, {
+            enabled,
+            keyword,
+            messageId,
+        })
+        throw error
     } finally {
         await client.disconnect()
     }
