@@ -152,6 +152,8 @@ export async function registerInboxNotificationBackgroundTask() {
   return true;
 }
 
+void registerInboxNotificationBackgroundTask().catch(() => {});
+
 function loadTaskManager(): TaskManagerModule | null {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports -- Old dev clients may not have this native module yet.

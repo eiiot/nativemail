@@ -602,6 +602,13 @@ async function refreshInbox(subscriber, { notify, reason }) {
     };
   }
 
+  await sendInboxStateSync(subscriber, {
+    emails,
+    inboxUnreadEmails,
+    mailboxName: subscriber.mailboxName,
+  });
+  stateSynced = true;
+
   let notified = 0;
 
   for (const email of newEmails.reverse()) {
@@ -663,7 +670,6 @@ async function sendInboxNotification(subscriber, email, inboxUnreadEmails) {
 
 async function sendInboxNotificationDismissal(subscriber, emailId, inboxUnreadEmails) {
   await sendExpoPush(subscriber, {
-    ...(inboxUnreadEmails === null ? {} : { badge: inboxUnreadEmails }),
     _contentAvailable: true,
     collapseId: emailId,
     data: {
@@ -680,7 +686,6 @@ async function sendInboxNotificationDismissal(subscriber, emailId, inboxUnreadEm
 
 async function sendInboxBadgeSync(subscriber, inboxUnreadEmails) {
   await sendExpoPush(subscriber, {
-    badge: inboxUnreadEmails,
     _contentAvailable: true,
     data: {
       action: 'sync-inbox-badge',
@@ -696,7 +701,6 @@ async function sendInboxBadgeSync(subscriber, inboxUnreadEmails) {
 
 async function sendInboxStateSync(subscriber, { emails, inboxUnreadEmails, mailboxName }) {
   await sendExpoPush(subscriber, {
-    ...(inboxUnreadEmails === null ? {} : { badge: inboxUnreadEmails }),
     _contentAvailable: true,
     data: {
       accountId: subscriber.accountId,
