@@ -5,7 +5,7 @@ import {
   isLiquidGlassAvailable,
 } from 'expo-glass-effect';
 import * as Haptics from 'expo-haptics';
-import { router } from 'expo-router';
+import { router, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { MenuView, type MenuAction, type NativeActionEvent } from '@expo/ui/community/menu';
 import { PropsWithChildren, useState } from 'react';
@@ -47,15 +47,25 @@ const composeMenuActions: MenuAction[] = [
 ];
 
 export default function ComposeScreen() {
+  const params = useLocalSearchParams<{
+    body?: string;
+    mode?: string;
+    subject?: string;
+    to?: string;
+  }>();
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
   const colors = scheme === 'dark' ? darkColors : lightColors;
-  const [to, setTo] = useState('');
+  const initialTo = getComposeParam(params.to);
+  const initialSubject = getComposeParam(params.subject);
+  const initialBody = getComposeParam(params.body) || defaultBody;
+  const startsWithRecipient = initialTo.trim().length > 0;
+  const [to, setTo] = useState(initialTo);
   const [cc, setCc] = useState('');
   const [bcc, setBcc] = useState('');
   const [recipientsExpanded, setRecipientsExpanded] = useState(false);
-  const [subject, setSubject] = useState('');
-  const [, setBody] = useState(defaultBody);
+  const [subject, setSubject] = useState(initialSubject);
+  const [body, setBody] = useState(initialBody);
   const canSend = to.trim().length > 0;
   const close = () => {
     pressHaptic();
@@ -129,7 +139,7 @@ export default function ComposeScreen() {
           <TextInput
             autoCapitalize="none"
             autoCorrect={false}
-            autoFocus
+            autoFocus={!startsWithRecipient}
             inputMode="email"
             keyboardType="email-address"
             maxFontSizeMultiplier={1.12}
@@ -210,17 +220,22 @@ export default function ComposeScreen() {
         </View>
 
         <TextInput
-          defaultValue={defaultBody}
+          autoFocus={startsWithRecipient}
           maxFontSizeMultiplier={1.12}
           multiline
           onChangeText={setBody}
           selectionColor={tint}
           style={[styles.bodyInput, { color: colors.text }]}
           textAlignVertical="top"
+          value={body}
         />
       </View>
     </View>
   );
+}
+
+function getComposeParam(value: string | string[] | undefined) {
+  return Array.isArray(value) ? value[0] ?? '' : value ?? '';
 }
 
 function GlassSurface({

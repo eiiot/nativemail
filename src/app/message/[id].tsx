@@ -542,10 +542,22 @@ export default function MessageScreen() {
       markVisibleMessageRead(unreadMessage);
     }
   }, [expandedUnreadMessageKey, expandedUnreadMessages, markVisibleMessageRead]);
-  const runMessageAction = (action: MessageAction, targetMessageId = focusedThreadMessageId) => {
+  const runMessageAction = (action: MessageAction, targetMessageId?: string) => {
+    const targetMessage = getActionTargetMessage({
+      action,
+      actionTargetMessage,
+      detailMessages,
+      targetMessageId,
+    });
+
     pressHaptic();
 
-    if (action === 'reply' || action === 'reply-all') {
+    if (action === 'reply') {
+      openReplyCompose(targetMessage);
+      return;
+    }
+
+    if (action === 'reply-all') {
       return;
     }
 
@@ -553,9 +565,6 @@ export default function MessageScreen() {
       return;
     }
 
-    const targetMessage =
-      detailMessages.find((detailMessage) => detailMessage.id === targetMessageId) ??
-      actionTargetMessage;
     const previousPatch = {
       keywords: targetMessage.keywords,
       pinned: targetMessage.pinned,
@@ -1281,6 +1290,67 @@ function getMessageMenuActions(message: Message, debugMode: boolean, hasHtmlBody
 function recordOptimisticMailAction(messageId: string) {
   recordLocalMailAction();
   void recordInboxNotificationLocalAction(messageId).catch(() => {});
+}
+
+function getActionTargetMessage({
+  action,
+  actionTargetMessage,
+  detailMessages,
+  targetMessageId,
+}: {
+  action: MessageAction;
+  actionTargetMessage: Message;
+  detailMessages: Message[];
+  targetMessageId?: string;
+}) {
+  if (targetMessageId) {
+    return (
+      detailMessages.find((detailMessage) => detailMessage.id === targetMessageId) ??
+      actionTargetMessage
+    );
+  }
+
+  if (action === 'reply') {
+    return detailMessages[detailMessages.length - 1] ?? actionTargetMessage;
+  }
+
+  return actionTargetMessage;
+}
+
+function openReplyCompose(message: Message) {
+  const params: Record<string, string> = {
+    mode: 'reply',
+    replyToMessageId: message.id,
+    subject: getReplySubject(message.subject),
+    to: getReplyToAddress(message),
+  };
+
+  if (message.threadId) {
+    params.threadId = message.threadId;
+  }
+
+  router.push({ pathname: '/compose', params });
+}
+
+function getReplySubject(subject: string) {
+  const trimmedSubject = subject.trim();
+
+  if (!trimmedSubject) {
+    return '';
+  }
+
+  return /^re:/i.test(trimmedSubject) ? trimmedSubject : `Re: ${trimmedSubject}`;
+}
+
+function getReplyToAddress(message: Message) {
+  const sender = message.sender.trim();
+  const fromEmail = message.fromEmail?.trim();
+
+  if (sender && fromEmail && !sender.includes(fromEmail)) {
+    return `${sender} <${fromEmail}>`;
+  }
+
+  return fromEmail || sender;
 }
 
 function isMessageAction(action: string): action is MessageAction {
