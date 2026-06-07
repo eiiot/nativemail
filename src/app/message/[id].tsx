@@ -1373,16 +1373,12 @@ function getReplyPlainTextBody(message: Message) {
 }
 
 function getReplyHtmlBody(message: Message) {
+  const quoteHtml = getReplyQuoteHtml(message);
   const quoteText = getReplyQuoteText(message);
 
-  if (!quoteText) {
+  if (!quoteHtml && !quoteText) {
     return '<div><br></div><div>Eliot</div>';
   }
-
-  const quoteHtml = quoteText
-    .split(/\r?\n/)
-    .map((line) => (line.trim() ? escapeHtml(line) : '<br>'))
-    .join('<br>');
 
   return [
     '<div><br></div>',
@@ -1390,9 +1386,28 @@ function getReplyHtmlBody(message: Message) {
     '<br>',
     '<blockquote type="cite" style="border-left: 2px solid #C7C7CC; margin: 0 0 0 0.8em; padding-left: 0.8em;">',
     `<div>${escapeHtml(getReplyIntroLine(message))}</div>`,
-    `<div>${quoteHtml}</div>`,
+    `<div>${quoteHtml ?? getReplyQuoteTextHtml(quoteText)}</div>`,
     '</blockquote>',
   ].join('');
+}
+
+function getReplyQuoteHtml(message: Message) {
+  const html = message.htmlBody?.trim() || (looksLikeHtml(message.body ?? '') ? message.body?.trim() : '');
+
+  if (!html) {
+    return null;
+  }
+
+  const fragment = getReplyQuoteHtmlFragment(html);
+
+  return fragment ? sanitizeReplyQuoteHtml(fragment) : null;
+}
+
+function getReplyQuoteTextHtml(text: string) {
+  return text
+    .split(/\r?\n/)
+    .map((line) => (line.trim() ? escapeHtml(line) : '<br>'))
+    .join('<br>');
 }
 
 function getReplyQuoteText(message: Message) {
@@ -1406,6 +1421,40 @@ function getReplyQuoteText(message: Message) {
 
 function looksLikeHtml(text: string) {
   return /<\/?[a-z][\s\S]*>/i.test(text);
+}
+
+function getReplyQuoteHtmlFragment(html: string) {
+  const sanitized = sanitizeReplyQuoteHtml(html);
+  const bodyMatches = Array.from(sanitized.matchAll(/<body\b[^>]*>([\s\S]*?)<\/body>/gi));
+
+  if (bodyMatches.length) {
+    return bodyMatches.map((match) => match[1] ?? '').join('\n').trim();
+  }
+
+  return sanitized
+    .replace(/<!doctype\b[^>]*>/gi, '')
+    .replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, '')
+    .replace(/<\/?html\b[^>]*>/gi, '')
+    .trim();
+}
+
+function sanitizeReplyQuoteHtml(html: string) {
+  return html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, '')
+    .replace(/<object\b[^>]*>[\s\S]*?<\/object>/gi, '')
+    .replace(/<embed\b[^>]*>/gi, '')
+    .replace(/<form\b[^>]*>[\s\S]*?<\/form>/gi, '')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/\s+contenteditable\s*=\s*"[^"]*"/gi, '')
+    .replace(/\s+contenteditable\s*=\s*'[^']*'/gi, '')
+    .replace(/\s+contenteditable\s*=\s*[^\s>]+/gi, '')
+    .replace(/\s+on[a-z]+\s*=\s*"[^"]*"/gi, '')
+    .replace(/\s+on[a-z]+\s*=\s*'[^']*'/gi, '')
+    .replace(/\s+on[a-z]+\s*=\s*[^\s>]+/gi, '')
+    .replace(/\s+(href|src)\s*=\s*"javascript:[^"]*"/gi, ' $1="#"')
+    .replace(/\s+(href|src)\s*=\s*'javascript:[^']*'/gi, " $1='#'")
+    .replace(/\s+(href|src)\s*=\s*javascript:[^\s>]+/gi, ' $1="#"');
 }
 
 function getReplyIntroLine(message: Message) {
