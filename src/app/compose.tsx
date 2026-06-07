@@ -9,7 +9,7 @@ import * as Haptics from 'expo-haptics';
 import { router, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { MenuView, type MenuAction, type NativeActionEvent } from '@expo/ui/community/menu';
-import { PropsWithChildren, useEffect, useRef, useState } from 'react';
+import { PropsWithChildren, useEffect, useMemo, useRef, useState } from 'react';
 import {
   LayoutAnimation,
   Platform,
@@ -24,6 +24,7 @@ import {
   useColorScheme,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import WebView, { type WebViewMessageEvent } from 'react-native-webview';
 
 const tint = '#0A84FF';
 const textScale = { maxFontSizeMultiplier: 1.12 };
@@ -63,6 +64,7 @@ export default function ComposeScreen() {
   const initialTo = draft?.to ?? getComposeParam(params.to);
   const initialSubject = draft?.subject ?? getComposeParam(params.subject);
   const initialBody = (draft?.body ?? getComposeParam(params.body)) || defaultBody;
+  const initialHtmlBody = draft?.htmlBody ?? getHtmlBodyFromPlainText(initialBody);
   const startsWithRecipient = initialTo.trim().length > 0;
   const [to, setTo] = useState(initialTo);
   const [cc, setCc] = useState('');
@@ -70,7 +72,8 @@ export default function ComposeScreen() {
   const [recipientsExpanded, setRecipientsExpanded] = useState(false);
   const [subject, setSubject] = useState(initialSubject);
   const [body, setBody] = useState(initialBody);
-  const canSend = to.trim().length > 0;
+  const [htmlBody, setHtmlBody] = useState(initialHtmlBody);
+  const canSend = to.trim().length > 0 && (body.trim().length > 0 || htmlBody.trim().length > 0);
   const close = () => {
     pressHaptic();
     router.back();
@@ -211,15 +214,14 @@ export default function ComposeScreen() {
           />
         </View>
 
-        <TextInput
+        <ComposeBodyEditor
           autoFocus={startsWithRecipient}
-          maxFontSizeMultiplier={1.12}
-          multiline
-          onChangeText={setBody}
-          selectionColor={tint}
-          style={[styles.bodyInput, { color: colors.text }]}
-          textAlignVertical="top"
-          value={body}
+          colors={colors}
+          initialHtml={initialHtmlBody}
+          onChange={({ html, text }) => {
+            setHtmlBody(html);
+            setBody(text);
+          }}
         />
       </View>
     </View>
@@ -228,6 +230,180 @@ export default function ComposeScreen() {
 
 function getComposeParam(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] ?? '' : value ?? '';
+}
+
+function ComposeBodyEditor({
+  autoFocus,
+  colors,
+  initialHtml,
+  onChange,
+}: {
+  autoFocus: boolean;
+  colors: ColorSet;
+  initialHtml: string;
+  onChange: (value: { html: string; text: string }) => void;
+}) {
+  const editorDocument = useMemo(
+    () => getComposeEditorDocument({ autoFocus, colors, initialHtml }),
+    [autoFocus, colors.background, colors.secondaryText, colors.text, initialHtml],
+  );
+  const handleMessage = (event: WebViewMessageEvent) => {
+    try {
+      const payload = JSON.parse(event.nativeEvent.data);
+
+      if (
+        payload &&
+        payload.type === 'change' &&
+        typeof payload.html === 'string' &&
+        typeof payload.text === 'string'
+      ) {
+        onChange({ html: payload.html, text: payload.text });
+      }
+    } catch {
+      // Ignore malformed editor messages.
+    }
+  };
+
+  return (
+    <WebView
+      automaticallyAdjustContentInsets={false}
+      bounces={false}
+      hideKeyboardAccessoryView={false}
+      keyboardDisplayRequiresUserAction={!autoFocus}
+      onMessage={handleMessage}
+      originWhitelist={['*']}
+      scrollEnabled
+      source={{ html: editorDocument }}
+      style={[styles.bodyEditor, { backgroundColor: colors.background }]}
+      textInteractionEnabled
+    />
+  );
+}
+
+function getComposeEditorDocument({
+  autoFocus,
+  colors,
+  initialHtml,
+}: {
+  autoFocus: boolean;
+  colors: ColorSet;
+  initialHtml: string;
+}) {
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <style>
+    html,
+    body {
+      background: ${colors.background};
+      color: ${colors.text};
+      font: -apple-system-body;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 16px;
+      line-height: 23px;
+      margin: 0;
+      min-height: 100%;
+      padding: 0;
+      -webkit-text-size-adjust: 100%;
+    }
+
+    #editor {
+      box-sizing: border-box;
+      min-height: 100vh;
+      outline: none;
+      padding: 20px 0 56px;
+      white-space: normal;
+      word-break: break-word;
+    }
+
+    #editor:empty::before {
+      color: ${colors.secondaryText};
+      content: attr(data-placeholder);
+    }
+
+    div {
+      min-height: 23px;
+    }
+
+    blockquote {
+      border-left: 2px solid ${colors.separator};
+      color: ${colors.secondaryText};
+      margin: 0 0 0 0.8em;
+      padding-left: 0.8em;
+    }
+
+    a {
+      color: ${tint};
+    }
+  </style>
+</head>
+<body>
+  <div id="editor" contenteditable="true" data-placeholder="">${initialHtml}</div>
+  <script>
+    (function () {
+      var editor = document.getElementById('editor');
+      var postTimer = null;
+      var shouldAutoFocus = ${autoFocus ? 'true' : 'false'};
+
+      function postChange() {
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: 'change',
+          html: editor.innerHTML,
+          text: editor.innerText || ''
+        }));
+      }
+
+      function schedulePost() {
+        clearTimeout(postTimer);
+        postTimer = setTimeout(postChange, 80);
+      }
+
+      function focusAtStart() {
+        editor.focus();
+        var range = document.createRange();
+        range.selectNodeContents(editor);
+        range.collapse(true);
+        var selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+
+      editor.addEventListener('input', schedulePost);
+      editor.addEventListener('blur', postChange);
+      editor.addEventListener('paste', function () {
+        setTimeout(postChange, 0);
+      });
+
+      setTimeout(function () {
+        postChange();
+
+        if (shouldAutoFocus) {
+          focusAtStart();
+        }
+      }, 0);
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function getHtmlBodyFromPlainText(text: string) {
+  const lines = text.split(/\r?\n/);
+
+  return lines
+    .map((line) => (line.length ? `<div>${escapeHtml(line)}</div>` : '<div><br></div>'))
+    .join('');
+}
+
+function escapeHtml(text: string) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function SingleLineComposeField({
@@ -357,6 +533,7 @@ const lightColors = {
   glassTint: 'rgba(255, 255, 255, 0.64)',
   fallbackGlass: 'rgba(255, 255, 255, 0.88)',
   fallbackBorder: 'rgba(255, 255, 255, 0.68)',
+  secondaryText: '#70707A',
 };
 
 const darkColors = {
@@ -368,6 +545,7 @@ const darkColors = {
   glassTint: 'rgba(36, 36, 38, 0.64)',
   fallbackGlass: 'rgba(36, 36, 38, 0.88)',
   fallbackBorder: 'rgba(255, 255, 255, 0.1)',
+  secondaryText: '#9A9AA2',
 };
 
 const styles = StyleSheet.create({
@@ -498,13 +676,8 @@ const styles = StyleSheet.create({
     lineHeight: 21,
     minWidth: 0,
   },
-  bodyInput: {
+  bodyEditor: {
+    backgroundColor: 'transparent',
     flex: 1,
-    fontFamily: systemFont,
-    fontSize: 16,
-    fontWeight: '400',
-    lineHeight: 23,
-    paddingHorizontal: 0,
-    paddingTop: 20,
   },
 });
