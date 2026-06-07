@@ -1396,9 +1396,16 @@ function getReplyHtmlBody(message: Message) {
 }
 
 function getReplyQuoteText(message: Message) {
-  const text = message.body?.trim() || getTextFromHtml(message.htmlBody).trim() || message.preview.trim();
+  const body = message.body?.trim() ?? '';
+  const text = body && !looksLikeHtml(body)
+    ? body
+    : getTextFromHtml(message.htmlBody || body).trim() || message.preview.trim();
 
   return normalizeReplyQuoteText(text);
+}
+
+function looksLikeHtml(text: string) {
+  return /<\/?[a-z][\s\S]*>/i.test(text);
 }
 
 function getReplyIntroLine(message: Message) {

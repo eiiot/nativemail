@@ -9,7 +9,7 @@ import * as Haptics from 'expo-haptics';
 import { router, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { MenuView, type MenuAction, type NativeActionEvent } from '@expo/ui/community/menu';
-import { PropsWithChildren, useState } from 'react';
+import { PropsWithChildren, useEffect, useRef, useState } from 'react';
 import {
   LayoutAnimation,
   Platform,
@@ -18,6 +18,7 @@ import {
   Text,
   TextInput,
   View,
+  type KeyboardTypeOptions,
   type StyleProp,
   type ViewStyle,
   useColorScheme,
@@ -138,21 +139,15 @@ export default function ComposeScreen() {
 
       <View style={styles.fields}>
         <View style={[styles.fieldRow, { borderBottomColor: colors.separator }]}>
-          <Text {...textScale} style={[styles.fieldLabel, { color: colors.text }]}>To:</Text>
-          <TextInput
+          <SingleLineComposeField
+            autoFocus={!startsWithRecipient}
             autoCapitalize="none"
             autoCorrect={false}
-            autoFocus={!startsWithRecipient}
+            colors={colors}
             inputMode="email"
             keyboardType="email-address"
-            maxFontSizeMultiplier={1.12}
-            multiline={false}
-            numberOfLines={1}
+            label="To:"
             onChangeText={setTo}
-            returnKeyType="next"
-            scrollEnabled
-            selectionColor={tint}
-            style={[styles.fieldInput, { color: colors.text }]}
             value={to}
           />
           <Pressable
@@ -172,39 +167,27 @@ export default function ComposeScreen() {
         {recipientsExpanded ? (
           <>
             <View style={[styles.fieldRow, { borderBottomColor: colors.separator }]}>
-              <Text {...textScale} style={[styles.fieldLabel, { color: colors.text }]}>Cc:</Text>
-              <TextInput
+              <SingleLineComposeField
                 autoCapitalize="none"
                 autoCorrect={false}
+                colors={colors}
                 inputMode="email"
                 keyboardType="email-address"
-                maxFontSizeMultiplier={1.12}
-                multiline={false}
-                numberOfLines={1}
+                label="Cc:"
                 onChangeText={setCc}
-                returnKeyType="next"
-                scrollEnabled
-                selectionColor={tint}
-                style={[styles.fieldInput, { color: colors.text }]}
                 value={cc}
               />
             </View>
 
             <View style={[styles.fieldRow, { borderBottomColor: colors.separator }]}>
-              <Text {...textScale} style={[styles.fieldLabel, { color: colors.text }]}>Bcc:</Text>
-              <TextInput
+              <SingleLineComposeField
                 autoCapitalize="none"
                 autoCorrect={false}
+                colors={colors}
                 inputMode="email"
                 keyboardType="email-address"
-                maxFontSizeMultiplier={1.12}
-                multiline={false}
-                numberOfLines={1}
+                label="Bcc:"
                 onChangeText={setBcc}
-                returnKeyType="next"
-                scrollEnabled
-                selectionColor={tint}
-                style={[styles.fieldInput, { color: colors.text }]}
                 value={bcc}
               />
             </View>
@@ -220,16 +203,10 @@ export default function ComposeScreen() {
         </View>
 
         <View style={[styles.fieldRow, { borderBottomColor: colors.separator }]}>
-          <Text {...textScale} style={[styles.fieldLabel, { color: colors.text }]}>Subject:</Text>
-          <TextInput
-            maxFontSizeMultiplier={1.12}
-            multiline={false}
-            numberOfLines={1}
+          <SingleLineComposeField
+            colors={colors}
+            label="Subject:"
             onChangeText={setSubject}
-            returnKeyType="next"
-            scrollEnabled
-            selectionColor={tint}
-            style={[styles.fieldInput, { color: colors.text }]}
             value={subject}
           />
         </View>
@@ -251,6 +228,84 @@ export default function ComposeScreen() {
 
 function getComposeParam(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] ?? '' : value ?? '';
+}
+
+function SingleLineComposeField({
+  autoCapitalize,
+  autoCorrect,
+  autoFocus,
+  colors,
+  inputMode,
+  keyboardType,
+  label,
+  onChangeText,
+  value,
+}: {
+  autoCapitalize?: 'none';
+  autoCorrect?: boolean;
+  autoFocus?: boolean;
+  colors: ColorSet;
+  inputMode?: 'email';
+  keyboardType?: KeyboardTypeOptions;
+  label: string;
+  onChangeText: (value: string) => void;
+  value: string;
+}) {
+  const inputRef = useRef<TextInput>(null);
+  const [focused, setFocused] = useState(autoFocus === true);
+  const showInput = focused || value.length === 0;
+
+  useEffect(() => {
+    if (!focused) {
+      return;
+    }
+
+    const focusTimeout = setTimeout(() => inputRef.current?.focus(), 0);
+
+    return () => clearTimeout(focusTimeout);
+  }, [focused]);
+
+  return (
+    <>
+      <Text {...textScale} style={[styles.fieldLabel, { color: colors.text }]}>
+        {label}
+      </Text>
+      {showInput ? (
+        <TextInput
+          ref={inputRef}
+          autoCapitalize={autoCapitalize}
+          autoCorrect={autoCorrect}
+          autoFocus={autoFocus}
+          inputMode={inputMode}
+          keyboardType={keyboardType}
+          maxFontSizeMultiplier={1.12}
+          multiline={false}
+          numberOfLines={1}
+          onBlur={() => setFocused(false)}
+          onChangeText={onChangeText}
+          onFocus={() => setFocused(true)}
+          returnKeyType="next"
+          scrollEnabled
+          selectionColor={tint}
+          style={[styles.fieldInput, { color: colors.text }]}
+          value={value}
+        />
+      ) : (
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => setFocused(true)}
+          style={styles.fieldPreviewButton}>
+          <Text
+            {...textScale}
+            ellipsizeMode="tail"
+            numberOfLines={1}
+            style={[styles.fieldPreviewText, { color: colors.text }]}>
+            {value}
+          </Text>
+        </Pressable>
+      )}
+    </>
+  );
 }
 
 function GlassSurface({
@@ -409,6 +464,19 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     padding: 0,
   },
+  fieldPreviewButton: {
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 42,
+    minWidth: 0,
+  },
+  fieldPreviewText: {
+    fontFamily: systemFont,
+    fontSize: 16,
+    fontWeight: '400',
+    lineHeight: 21,
+    minWidth: 0,
+  },
   recipientToggle: {
     alignItems: 'center',
     height: 42,
@@ -428,6 +496,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '400',
     lineHeight: 21,
+    minWidth: 0,
   },
   bodyInput: {
     flex: 1,
