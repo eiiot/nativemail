@@ -17,6 +17,13 @@
         "resourceClass": "m-medium"
       }
     },
+    "dev-bundle": {
+      "distribution": "internal",
+      "channel": "nativemail-dev",
+      "ios": {
+        "resourceClass": "m-medium"
+      }
+    },
     "production": {
       "autoIncrement": true
     }

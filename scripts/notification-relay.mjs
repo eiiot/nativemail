@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { Buffer } from 'node:buffer';
 import { createServer } from 'node:http';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -10,6 +11,11 @@ const CORE_CAPABILITY = 'urn:ietf:params:jmap:core';
 const MAIL_CAPABILITY = 'urn:ietf:params:jmap:mail';
 const FASTMAIL_SESSION_URL = 'https://api.fastmail.com/jmap/session';
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+const EVENT_SOURCE_TYPES = '*';
+const ACTIVE_NOTIFICATION_LIMIT = 200;
+const INBOX_STATE_SYNC_LIMIT = 10;
+const LOCAL_ACTION_SUPPRESSION_MS = 8000;
+const INBOX_MESSAGE_NOTIFICATION_CATEGORY_ID = 'nativemailInboxMessage';
 const PORT = Number.parseInt(process.env.PORT ?? '8787', 10);
 const FALLBACK_POLL_MS = Number.parseInt(
   process.env.NOTIFICATION_FALLBACK_POLL_MS ?? process.env.NOTIFICATION_POLL_MS ?? '60000',
@@ -32,7 +38,29 @@ const subscribers = new Map();
  *   expoPushToken: string;
  *   inboxMailboxId: string;
  *   jmapToken: string;
+ *   activeNotificationEmailIds?: string[];
  *   knownInboxEmailIds: string[];
+ *   lastEventAt?: string;
+ *   lastEventId?: string;
+ *   lastEventType?: string;
+ *   lastInboxCheckedAt?: string;
+ *   lastInboxCheckReason?: string;
+ *   lastInboxEmailIds?: string[];
+ *   lastInboxUnreadEmailsSource?: string;
+ *   lastInboxStateSignature?: string;
+ *   lastInboxStateSyncAt?: string;
+ *   lastLocalActionAt?: string;
+ *   lastLocalActionMessageIds?: string[];
+ *   localActionSuppressUntil?: number;
+ *   lastMailboxUnreadEmails?: number | null;
+ *   lastNewInboxEmailIds?: string[];
+ *   lastInboxUnreadEmails?: number | null;
+ *   lastBadgeSyncAt?: string;
+ *   lastNotificationDismissalAt?: string;
+ *   lastNotificationDismissalEmailIds?: string[];
+ *   lastNotificationAt?: string;
+ *   lastNotificationTitle?: string;
+ *   lastPushTicketId?: string;
  *   mailboxName: string;
  *   status: string;
  *   username: string;
@@ -69,6 +97,60 @@ async function route(request, response) {
       ok: true,
       subscriberCount: subscribers.size,
       subscribers: [...subscribers.values()].map(toPublicSubscriber),
+    });
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname.startsWith('/debug/')) {
+    const deviceId = sanitizeDeviceId(decodeURIComponent(url.pathname.slice('/debug/'.length)));
+    const subscriber = subscribers.get(deviceId);
+
+    sendJson(response, 200, {
+      ok: true,
+      registered: Boolean(subscriber),
+      subscriber: subscriber ? toPublicSubscriber(subscriber, { includeDebug: true }) : null,
+    });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname.startsWith('/refresh/')) {
+    const deviceId = sanitizeDeviceId(decodeURIComponent(url.pathname.slice('/refresh/'.length)));
+    const subscriber = subscribers.get(deviceId);
+
+    if (!subscriber) {
+      sendJson(response, 404, { error: 'Device is not registered.' });
+      return;
+    }
+
+    const notify = url.searchParams.get('notify') === '1';
+    const result = await refreshInbox(subscriber, { notify, reason: notify ? 'manual-notify' : 'manual' });
+
+    sendJson(response, 200, { ok: true, result, subscriber: toPublicSubscriber(subscriber, { includeDebug: true }) });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/local-action') {
+    const body = await readJson(request);
+    const deviceId = sanitizeDeviceId(getRequiredString(body, 'deviceId'));
+    const subscriber = subscribers.get(deviceId);
+
+    if (!subscriber) {
+      sendJson(response, 404, { error: 'Device is not registered.' });
+      return;
+    }
+
+    const messageId = getOptionalString(body, 'messageId');
+
+    subscriber.localActionSuppressUntil = Date.now() + LOCAL_ACTION_SUPPRESSION_MS;
+    subscriber.lastLocalActionAt = new Date().toISOString();
+    subscriber.lastLocalActionMessageIds = messageId
+      ? mergeKnownIds(subscriber.lastLocalActionMessageIds ?? [], [messageId]).slice(0, 20)
+      : subscriber.lastLocalActionMessageIds ?? [];
+    await saveStore();
+
+    sendJson(response, 200, {
+      ok: true,
+      suppressUntil: new Date(subscriber.localActionSuppressUntil).toISOString(),
     });
     return;
   }
@@ -175,6 +257,7 @@ async function createSubscriber({ deviceId, expoPushToken, jmapToken }) {
 
   const subscriber = {
     accountId,
+    activeNotificationEmailIds: [],
     apiUrl: session.apiUrl,
     deviceId,
     eventSourceUrl: session.eventSourceUrl,
@@ -201,6 +284,7 @@ async function startSubscriber(subscriber, { rehydrate }) {
       subscriber.apiUrl = session.apiUrl;
       subscriber.eventSourceUrl = session.eventSourceUrl;
       subscriber.status = 'rehydrated';
+      await refreshInbox(subscriber, { notify: false, reason: 'rehydrate' });
     } catch (error) {
       subscriber.status = `session error: ${describeError(error)}`;
       await saveStore();
@@ -267,7 +351,7 @@ async function readEventSource(subscriber, signal) {
   const eventSourceUrl = expandEventSourceUrl(subscriber.eventSourceUrl, {
     closeafter: 'no',
     ping: '60',
-    types: 'Email',
+    types: EVENT_SOURCE_TYPES,
   });
   const response = await fetch(eventSourceUrl, {
     headers: {
@@ -306,7 +390,14 @@ async function readEventSource(subscriber, signal) {
 }
 
 async function handleEventSourceEvent(subscriber, event) {
-  if (!event.data || (event.event !== 'state' && event.event !== 'message')) {
+  if (!event.data) {
+    if (event.event === 'ping') {
+      subscriber.lastEventAt = new Date().toISOString();
+      subscriber.lastEventId = event.id || undefined;
+      subscriber.lastEventType = 'ping';
+      await saveStore();
+    }
+
     return;
   }
 
@@ -315,16 +406,28 @@ async function handleEventSourceEvent(subscriber, event) {
   try {
     payload = JSON.parse(event.data);
   } catch {
+    subscriber.lastEventAt = new Date().toISOString();
+    subscriber.lastEventId = event.id || undefined;
+    subscriber.lastEventType = `${event.event}: invalid json`;
+    await saveStore();
     return;
   }
 
-  if (payload?.['@type'] !== 'StateChange') {
+  subscriber.lastEventAt = new Date().toISOString();
+  subscriber.lastEventId = event.id || undefined;
+
+  if (payload?.['@type'] !== 'StateChange' && !payload?.changed) {
+    subscriber.lastEventType = `${event.event}: ${payload?.['@type'] ?? 'unknown'}`;
+    await saveStore();
     return;
   }
 
   const changedTypes = payload.changed?.[subscriber.accountId];
+  const changedTypeNames = Object.keys(changedTypes ?? {});
+  subscriber.lastEventType = changedTypeNames.length ? `state: ${changedTypeNames.join(',')}` : 'state: no account changes';
+  await saveStore();
 
-  if (!changedTypes?.Email) {
+  if (!changedTypes || (!changedTypes.Email && !changedTypes.EmailDelivery && !changedTypes.Mailbox)) {
     return;
   }
 
@@ -332,18 +435,40 @@ async function handleEventSourceEvent(subscriber, event) {
 }
 
 async function refreshInbox(subscriber, { notify, reason }) {
-  const responses = await jmapRequest(subscriber.apiUrl, subscriber.jmapToken, [
+  const activeNotificationEmailIds = normalizeIdList(subscriber.activeNotificationEmailIds);
+  const methodCalls = [
+    [
+      'Mailbox/get',
+      {
+        accountId: subscriber.accountId,
+        ids: [subscriber.inboxMailboxId],
+        properties: ['id', 'unreadEmails'],
+      },
+      'mailbox',
+    ],
     [
       'Email/query',
       {
         accountId: subscriber.accountId,
         collapseThreads: false,
         filter: { inMailbox: subscriber.inboxMailboxId },
-        limit: 10,
+        limit: INBOX_STATE_SYNC_LIMIT,
         position: 0,
         sort: [{ property: 'receivedAt', isAscending: false }],
       },
       'query',
+    ],
+    [
+      'Email/query',
+      {
+        accountId: subscriber.accountId,
+        calculateTotal: true,
+        collapseThreads: false,
+        filter: { inMailbox: subscriber.inboxMailboxId, notKeyword: '$seen' },
+        limit: 1,
+        position: 0,
+      },
+      'unreadQuery',
     ],
     [
       'Email/get',
@@ -354,42 +479,166 @@ async function refreshInbox(subscriber, { notify, reason }) {
           name: 'Email/query',
           path: '/ids',
         },
-        properties: ['id', 'threadId', 'mailboxIds', 'receivedAt', 'from', 'subject', 'preview'],
+        properties: ['id', 'threadId', 'mailboxIds', 'keywords', 'receivedAt', 'from', 'subject', 'preview'],
       },
       'get',
     ],
-  ]);
+  ];
+
+  if (activeNotificationEmailIds.length) {
+    methodCalls.push([
+      'Email/get',
+      {
+        accountId: subscriber.accountId,
+        ids: activeNotificationEmailIds,
+        properties: ['id', 'mailboxIds', 'keywords'],
+      },
+      'activeNotifications',
+    ]);
+  }
+
+  const responses = await jmapRequest(subscriber.apiUrl, subscriber.jmapToken, methodCalls);
+  const mailboxResponse = findMethodResponse(responses, 'Mailbox/get');
   const queryResponse = findMethodResponse(responses, 'Email/query');
+  const unreadQueryResponse = findMethodResponse(responses, 'Email/query', 'unreadQuery');
   const emailResponse = findMethodResponse(responses, 'Email/get');
+  const activeNotificationResponse = findMethodResponse(responses, 'Email/get', 'activeNotifications');
+  const previousInboxUnreadEmails = normalizeNullableCount(subscriber.lastInboxUnreadEmails);
+  const previousInboxStateSignature = subscriber.lastInboxStateSignature;
+  const mailboxUnreadEmails = getMailboxUnreadEmails(mailboxResponse?.[1]?.list?.[0]);
+  const unreadQueryEmails = getUnreadQueryTotal(unreadQueryResponse?.[1]);
+  const inboxUnreadEmails = unreadQueryEmails ?? mailboxUnreadEmails;
+  const inboxUnreadEmailsSource = unreadQueryEmails === null ? 'mailbox' : 'email-query';
   const queryIds = queryResponse?.[1]?.ids ?? [];
   const emails = sortEmails(emailResponse?.[1]?.list ?? [], queryIds);
+  const inboxStateSignature = getInboxStateSignature(emails, inboxUnreadEmails);
   const knownIds = new Set(subscriber.knownInboxEmailIds);
-  const newEmails = emails.filter((email) => !knownIds.has(email.id));
+  const newEmails = emails.filter((email) => !knownIds.has(email.id) && isUnreadEmail(email));
+  const currentUnreadEmailIds = emails.filter(isUnreadEmail).map((email) => email.id);
+  const staleNotificationEmailIds = getStaleNotificationEmailIds(
+    activeNotificationEmailIds,
+    activeNotificationResponse?.[1],
+    subscriber.inboxMailboxId
+  );
+  const localActionSuppressed = notify && hasActiveLocalActionSuppression(subscriber) && !newEmails.length;
+  const nextActiveNotificationEmailIds = withoutIds(
+    notify
+      ? activeNotificationEmailIds
+      : mergeNotificationIds(activeNotificationEmailIds, currentUnreadEmailIds),
+    staleNotificationEmailIds
+  );
 
   subscriber.knownInboxEmailIds = mergeKnownIds(subscriber.knownInboxEmailIds, queryIds);
-  subscriber.status = `inbox checked (${reason}) at ${new Date().toISOString()}`;
+  subscriber.activeNotificationEmailIds = notify
+    ? activeNotificationEmailIds
+    : nextActiveNotificationEmailIds;
+  subscriber.lastInboxCheckedAt = new Date().toISOString();
+  subscriber.lastInboxCheckReason = reason;
+  subscriber.lastInboxEmailIds = queryIds;
+  subscriber.lastNewInboxEmailIds = newEmails.map((email) => email.id);
+  subscriber.lastInboxStateSignature = inboxStateSignature;
+  subscriber.lastMailboxUnreadEmails = mailboxUnreadEmails;
+  subscriber.lastInboxUnreadEmails = inboxUnreadEmails;
+  subscriber.lastInboxUnreadEmailsSource = inboxUnreadEmailsSource;
+  subscriber.lastNotificationDismissalEmailIds = staleNotificationEmailIds;
+  subscriber.status = `inbox checked (${reason}) at ${subscriber.lastInboxCheckedAt}`;
   await saveStore();
 
-  if (!notify || !newEmails.length) {
-    return;
+  let dismissed = 0;
+  let badgeSynced = false;
+  let stateSynced = false;
+
+  if (notify && !localActionSuppressed) {
+    for (const emailId of staleNotificationEmailIds) {
+      await sendInboxNotificationDismissal(subscriber, emailId, inboxUnreadEmails);
+      dismissed += 1;
+    }
+
+    subscriber.activeNotificationEmailIds = nextActiveNotificationEmailIds;
+    await saveStore();
+  } else if (localActionSuppressed) {
+    subscriber.lastLocalActionAt = new Date().toISOString();
+    await saveStore();
   }
+
+  const didSendBadgeBearingNotification = newEmails.length > 0 || staleNotificationEmailIds.length > 0;
+  const shouldSyncInboxState =
+    notify &&
+    !localActionSuppressed &&
+    Boolean(previousInboxStateSignature) &&
+    inboxStateSignature !== previousInboxStateSignature &&
+    !newEmails.length;
+
+  if (shouldSyncInboxState) {
+    await sendInboxStateSync(subscriber, {
+      emails,
+      inboxUnreadEmails,
+      mailboxName: subscriber.mailboxName,
+    });
+    stateSynced = true;
+  } else if (
+    notify &&
+    inboxUnreadEmails !== null &&
+    inboxUnreadEmails !== previousInboxUnreadEmails &&
+    !localActionSuppressed &&
+    !didSendBadgeBearingNotification
+  ) {
+    await sendInboxBadgeSync(subscriber, inboxUnreadEmails);
+    badgeSynced = true;
+  }
+
+  if (!notify || !newEmails.length) {
+    return {
+      badgeSynced,
+      checkedIds: queryIds,
+      dismissed,
+      dismissedIds: staleNotificationEmailIds,
+      inboxUnreadEmails,
+      inboxUnreadEmailsSource,
+      mailboxUnreadEmails,
+      newIds: newEmails.map((email) => email.id),
+      notified: 0,
+      stateSynced,
+    };
+  }
+
+  let notified = 0;
 
   for (const email of newEmails.reverse()) {
-    await sendInboxNotification(subscriber, email);
+    await sendInboxNotification(subscriber, email, inboxUnreadEmails);
+    notified += 1;
   }
+
+  return {
+    badgeSynced,
+    checkedIds: queryIds,
+    dismissed,
+    dismissedIds: staleNotificationEmailIds,
+    inboxUnreadEmails,
+    inboxUnreadEmailsSource,
+    mailboxUnreadEmails,
+    newIds: newEmails.map((email) => email.id),
+    notified,
+    stateSynced,
+  };
 }
 
-async function sendInboxNotification(subscriber, email) {
+async function sendInboxNotification(subscriber, email, inboxUnreadEmails) {
   const from = email.from?.[0];
   const sender = from?.name || from?.email || 'New mail';
   const subject = email.subject || '(No subject)';
   const body = email.preview || `New message in ${subscriber.mailboxName}`;
 
   await sendExpoPush(subscriber, {
+    ...(inboxUnreadEmails === null ? {} : { badge: inboxUnreadEmails }),
     body,
+    categoryId: INBOX_MESSAGE_NOTIFICATION_CATEGORY_ID,
+    collapseId: email.id,
     data: {
+      accountId: subscriber.accountId,
       date: email.receivedAt ?? '',
       fromEmail: from?.email ?? '',
+      inboxUnreadEmails,
       mailboxId: subscriber.inboxMailboxId,
       mailboxName: subscriber.mailboxName,
       messageId: email.id,
@@ -402,13 +651,75 @@ async function sendInboxNotification(subscriber, email) {
     title: sender,
     subtitle: subject,
   });
+
+  subscriber.activeNotificationEmailIds = mergeNotificationIds(
+    subscriber.activeNotificationEmailIds,
+    [email.id]
+  );
+  subscriber.lastNotificationAt = new Date().toISOString();
+  subscriber.lastNotificationTitle = `${sender}: ${subject}`;
+  await saveStore();
+}
+
+async function sendInboxNotificationDismissal(subscriber, emailId, inboxUnreadEmails) {
+  await sendExpoPush(subscriber, {
+    ...(inboxUnreadEmails === null ? {} : { badge: inboxUnreadEmails }),
+    _contentAvailable: true,
+    collapseId: emailId,
+    data: {
+      action: 'dismiss-message-notification',
+      messageId: emailId,
+      source: 'jmap',
+      type: 'dismiss-message-notification',
+    },
+  });
+
+  subscriber.lastNotificationDismissalAt = new Date().toISOString();
+  await saveStore();
+}
+
+async function sendInboxBadgeSync(subscriber, inboxUnreadEmails) {
+  await sendExpoPush(subscriber, {
+    badge: inboxUnreadEmails,
+    _contentAvailable: true,
+    data: {
+      action: 'sync-inbox-badge',
+      inboxUnreadEmails,
+      source: 'jmap',
+      type: 'sync-inbox-badge',
+    },
+  });
+
+  subscriber.lastBadgeSyncAt = new Date().toISOString();
+  await saveStore();
+}
+
+async function sendInboxStateSync(subscriber, { emails, inboxUnreadEmails, mailboxName }) {
+  await sendExpoPush(subscriber, {
+    ...(inboxUnreadEmails === null ? {} : { badge: inboxUnreadEmails }),
+    _contentAvailable: true,
+    data: {
+      accountId: subscriber.accountId,
+      action: 'sync-inbox-state',
+      inboxUnreadEmails,
+      mailboxId: subscriber.inboxMailboxId,
+      mailboxName,
+      messages: emails.map(toInboxStateSyncMessage),
+      source: 'jmap',
+      type: 'sync-inbox-state',
+    },
+  });
+
+  subscriber.lastInboxStateSyncAt = new Date().toISOString();
+  await saveStore();
 }
 
 async function sendExpoPush(subscriber, message) {
+  const shouldPlaySound = !message._contentAvailable && !Object.hasOwn(message, 'sound');
   const response = await fetch(EXPO_PUSH_URL, {
     body: JSON.stringify({
+      ...(shouldPlaySound ? { sound: 'default' } : {}),
       ...message,
-      sound: 'default',
       to: subscriber.expoPushToken,
     }),
     headers: {
@@ -425,7 +736,14 @@ async function sendExpoPush(subscriber, message) {
 
   assertExpoPushTicketOk(payload);
 
-  console.log('[relay] sent notification', subscriber.deviceId, message.title, message.subtitle ?? '');
+  subscriber.lastPushTicketId = getExpoPushTicketId(payload) ?? subscriber.lastPushTicketId;
+  await saveStore();
+  console.log(
+    '[relay] sent notification',
+    subscriber.deviceId,
+    message.title ?? message.data?.action ?? 'background',
+    message.subtitle ?? message.data?.messageId ?? ''
+  );
   return payload;
 }
 
@@ -444,6 +762,12 @@ function assertExpoPushTicketOk(payload) {
   const message = error?.message ?? JSON.stringify(error);
 
   throw new Error(`Expo push ticket error${detailCode}: ${message}`);
+}
+
+function getExpoPushTicketId(payload) {
+  const ticket = Array.isArray(payload?.data) ? payload.data[0] : payload?.data;
+
+  return typeof ticket?.id === 'string' ? ticket.id : null;
 }
 
 async function discoverJmapSession(token) {
@@ -527,8 +851,8 @@ function expandEventSourceUrl(template, variables) {
     .replace(/\{([^}]+)\}/g, (_match, name) => encodeURIComponent(variables[name] ?? ''));
 }
 
-function findMethodResponse(responses, name) {
-  return responses.find((response) => response[0] === name) ?? null;
+function findMethodResponse(responses, name, callId) {
+  return responses.find((response) => response[0] === name && (!callId || response[2] === callId)) ?? null;
 }
 
 function sortEmails(emails, ids) {
@@ -539,6 +863,87 @@ function sortEmails(emails, ids) {
 
 function mergeKnownIds(currentIds, nextIds) {
   return Array.from(new Set([...nextIds, ...currentIds])).slice(0, 200);
+}
+
+function mergeNotificationIds(currentIds, nextIds) {
+  return Array.from(new Set([...normalizeIdList(nextIds), ...normalizeIdList(currentIds)])).slice(
+    0,
+    ACTIVE_NOTIFICATION_LIMIT
+  );
+}
+
+function normalizeIdList(ids) {
+  return Array.isArray(ids)
+    ? ids.filter((id) => typeof id === 'string' && id.length > 0)
+    : [];
+}
+
+function hasActiveLocalActionSuppression(subscriber) {
+  return typeof subscriber.localActionSuppressUntil === 'number' && subscriber.localActionSuppressUntil > Date.now();
+}
+
+function withoutIds(ids, removedIds) {
+  const removedIdSet = new Set(removedIds);
+
+  return ids.filter((id) => !removedIdSet.has(id));
+}
+
+function getStaleNotificationEmailIds(activeNotificationEmailIds, emailGetPayload, inboxMailboxId) {
+  if (!activeNotificationEmailIds.length || !emailGetPayload) {
+    return [];
+  }
+
+  const emailById = new Map((emailGetPayload.list ?? []).map((email) => [email.id, email]));
+  const notFoundIds = new Set(emailGetPayload.notFound ?? []);
+
+  return activeNotificationEmailIds.filter((emailId) => {
+    const email = emailById.get(emailId);
+
+    return notFoundIds.has(emailId) || !email || !email.mailboxIds?.[inboxMailboxId] || !isUnreadEmail(email);
+  });
+}
+
+function isUnreadEmail(email) {
+  return !email.keywords?.$seen;
+}
+
+function getInboxStateSignature(emails, inboxUnreadEmails) {
+  return JSON.stringify({
+    ids: emails.map((email) => email.id),
+    unread: emails.map((email) => [email.id, isUnreadEmail(email)]),
+    inboxUnreadEmails,
+  });
+}
+
+function toInboxStateSyncMessage(email) {
+  const from = email.from?.[0];
+  const sender = from?.name || from?.email || 'New mail';
+
+  return {
+    date: email.receivedAt ?? '',
+    fromEmail: from?.email ?? '',
+    keywords: email.keywords ?? {},
+    mailboxIds: email.mailboxIds ?? {},
+    messageId: email.id,
+    preview: email.preview ?? '',
+    sender,
+    subject: email.subject || '(No subject)',
+    threadId: email.threadId ?? '',
+  };
+}
+
+function getMailboxUnreadEmails(mailbox) {
+  const unreadEmails = mailbox?.unreadEmails;
+
+  return normalizeNullableCount(unreadEmails);
+}
+
+function getUnreadQueryTotal(queryPayload) {
+  return normalizeNullableCount(queryPayload?.total);
+}
+
+function normalizeNullableCount(value) {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : null;
 }
 
 async function readJson(request) {
@@ -571,6 +976,12 @@ function getRequiredString(body, key) {
   return value.trim();
 }
 
+function getOptionalString(body, key) {
+  const value = body?.[key];
+
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
 function sanitizeDeviceId(value) {
   return value.replace(/[^a-zA-Z0-9._:-]/g, '-').slice(0, 120);
 }
@@ -583,18 +994,50 @@ function describeError(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function toPublicSubscriber(subscriber) {
-  return {
+function toPublicSubscriber(subscriber, options = {}) {
+  const publicSubscriber = {
     accountId: subscriber.accountId,
+    activeNotificationEmailIds: normalizeIdList(subscriber.activeNotificationEmailIds).length,
     deviceId: subscriber.deviceId,
     eventSource: Boolean(subscriber.eventSourceUrl),
     inboxMailboxId: subscriber.inboxMailboxId,
     knownInboxEmailIds: subscriber.knownInboxEmailIds.length,
+    lastEventAt: subscriber.lastEventAt ?? null,
+    lastEventType: subscriber.lastEventType ?? null,
+    lastInboxCheckedAt: subscriber.lastInboxCheckedAt ?? null,
+    lastInboxCheckReason: subscriber.lastInboxCheckReason ?? null,
+    lastNewInboxEmailIds: subscriber.lastNewInboxEmailIds?.length ?? 0,
+    lastInboxUnreadEmails: subscriber.lastInboxUnreadEmails ?? null,
+    lastInboxUnreadEmailsSource: subscriber.lastInboxUnreadEmailsSource ?? null,
+    lastInboxStateSyncAt: subscriber.lastInboxStateSyncAt ?? null,
+    lastLocalActionAt: subscriber.lastLocalActionAt ?? null,
+    localActionSuppressed: hasActiveLocalActionSuppression(subscriber),
+    lastMailboxUnreadEmails: subscriber.lastMailboxUnreadEmails ?? null,
+    lastBadgeSyncAt: subscriber.lastBadgeSyncAt ?? null,
+    lastNotificationDismissalAt: subscriber.lastNotificationDismissalAt ?? null,
+    lastNotificationDismissalEmailIds: subscriber.lastNotificationDismissalEmailIds?.length ?? 0,
+    lastNotificationAt: subscriber.lastNotificationAt ?? null,
+    lastPushTicketId: subscriber.lastPushTicketId ?? null,
     mailboxName: subscriber.mailboxName,
     pollingMs: subscriber.pollTimer ? FALLBACK_POLL_MS : null,
     status: subscriber.status,
     username: subscriber.username,
   };
+
+  if (options.includeDebug) {
+    publicSubscriber.lastEventId = subscriber.lastEventId ?? null;
+    publicSubscriber.lastInboxEmailIds = subscriber.lastInboxEmailIds ?? [];
+    publicSubscriber.lastNewInboxEmailIds = subscriber.lastNewInboxEmailIds ?? [];
+    publicSubscriber.activeNotificationEmailIdsPreview = normalizeIdList(
+      subscriber.activeNotificationEmailIds
+    ).slice(0, 20);
+    publicSubscriber.knownInboxEmailIdsPreview = subscriber.knownInboxEmailIds.slice(0, 20);
+    publicSubscriber.lastNotificationDismissalEmailIds = subscriber.lastNotificationDismissalEmailIds ?? [];
+    publicSubscriber.lastNotificationTitle = subscriber.lastNotificationTitle ?? null;
+    publicSubscriber.lastLocalActionMessageIds = subscriber.lastLocalActionMessageIds ?? [];
+  }
+
+  return publicSubscriber;
 }
 
 async function loadStore() {
@@ -609,6 +1052,8 @@ async function loadStore() {
     const data = JSON.parse(text);
 
     for (const subscriber of data.subscribers ?? []) {
+      subscriber.activeNotificationEmailIds = normalizeIdList(subscriber.activeNotificationEmailIds);
+      subscriber.knownInboxEmailIds = normalizeIdList(subscriber.knownInboxEmailIds);
       subscribers.set(subscriber.deviceId, subscriber);
     }
   } catch (error) {

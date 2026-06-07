@@ -1,4 +1,5 @@
 export type EmailReplyHtmlSplit = {
+  afterQuoteHtml: string | null;
   bodyHtml: string;
   quoteHtml: string | null;
 };
@@ -6,6 +7,11 @@ export type EmailReplyHtmlSplit = {
 export type EmailReplyTextSplit = {
   bodyText: string;
   quoteText: string | null;
+};
+
+export type EmailForwardHtmlSplit = {
+  forwardedHtml: string;
+  introHtml: string;
 };
 
 type HtmlDocumentParts = {
@@ -28,6 +34,12 @@ const replyIntroPatterns = [
   /-{2,}\s*Original Message\s*-{2,}/gi,
 ];
 
+const forwardedIntroPatterns = [
+  /\bBegin forwarded message\s*:/i,
+  /-{2,}\s*Forwarded message\s*-{2,}/i,
+  /\bForwarded message\s*:/i,
+];
+
 const textReplyBoundaryPatterns = [
   /^On .{0,420}\bwrote\s*:$/gim,
   /^From\s*:.{0,900}\nSent\s*:.{0,900}\nTo\s*:/gim,
@@ -39,19 +51,43 @@ export function splitEmailReplyHtml(html: string): EmailReplyHtmlSplit {
   const quoteBoundary = findHtmlQuoteBoundary(parts.body);
 
   if (quoteBoundary === null) {
-    return { bodyHtml: html, quoteHtml: null };
+    return { afterQuoteHtml: null, bodyHtml: html, quoteHtml: null };
   }
 
-  const body = parts.body.slice(0, quoteBoundary).trim();
-  const quote = parts.body.slice(quoteBoundary).trim();
+  const fragments = splitHtmlQuoteFragments(parts.body, quoteBoundary);
+  const body = fragments.body.trim();
+  const quote = fragments.quote.trim();
+  const afterQuote = fragments.afterQuote.trim();
 
   if (!hasMeaningfulHtmlContent(body) || !hasMeaningfulHtmlContent(quote)) {
-    return { bodyHtml: html, quoteHtml: null };
+    return { afterQuoteHtml: null, bodyHtml: html, quoteHtml: null };
   }
 
   return {
+    afterQuoteHtml: afterQuote ? wrapHtmlDocumentPart(parts, afterQuote) : null,
     bodyHtml: wrapHtmlDocumentPart(parts, body),
     quoteHtml: wrapHtmlDocumentPart(parts, quote),
+  };
+}
+
+export function splitEmailForwardHtml(html: string): EmailForwardHtmlSplit | null {
+  const parts = getHtmlDocumentParts(html);
+  const split = findAppleMailForwardSplit(parts.body);
+
+  if (!split) {
+    return null;
+  }
+
+  const intro = parts.body.slice(0, split.forwardedBodyStart).trim();
+  const forwarded = parts.body.slice(split.forwardedBodyStart).trim();
+
+  if (!hasMeaningfulHtmlContent(intro) || !hasMeaningfulHtmlContent(forwarded)) {
+    return null;
+  }
+
+  return {
+    forwardedHtml: wrapHtmlDocumentPart(parts, forwarded),
+    introHtml: wrapHtmlDocumentPart(parts, intro),
   };
 }
 
@@ -72,6 +108,77 @@ export function splitEmailReplyText(text: string): EmailReplyTextSplit {
   return { bodyText, quoteText };
 }
 
+function findAppleMailForwardSplit(html: string) {
+  const rawIntroMatch = getFirstForwardedIntroMatch(html);
+  const hasIntro = rawIntroMatch ?? getFirstForwardedIntroMatch(getHtmlTextContent(html));
+
+  if (!hasIntro) {
+    return null;
+  }
+
+  const citeBoundary = getFirstTypeCiteBlockquoteBoundary(html, rawIntroMatch?.index ?? 0);
+
+  if (citeBoundary === null) {
+    return null;
+  }
+
+  const headerEnd = getElementEnd(html, citeBoundary, 'blockquote');
+
+  if (headerEnd === null) {
+    return null;
+  }
+
+  const forwardedBodyMatch = /<blockquote\b(?=[^>]*\btype\s*=\s*["']cite["'])[^>]*>/i.exec(html.slice(headerEnd));
+
+  if (!forwardedBodyMatch) {
+    return null;
+  }
+
+  return {
+    forwardedBodyStart: headerEnd + forwardedBodyMatch.index,
+  };
+}
+
+function getFirstTypeCiteBlockquoteBoundary(html: string, startIndex: number) {
+  const match = /<blockquote\b(?=[^>]*\btype\s*=\s*["']cite["'])[^>]*>/i.exec(html.slice(startIndex));
+
+  return match ? startIndex + match.index : null;
+}
+
+function getElementEnd(html: string, startIndex: number, tagName: string) {
+  const openPattern = new RegExp(`<${tagName}\\b[^>]*>`, 'gi');
+  const closePattern = new RegExp(`</${tagName}\\s*>`, 'gi');
+  let depth = 0;
+  let cursor = startIndex;
+
+  while (cursor < html.length) {
+    openPattern.lastIndex = cursor;
+    closePattern.lastIndex = cursor;
+
+    const openMatch = openPattern.exec(html);
+    const closeMatch = closePattern.exec(html);
+
+    if (!closeMatch) {
+      return null;
+    }
+
+    if (openMatch && openMatch.index < closeMatch.index) {
+      depth += 1;
+      cursor = openPattern.lastIndex;
+      continue;
+    }
+
+    depth -= 1;
+    cursor = closePattern.lastIndex;
+
+    if (depth <= 0) {
+      return cursor;
+    }
+  }
+
+  return null;
+}
+
 function findHtmlQuoteBoundary(html: string) {
   const boundary = getFirstKnownHtmlBoundary(html) ?? getOutlookHeaderBoundary(html);
 
@@ -79,7 +186,91 @@ function findHtmlQuoteBoundary(html: string) {
     return null;
   }
 
+  if (isForwardedHtmlBoundary(html, boundary)) {
+    return null;
+  }
+
   return getQuoteBoundaryWithIntro(html, boundary);
+}
+
+function splitHtmlQuoteFragments(html: string, quoteBoundary: number) {
+  if (isOutlookReplyForwardHeaderBoundary(html, quoteBoundary)) {
+    return {
+      afterQuote: '',
+      body: html.slice(0, quoteBoundary),
+      quote: html.slice(quoteBoundary),
+    };
+  }
+
+  const boundary = getFirstKnownHtmlBoundaryAfter(html, quoteBoundary);
+  const quoteEnd = boundary === null ? null : getHtmlBoundaryElementEnd(html, boundary);
+
+  if (quoteEnd === null || quoteEnd <= quoteBoundary || quoteEnd >= html.length) {
+    return {
+      afterQuote: '',
+      body: html.slice(0, quoteBoundary),
+      quote: html.slice(quoteBoundary),
+    };
+  }
+
+  const afterQuote = html.slice(quoteEnd);
+
+  if (!shouldKeepVisibleHtmlAfterQuote(afterQuote)) {
+    return {
+      afterQuote: '',
+      body: html.slice(0, quoteBoundary),
+      quote: html.slice(quoteBoundary),
+    };
+  }
+
+  return {
+    afterQuote,
+    body: html.slice(0, quoteBoundary),
+    quote: html.slice(quoteBoundary, quoteEnd),
+  };
+}
+
+function isOutlookReplyForwardHeaderBoundary(html: string, quoteBoundary: number) {
+  const boundaryPrefix = html.slice(quoteBoundary, Math.min(html.length, quoteBoundary + 1800));
+
+  return /^\s*(?:<hr\b[^>]*>\s*)?(?:[\s\S]{0,800}?)<div\b(?=[^>]*\bid\s*=\s*["']divRplyFwdMsg["'])[^>]*>/i.test(boundaryPrefix);
+}
+
+function getFirstKnownHtmlBoundaryAfter(html: string, startIndex: number) {
+  const searchEnd = Math.min(html.length, startIndex + 2400);
+  const search = html.slice(startIndex, searchEnd);
+  const boundary = getFirstKnownHtmlBoundary(search);
+
+  return boundary === null ? null : startIndex + boundary;
+}
+
+function getHtmlBoundaryElementEnd(html: string, boundary: number) {
+  const tagMatch = /^<([a-z][a-z0-9:-]*)\b/i.exec(html.slice(boundary));
+  const tagName = tagMatch?.[1]?.toLowerCase();
+
+  if (!tagName) {
+    return null;
+  }
+
+  return getElementEnd(html, boundary, tagName);
+}
+
+function shouldKeepVisibleHtmlAfterQuote(html: string) {
+  if (!hasMeaningfulHtmlContent(html)) {
+    return false;
+  }
+
+  const text = getHtmlTextContent(html);
+
+  if (!text) {
+    return false;
+  }
+
+  if (text.length <= 600) {
+    return true;
+  }
+
+  return /\b(?:best|regards|thanks|thank you|sent from my|cheers|sincerely)\b/i.test(text.slice(0, 240));
 }
 
 function getFirstKnownHtmlBoundary(html: string) {
@@ -145,10 +336,50 @@ function findTextQuoteBoundary(text: string) {
       continue;
     }
 
+    if (isForwardedTextBoundary(text, match.index)) {
+      continue;
+    }
+
     boundary = boundary === null ? match.index : Math.min(boundary, match.index);
   }
 
   return boundary;
+}
+
+function isForwardedHtmlBoundary(html: string, boundary: number) {
+  const before = getHtmlTextContent(html.slice(Math.max(0, boundary - 1200), boundary));
+  const after = getHtmlTextContent(html.slice(boundary, Math.min(html.length, boundary + 1200)));
+
+  return hasForwardedIntro(before) || hasForwardedIntro(after);
+}
+
+function isForwardedTextBoundary(text: string, boundary: number) {
+  const before = text.slice(Math.max(0, boundary - 1200), boundary);
+  const after = text.slice(boundary, Math.min(text.length, boundary + 1200));
+
+  return hasForwardedIntro(before) || hasForwardedIntro(after);
+}
+
+function hasForwardedIntro(text: string) {
+  return Boolean(getFirstForwardedIntroMatch(text));
+}
+
+function getFirstForwardedIntroMatch(text: string) {
+  let firstMatch: RegExpExecArray | null = null;
+
+  for (const pattern of forwardedIntroPatterns) {
+    const match = pattern.exec(text);
+
+    if (!match) {
+      continue;
+    }
+
+    if (!firstMatch || match.index < firstMatch.index) {
+      firstMatch = match;
+    }
+  }
+
+  return firstMatch;
 }
 
 function getContainingBlockStart(html: string, index: number) {

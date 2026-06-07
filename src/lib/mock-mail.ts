@@ -24,10 +24,14 @@ export type Message = {
   mailboxName?: string;
   pinned?: boolean;
   to?: string;
+  toAddresses?: string[];
+  ccAddresses?: string[];
+  bccAddresses?: string[];
   unread?: boolean;
   count?: number;
   avatar?: string;
   avatarColor: string;
+  avatarUrl?: string;
 };
 
 export const messages: Message[] = [

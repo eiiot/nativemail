@@ -7,6 +7,7 @@ import { setDebugMode, useDebugMode } from '@/lib/debug-mode';
 import {
   getInboxNotificationRegistrationStatus,
   getNotificationRelayUrl,
+  getPresentedInboxNotificationDebugReport,
   registerForInboxNotifications,
   sendInboxNotificationTest,
   unregisterInboxNotifications,
@@ -18,6 +19,7 @@ import {
   type NavigationDebugTrace,
 } from '@/lib/navigation-debug';
 import * as Haptics from 'expo-haptics';
+import * as Updates from 'expo-updates';
 import { Stack, router } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { useEffect, useState } from 'react';
@@ -60,6 +62,8 @@ export default function SettingsScreen() {
   const [notificationRelayUrl, setNotificationRelayUrl] = useState('');
   const [notificationStatusText, setNotificationStatusText] = useState('');
   const [tokenInput, setTokenInput] = useState('');
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateStatusText, setUpdateStatusText] = useState('');
   const [statusText, setStatusText] = useState('');
   const canSave = tokenInput.trim().length > 0 && !saving;
   const canTest = configured && !saving && !testing;
@@ -186,6 +190,40 @@ export default function SettingsScreen() {
     pressHaptic();
     setDebugMode(enabled);
   };
+  const checkForUpdate = async () => {
+    if (updateBusy) {
+      return;
+    }
+
+    pressHaptic();
+    setUpdateBusy(true);
+    setUpdateStatusText('Checking for EAS update...');
+
+    try {
+      if (!Updates.isEnabled) {
+        setUpdateStatusText('EAS Updates are not enabled in this build.');
+        return;
+      }
+
+      const result = await Updates.checkForUpdateAsync();
+
+      if (!result.isAvailable) {
+        setUpdateStatusText(getUpdateStatusSummary('No update available.'));
+        return;
+      }
+
+      setUpdateStatusText('Downloading update...');
+      await Updates.fetchUpdateAsync();
+      setUpdateStatusText('Update downloaded. Reloading...');
+      setTimeout(() => {
+        void Updates.reloadAsync();
+      }, 250);
+    } catch (error) {
+      setUpdateStatusText(`Could not update\n${describeJmapError(error)}`);
+    } finally {
+      setUpdateBusy(false);
+    }
+  };
   const registerNotifications = async () => {
     if (!canRegisterNotifications) {
       return;
@@ -243,6 +281,20 @@ export default function SettingsScreen() {
       setNotificationBusy(false);
     }
   };
+  const copyNotificationDebug = async () => {
+    pressHaptic();
+
+    try {
+      const report = await getPresentedInboxNotificationDebugReport();
+
+      Clipboard.setString(report);
+      setNotificationStatusText('Copied delivered notification debug');
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (error) {
+      setNotificationStatusText(`Could not inspect delivered notifications\n${describeJmapError(error)}`);
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    }
+  };
 
   return (
     <>
@@ -257,7 +309,7 @@ export default function SettingsScreen() {
       <Stack.Title>{''}</Stack.Title>
       <Stack.Toolbar placement="left">
         <Stack.Toolbar.Button
-          icon="chevron.left"
+          icon="xmark"
           onPress={close}
           separateBackground
           tintColor={colors.text}
@@ -489,6 +541,35 @@ export default function SettingsScreen() {
             )}
           </View>
 
+          <View style={[styles.card, { backgroundColor: colors.card }]}>
+            <View style={styles.cardHeader}>
+              <View style={styles.cardHeaderText}>
+                <Text {...textScale} style={[styles.cardTitle, { color: colors.text }]}>
+                  App updates
+                </Text>
+                <Text {...textScale} style={[styles.cardSubtitle, { color: colors.secondaryText }]}>
+                  Pull the latest EAS update for this dev client
+                </Text>
+              </View>
+            </View>
+            <Pressable
+              accessibilityRole="button"
+              disabled={updateBusy}
+              onPress={checkForUpdate}
+              style={({ pressed }) => [
+                styles.testButton,
+                { backgroundColor: updateBusy ? colors.disabledButton : colors.secondaryButton },
+                pressed && styles.pressed,
+              ]}>
+              <Text {...textScale} style={[styles.secondaryButtonText, { color: colors.text }]}>
+                {updateBusy ? 'Checking Update' : 'Check for EAS Update'}
+              </Text>
+            </Pressable>
+            <Text selectable style={[styles.diagnosticText, { backgroundColor: colors.inputBackground, color: colors.text }]}>
+              {updateStatusText || getUpdateStatusSummary()}
+            </Text>
+          </View>
+
           <View style={[styles.card, styles.debugCard, { backgroundColor: colors.card }]}>
             <View style={styles.debugRow}>
               <View style={styles.debugTextBlock}>
@@ -508,7 +589,21 @@ export default function SettingsScreen() {
               />
             </View>
             {debugMode ? (
-              <NavigationDebugReport colors={colors} trace={navigationDebugTrace} />
+              <>
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={copyNotificationDebug}
+                  style={({ pressed }) => [
+                    styles.testButton,
+                    { backgroundColor: colors.secondaryButton },
+                    pressed && styles.pressed,
+                  ]}>
+                  <Text {...textScale} style={[styles.secondaryButtonText, { color: colors.text }]}>
+                    Copy Delivered Notification Debug
+                  </Text>
+                </Pressable>
+                <NavigationDebugReport colors={colors} trace={navigationDebugTrace} />
+              </>
             ) : null}
           </View>
         </ScrollView>
@@ -553,6 +648,20 @@ function formatDiagnosticReport(steps: Awaited<ReturnType<typeof diagnoseFastmai
   return steps
     .map((step) => `${step.status.toUpperCase()} ${step.label}\n${step.detail}`)
     .join('\n\n');
+}
+
+function getUpdateStatusSummary(prefix?: string) {
+  return [
+    prefix,
+    `enabled: ${Updates.isEnabled ? 'yes' : 'no'}`,
+    `channel: ${Updates.channel ?? 'none'}`,
+    `runtime: ${Updates.runtimeVersion ?? 'none'}`,
+    `update id: ${Updates.updateId ?? 'embedded'}`,
+    `embedded: ${Updates.isEmbeddedLaunch ? 'yes' : 'no'}`,
+    Updates.createdAt ? `created: ${Updates.createdAt.toISOString()}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 type ColorSet = typeof lightColors;

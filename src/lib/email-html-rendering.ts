@@ -79,15 +79,55 @@ export function getEmailBodyHeightScript(contentWidth: number, darkMode = false)
 
       function getHeight() {
         var body = document.body;
-        var doc = document.documentElement;
 
-        return Math.max(
-          body ? body.scrollHeight : 0,
-          body ? body.offsetHeight : 0,
-          doc ? doc.clientHeight : 0,
-          doc ? doc.scrollHeight : 0,
-          doc ? doc.offsetHeight : 0
-        );
+        if (!body) {
+          return 0;
+        }
+
+        var bodyStyle = window.getComputedStyle(body);
+        var bodyRect = body.getBoundingClientRect();
+        var minTop = 0;
+        var maxBottom = 0;
+        var hasMeasuredChild = false;
+        var children = Array.prototype.slice.call(body.children || []);
+
+        children.forEach(function (child) {
+          var tagName = child.tagName ? child.tagName.toLowerCase() : '';
+
+          if (tagName === 'script' || tagName === 'style' || tagName === 'title' || tagName === 'meta' || tagName === 'link') {
+            return;
+          }
+
+          var childStyle = window.getComputedStyle(child);
+
+          if (childStyle.display === 'none' || childStyle.visibility === 'hidden') {
+            return;
+          }
+
+          var rect = child.getBoundingClientRect();
+          var marginTop = parseFloat(childStyle.marginTop || '0') || 0;
+          var marginBottom = parseFloat(childStyle.marginBottom || '0') || 0;
+          var top = rect.top - bodyRect.top - marginTop;
+          var bottom = rect.bottom - bodyRect.top + marginBottom;
+
+          if (!hasMeasuredChild) {
+            minTop = top;
+            maxBottom = bottom;
+            hasMeasuredChild = true;
+          } else {
+            minTop = Math.min(minTop, top);
+            maxBottom = Math.max(maxBottom, bottom);
+          }
+        });
+
+        if (!hasMeasuredChild) {
+          return body.scrollHeight;
+        }
+
+        var marginTop = parseFloat(bodyStyle.marginTop || '0') || 0;
+        var marginBottom = parseFloat(bodyStyle.marginBottom || '0') || 0;
+
+        return Math.max(0, maxBottom - Math.min(0, minTop) + marginTop + marginBottom);
       }
 
       function getHost(value) {

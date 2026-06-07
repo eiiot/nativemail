@@ -15,19 +15,26 @@ import type { Message } from '@/lib/mock-mail';
 
 type MessagePatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 
+const LOCAL_ACTION_REFRESH_SUPPRESSION_MS = 8000;
+
 const messageBodyFetches = new Map<string, Promise<JmapMessageBody | null>>();
+let localMailActionSuppressUntil = 0;
 
 type MailStoreState = {
+  hiddenMailboxMessageIds: Record<string, Record<string, true>>;
   messageBodies: Record<string, JmapMessageBody>;
   snapshots: Record<string, JmapMailboxSnapshot>;
   threads: Record<string, JmapThread>;
   applyMailboxSnapshot: (snapshot: JmapMailboxSnapshot, mailboxId?: string | null) => void;
   applyMessageBody: (messageId: string, body: JmapMessageBody) => void;
+  clearHiddenMessageInMailbox: (messageId: string, mailboxId?: string | null) => void;
+  hideMessageInMailbox: (messageId: string, mailboxId?: string | null) => void;
   patchMessage: (messageId: string, patch: MessagePatch) => void;
   removeMessageFromMailbox: (messageId: string, mailboxId?: string | null) => void;
 };
 
 export const useMailStore = create<MailStoreState>((set) => ({
+  hiddenMailboxMessageIds: {},
   messageBodies: {},
   snapshots: {},
   threads: {},
@@ -35,13 +42,14 @@ export const useMailStore = create<MailStoreState>((set) => ({
     set((state) => {
       const messageBodies = { ...state.messageBodies };
       const snapshots = { ...state.snapshots };
-      const threads = { ...state.threads, ...(snapshot.threads ?? {}) };
+      const nextSnapshot = filterHiddenMailboxMessages(snapshot, mailboxId, state.hiddenMailboxMessageIds);
+      const threads = { ...state.threads, ...(nextSnapshot.threads ?? {}) };
 
-      for (const key of getSnapshotKeys(snapshot, mailboxId)) {
-        snapshots[key] = snapshot;
+      for (const key of getSnapshotKeys(nextSnapshot, mailboxId)) {
+        snapshots[key] = nextSnapshot;
       }
 
-      for (const message of snapshot.messages) {
+      for (const message of nextSnapshot.messages) {
         const body = getMessageBodyFromMessage(message);
 
         if (body) {
@@ -50,6 +58,59 @@ export const useMailStore = create<MailStoreState>((set) => ({
       }
 
       return { messageBodies, snapshots, threads };
+    });
+  },
+  clearHiddenMessageInMailbox: (messageId, mailboxId) => {
+    set((state) => {
+      const key = getMailboxSnapshotKey(mailboxId);
+      const hiddenForMailbox = state.hiddenMailboxMessageIds[key];
+
+      if (!hiddenForMailbox?.[messageId]) {
+        return state;
+      }
+
+      const nextHiddenForMailbox = { ...hiddenForMailbox };
+      delete nextHiddenForMailbox[messageId];
+
+      const hiddenMailboxMessageIds = { ...state.hiddenMailboxMessageIds };
+
+      if (Object.keys(nextHiddenForMailbox).length) {
+        hiddenMailboxMessageIds[key] = nextHiddenForMailbox;
+      } else {
+        delete hiddenMailboxMessageIds[key];
+      }
+
+      return { hiddenMailboxMessageIds };
+    });
+  },
+  hideMessageInMailbox: (messageId, mailboxId) => {
+    set((state) => {
+      const key = getMailboxSnapshotKey(mailboxId);
+      const hiddenForMailbox = state.hiddenMailboxMessageIds[key] ?? {};
+      const hiddenMailboxMessageIds = {
+        ...state.hiddenMailboxMessageIds,
+        [key]: {
+          ...hiddenForMailbox,
+          [messageId]: true as true,
+        },
+      };
+      const snapshot = state.snapshots[key];
+
+      if (!snapshot) {
+        return { hiddenMailboxMessageIds };
+      }
+
+      const nextSnapshot = {
+        ...snapshot,
+        messages: snapshot.messages.filter((message) => message.id !== messageId),
+      };
+      const snapshots = { ...state.snapshots };
+
+      for (const snapshotKey of getSnapshotKeys(nextSnapshot, mailboxId)) {
+        snapshots[snapshotKey] = nextSnapshot;
+      }
+
+      return { hiddenMailboxMessageIds, snapshots };
     });
   },
   applyMessageBody: (messageId, body) => {
@@ -129,6 +190,21 @@ export async function hydrateMailboxSnapshotFromCache(mailboxId?: string | null)
   }
 
   return snapshot;
+}
+
+export function recordLocalMailAction() {
+  localMailActionSuppressUntil = Math.max(
+    localMailActionSuppressUntil,
+    Date.now() + LOCAL_ACTION_REFRESH_SUPPRESSION_MS,
+  );
+}
+
+export function getLocalMailActionRefreshSuppressionRemainingMs() {
+  return Math.max(0, localMailActionSuppressUntil - Date.now());
+}
+
+export function isLocalMailActionRefreshSuppressed() {
+  return getLocalMailActionRefreshSuppressionRemainingMs() > 0;
 }
 
 export async function hydrateMessageBodyFromCache(messageId: string) {
@@ -261,6 +337,45 @@ function getSnapshotKeys(snapshot: JmapMailboxSnapshot, mailboxId?: string | nul
   }
 
   return keys;
+}
+
+function filterHiddenMailboxMessages(
+  snapshot: JmapMailboxSnapshot,
+  mailboxId: string | null | undefined,
+  hiddenMailboxMessageIds: Record<string, Record<string, true>>,
+) {
+  const hiddenMessageIds = getHiddenMessageIds(snapshot, mailboxId, hiddenMailboxMessageIds);
+
+  if (!hiddenMessageIds.size) {
+    return snapshot;
+  }
+
+  return {
+    ...snapshot,
+    messages: snapshot.messages.filter((message) => !hiddenMessageIds.has(message.id)),
+  };
+}
+
+function getHiddenMessageIds(
+  snapshot: JmapMailboxSnapshot,
+  mailboxId: string | null | undefined,
+  hiddenMailboxMessageIds: Record<string, Record<string, true>>,
+) {
+  const hiddenMessageIds = new Set<string>();
+
+  for (const key of getSnapshotKeys(snapshot, mailboxId)) {
+    const hiddenForMailbox = hiddenMailboxMessageIds[key];
+
+    if (!hiddenForMailbox) {
+      continue;
+    }
+
+    for (const messageId of Object.keys(hiddenForMailbox)) {
+      hiddenMessageIds.add(messageId);
+    }
+  }
+
+  return hiddenMessageIds;
 }
 
 function mapSnapshots(

@@ -1,5 +1,9 @@
 import '@/lib/jmap-polyfills'
 
+import {
+    getFastmailDomainAvatarUrl,
+    getFastmailProfilePhotoUrl,
+} from '@/lib/avatar-photos'
 import { getFastmailJmapToken } from '@/lib/fastmail-token'
 import type { Message, MessageAttachment } from '@/lib/mock-mail'
 import {
@@ -43,10 +47,16 @@ const emailSummaryProperties = [
     'receivedAt',
     'from',
     'to',
+    'cc',
+    'bcc',
     'subject',
     'preview',
     'hasAttachment',
     'attachments',
+    'header:BIMI-Location:asText',
+    'header:BIMI-Location:asURLs',
+    'header:BIMI-Indicator:asText',
+    'header:BIMI-Indicator:asURLs',
 ] satisfies (keyof EmailObject)[]
 
 const emailDetailProperties = [
@@ -164,6 +174,15 @@ export type JmapMessageActionResult = {
     unread?: boolean
 }
 
+export type JmapMessageNotificationState = {
+    exists: boolean
+    id: string
+    inInbox: boolean
+    keywords: Record<string, true>
+    mailboxIds: Record<string, true>
+    unread: boolean
+}
+
 export class FastmailJmapTokenMissingError extends Error {
     constructor() {
         super('No Fastmail JMAP token is configured.')
@@ -202,6 +221,53 @@ export async function fetchJmapMailboxes(signal?: AbortSignal) {
 
     try {
         return await getMailboxes(client, accountId, signal)
+    } finally {
+        await client.disconnect()
+    }
+}
+
+export async function fetchJmapMessageNotificationStates(
+    messageIds: string[],
+    signal?: AbortSignal
+): Promise<Record<string, JmapMessageNotificationState>> {
+    const ids = Array.from(new Set(messageIds.filter(Boolean)))
+
+    if (!ids.length) {
+        return {}
+    }
+
+    const { accountId, client } = await createFastmailJmapClient(signal)
+
+    try {
+        const mailboxes = await getMailboxes(client, accountId, signal)
+        const inbox = findMailboxByRole(mailboxes, 'inbox')
+        const emails = await getEmails(
+            client,
+            accountId,
+            ids,
+            emailMetadataProperties,
+            signal
+        )
+        const emailById = new Map(emails.map((email) => [email.id, email]))
+        const states: Record<string, JmapMessageNotificationState> = {}
+
+        for (const id of ids) {
+            const email = emailById.get(id)
+            const keywords = normalizeTrueRecord(email?.keywords)
+            const mailboxIds = normalizeTrueRecord(email?.mailboxIds)
+            const exists = Boolean(email)
+
+            states[id] = {
+                exists,
+                id,
+                inInbox: exists && Boolean(inbox && mailboxIds[inbox.id]),
+                keywords,
+                mailboxIds,
+                unread: exists && keywords.$seen !== true,
+            }
+        }
+
+        return states
     } finally {
         await client.disconnect()
     }
@@ -1206,11 +1272,19 @@ function mapEmailToMessage(email: EmailObject, mailboxes?: JmapMailbox[]): Messa
     const from = email.from?.[0] ?? email.sender?.[0] ?? null
     const sender = formatAddress(from)
     const attachments = getDownloadableAttachments(email)
+    const toAddresses = email.to?.map(formatAddress).filter(Boolean) ?? []
+    const ccAddresses = email.cc?.map(formatAddress).filter(Boolean) ?? []
+    const bccAddresses = email.bcc?.map(formatAddress).filter(Boolean) ?? []
+    const avatarUrl =
+        getBimiAvatarUrl(email) ??
+        getFastmailDomainAvatarUrl(from?.email) ??
+        getFastmailProfilePhotoUrl(from?.email)
 
     return {
         attachments,
         avatar: getInitials(sender),
         avatarColor: colorForString(from?.email ?? sender),
+        avatarUrl,
         body: getPlainTextBody(email) ?? undefined,
         hasAttachment: email.hasAttachment === true || attachments.length > 0,
         htmlBody: getHtmlBody(email) ?? undefined,
@@ -1225,9 +1299,81 @@ function mapEmailToMessage(email: EmailObject, mailboxes?: JmapMailbox[]): Messa
         sender,
         subject: email.subject?.trim() || '(No subject)',
         threadId: email.threadId,
-        to: email.to?.map(formatAddress).join(', '),
+        to: toAddresses.join(', '),
+        toAddresses,
+        ccAddresses,
+        bccAddresses,
         unread: email.keywords?.['$seen'] !== true,
     }
+}
+
+function getBimiAvatarUrl(email: EmailObject) {
+    const headerValues = [
+        getHeaderString(email, 'header:BIMI-Location:asText'),
+        getHeaderUrl(email, 'header:BIMI-Location:asURLs'),
+        getHeaderString(email, 'header:BIMI-Indicator:asText'),
+        getHeaderUrl(email, 'header:BIMI-Indicator:asURLs'),
+    ].filter((value): value is string => Boolean(value))
+
+    for (const value of headerValues) {
+        const url = getBimiLocationUrl(value)
+
+        if (url) {
+            return url
+        }
+    }
+
+    return undefined
+}
+
+function getHeaderString(email: EmailObject, key: keyof EmailObject) {
+    const value = email[key]
+
+    if (typeof value === 'string') {
+        return value
+    }
+
+    if (Array.isArray(value)) {
+        return value.find((item): item is string => typeof item === 'string')
+    }
+
+    return undefined
+}
+
+function getHeaderUrl(email: EmailObject, key: keyof EmailObject) {
+    const value = email[key]
+
+    if (typeof value === 'string') {
+        return value
+    }
+
+    if (Array.isArray(value)) {
+        return value.find(
+            (item): item is string =>
+                typeof item === 'string' && isAvatarImageUrl(item)
+        )
+    }
+
+    return undefined
+}
+
+function getBimiLocationUrl(value: string) {
+    const locationTag = value.match(/(?:^|;)\s*l\s*=\s*"?([^";\s]+)"?/i)
+    const url = locationTag?.[1] ?? value.match(/https?:\/\/[^\s"';<>]+/i)?.[0]
+
+    if (!url || !isAvatarImageUrl(url)) {
+        return undefined
+    }
+
+    return url.replace(/&amp;/g, '&')
+}
+
+function isAvatarImageUrl(value: string) {
+    if (!/^https?:\/\//i.test(value)) {
+        return false
+    }
+
+    return /\.(?:avif|gif|jpe?g|png|svg|webp)(?:[?#]|$)/i.test(value)
 }
 
 function getMessageMailboxName(email: EmailObject, mailboxes?: JmapMailbox[]) {
@@ -1329,14 +1475,7 @@ async function getEmailBody(
         : null
 
     return {
-        attachments: await getDownloadableAttachmentsWithPreviews(
-            client,
-            accountId,
-            token,
-            email,
-            html,
-            signal
-        ),
+        attachments: getDownloadableAttachments(email, html),
         debug: inlinedHtml?.debug,
         html: inlinedHtml?.html ?? null,
         text: getPlainTextBody(email, { allowPreviewFallback: true }),

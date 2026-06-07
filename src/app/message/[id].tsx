@@ -1,4 +1,4 @@
-import { GradientAvatar } from '@/components/gradient-avatar';
+import { ProfileAvatar } from '@/components/profile-avatar';
 import {
   AttachmentThumbnailView,
   canUseNativeAttachmentThumbnail,
@@ -13,7 +13,7 @@ import {
   type JmapMessageBodyDebug,
   type JmapMessageActionResult,
 } from '@/lib/jmap-client';
-import { updateCachedEmail } from '@/lib/mail-cache';
+import { removeCachedEmailFromMailbox, updateCachedEmail } from '@/lib/mail-cache';
 import { useDebugMode } from '@/lib/debug-mode';
 import {
   clampEmailBodyHeight,
@@ -22,10 +22,21 @@ import {
   getEmailHtmlDocument,
   minEmailBodyWebViewHeight,
 } from '@/lib/email-html-rendering';
-import { splitEmailReplyHtml, splitEmailReplyText } from '@/lib/email-reply-history';
+import { splitEmailForwardHtml, splitEmailReplyHtml, splitEmailReplyText } from '@/lib/email-reply-history';
+import {
+  adjustInboxUnreadBadgeCount,
+  dismissInboxNotificationForMessage,
+  recordInboxNotificationLocalAction,
+} from '@/lib/inbox-notifications';
+import {
+  getContactAvatarUrisForEmails,
+  normalizeContactEmail,
+} from '@/lib/contact-cache';
 import {
   hydrateMessageBodyFromCache,
   loadMessageBody,
+  recordLocalMailAction,
+  selectMailboxSnapshot,
   selectThread,
   useMailStore,
 } from '@/lib/mail-store';
@@ -79,7 +90,8 @@ import WebView, { type WebViewMessageEvent } from 'react-native-webview';
 
 const textScale = { maxFontSizeMultiplier: 1.12 };
 const messageDetailHorizontalPadding = 20;
-const messageBodyFetchRevision = 8;
+const messageBodyFetchRevision = 9;
+const optimisticMailboxHideTtlMs = 30000;
 const threadScrollOffset = 12;
 const systemFont = Platform.select({ ios: 'system-ui', default: undefined });
 const roundedFont = Platform.select({ ios: 'ui-rounded', default: undefined });
@@ -90,6 +102,24 @@ type MessageAction = 'archive' | 'reply' | 'reply-all' | 'toggle-pin' | 'toggle-
 type MessageStatusPatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 const copyEmailHtmlAction = 'copy-email-html';
 const maxReadDebugEvents = 24;
+
+function isPresent<T>(value: T | null | undefined): value is T {
+  return value !== null && value !== undefined;
+}
+
+function getBodyLoadDebugSummary(
+  body: { attachments?: MessageAttachment[]; html?: string | null; text?: string | null } | null | undefined,
+) {
+  if (!body) {
+    return 'html=0 text=0 attachments=0';
+  }
+
+  return [
+    `html=${body.html?.trim() ? body.html.length : 0}`,
+    `text=${body.text?.trim() ? body.text.length : 0}`,
+    `attachments=${body.attachments?.length ?? 0}`,
+  ].join(' ');
+}
 
 type EmailWebViewImageDebug = {
   imageCount: number;
@@ -125,11 +155,13 @@ export default function MessageScreen() {
   const params = useLocalSearchParams<{
     avatar?: string;
     avatarColor?: string;
+    avatarUrl?: string;
     count?: string;
     date?: string;
     fromEmail?: string;
     hasAttachment?: string;
     id: string;
+    mailboxId?: string;
     keywords?: string;
     mailboxIds?: string;
     mailboxName?: string;
@@ -140,6 +172,9 @@ export default function MessageScreen() {
     subject?: string;
     threadId?: string;
     to?: string;
+    toAddresses?: string;
+    ccAddresses?: string;
+    bccAddresses?: string;
     unread?: string;
     wasUnreadOnOpen?: string;
   }>();
@@ -153,17 +188,23 @@ export default function MessageScreen() {
   const routeMessage = getRouteMessage(params, fallbackMessage);
   const wasUnreadOnOpen = getRouteParam(params.wasUnreadOnOpen) === '1';
   const routeThreadId = routeMessage.threadId;
+  const routeMailboxId = getRouteParam(params.mailboxId) || null;
   const messageBodies = useMailStore((state) => state.messageBodies);
   const cachedThread = useMailStore((state) => selectThread(state, routeThreadId));
   const storeMessageBody = messageBodies[messageId] ?? null;
+  const applyMailboxSnapshot = useMailStore((state) => state.applyMailboxSnapshot);
   const applyMessageBody = useMailStore((state) => state.applyMessageBody);
+  const clearHiddenMessageInMailbox = useMailStore((state) => state.clearHiddenMessageInMailbox);
+  const hideMessageInMailbox = useMailStore((state) => state.hideMessageInMailbox);
   const patchStoreMessage = useMailStore((state) => state.patchMessage);
+  const removeStoreMessageFromMailbox = useMailStore((state) => state.removeMessageFromMailbox);
   const [localFlags, setLocalFlags] = useState({
     pinned: routeMessage.pinned,
     unread: routeMessage.unread,
   });
   const [pendingAction, setPendingAction] = useState<MessageAction | null>(null);
   const [readDebugEvents, setReadDebugEvents] = useState<string[]>([]);
+  const [contactAvatarUriByEmail, setContactAvatarUriByEmail] = useState<Record<string, string>>({});
   const [threadMessages, setThreadMessages] = useState<Message[] | null>(null);
   const [focusedThreadMessageId, setFocusedThreadMessageId] = useState(messageId);
   const [expandedThreadMessageIds, setExpandedThreadMessageIds] = useState<Set<string>>(
@@ -184,6 +225,8 @@ export default function MessageScreen() {
     pinned: localFlags.pinned,
     unread: localFlags.unread,
   };
+  const focusedBodyAvailable =
+    source !== 'jmap' || Boolean(jmapBody?.html?.trim() || jmapBody?.text?.trim());
   const cachedThreadMessages = cachedThread?.messages ?? null;
   const cachedThreadMessageKey = useMemo(
     () => cachedThreadMessages?.map((threadMessage) => threadMessage.id).join('\n') ?? '',
@@ -207,6 +250,10 @@ export default function MessageScreen() {
   const expandedThreadMessageKey = useMemo(
     () => Array.from(expandedThreadMessageIds).sort().join('\n'),
     [expandedThreadMessageIds],
+  );
+  const contactEmailKey = useMemo(
+    () => getContactEmailKey(detailMessages),
+    [detailMessages],
   );
   const appendReadDebugEvent = useCallback((event: string) => {
     setReadDebugEvents((currentEvents) =>
@@ -259,6 +306,29 @@ export default function MessageScreen() {
     },
     [messageId, patchStoreMessage],
   );
+  const dismissReadNotification = useCallback(
+    (targetMessageId: string) => {
+      dismissInboxNotificationForMessage(targetMessageId)
+        .then((result) => {
+          appendReadDebugEvent(
+            [
+              `notification-dismiss id=${targetMessageId}`,
+              `presented=${result.presented}`,
+              `matched=${result.matched}`,
+              `dismissed=${result.dismissed}`,
+              `identifiers=${result.matchedIdentifiers.length ? result.matchedIdentifiers.join(',') : 'none'}`,
+              `presentedMessageIds=${result.presentedMessageIds.length ? result.presentedMessageIds.join(',') : 'none'}`,
+            ].join(' '),
+          );
+        })
+        .catch((error: unknown) => {
+          appendReadDebugEvent(
+            `notification-dismiss failed id=${targetMessageId} error=${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+    },
+    [appendReadDebugEvent],
+  );
   const markVisibleMessageRead = useCallback(
     (targetMessage: Message) => {
       if (source !== 'jmap' || !targetMessage.id || !targetMessage.unread) {
@@ -274,19 +344,16 @@ export default function MessageScreen() {
       appendReadDebugEvent(
         `mark-read start id=${targetMessage.id} thread=${targetMessage.threadId ?? 'none'} unread=${targetMessage.unread ? '1' : '0'} seen=${targetMessage.keywords?.$seen === true ? '1' : '0'}`,
       );
+      recordOptimisticMailAction(targetMessage.id);
       patchVisibleMessage(targetMessage.id, optimisticPatch);
+      dismissReadNotification(targetMessage.id);
+      if (isInboxMailboxName(mailboxName)) {
+        void adjustInboxUnreadBadgeCount(-1).catch(() => {});
+      }
       void updateCachedEmail(targetMessage.id, optimisticPatch).catch(() => {});
 
       setJmapEmailUnread(targetMessage.id, false)
         .then((result) => {
-          const resultPatch = {
-            keywords: result.keywords,
-            pinned: result.pinned,
-            unread: result.unread,
-          };
-
-          patchVisibleMessage(targetMessage.id, resultPatch);
-          void updateCachedEmail(targetMessage.id, resultPatch).catch(() => {});
           appendReadDebugEvent(
             `mark-read success id=${targetMessage.id} unread=${result.unread === true ? '1' : '0'} seen=${result.keywords?.$seen === true ? '1' : '0'}`,
           );
@@ -299,13 +366,16 @@ export default function MessageScreen() {
           };
 
           patchVisibleMessage(targetMessage.id, rollbackPatch);
+          if (isInboxMailboxName(mailboxName)) {
+            void adjustInboxUnreadBadgeCount(1).catch(() => {});
+          }
           void updateCachedEmail(targetMessage.id, rollbackPatch).catch(() => {});
           appendReadDebugEvent(
             `mark-read failed id=${targetMessage.id} error=${error instanceof Error ? error.message : String(error)}`,
           );
         });
     },
-    [appendReadDebugEvent, patchVisibleMessage, source],
+    [appendReadDebugEvent, dismissReadNotification, mailboxName, patchVisibleMessage, source],
   );
 
   useEffect(() => {
@@ -339,6 +409,11 @@ export default function MessageScreen() {
 
   useEffect(() => {
     if (source !== 'jmap' || !messageId) {
+      return;
+    }
+
+    if (!focusedBodyAvailable) {
+      appendReadDebugEvent(`thread fetch deferred until body id=${messageId}`);
       return;
     }
 
@@ -378,7 +453,36 @@ export default function MessageScreen() {
     return () => {
       controller.abort();
     };
-  }, [appendReadDebugEvent, cachedThreadMessageKey, cachedThreadMessages, messageId, routeMessage.threadId, source, wasUnreadOnOpen]);
+  }, [appendReadDebugEvent, cachedThreadMessageKey, cachedThreadMessages, focusedBodyAvailable, messageId, routeMessage.threadId, source, wasUnreadOnOpen]);
+
+  useEffect(() => {
+    if (!contactEmailKey) {
+      return;
+    }
+
+    const controller = new AbortController();
+    const emails = contactEmailKey.split('\n').filter(Boolean);
+
+    const contactLookupTask = InteractionManager.runAfterInteractions(() => {
+      void getContactAvatarUrisForEmails(emails, controller.signal)
+        .then((result) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+
+          setContactAvatarUriByEmail((current) => ({
+            ...current,
+            ...result.avatarUriByEmail,
+          }));
+        })
+        .catch(() => {});
+    });
+
+    return () => {
+      controller.abort();
+      contactLookupTask.cancel();
+    };
+  }, [contactEmailKey]);
 
   useEffect(() => {
     const shouldLoadJmap = source === 'jmap';
@@ -387,34 +491,58 @@ export default function MessageScreen() {
       return;
     }
 
-    void hydrateMessageBodyFromCache(messageId).catch(() => {});
+    const startedAt = Date.now();
 
+    appendReadDebugEvent(`body cache start id=${messageId}`);
+    void hydrateMessageBodyFromCache(messageId)
+      .then((body) => {
+        appendReadDebugEvent(
+          `body cache ${body ? 'hit' : 'miss'} id=${messageId} +${Date.now() - startedAt}ms ${getBodyLoadDebugSummary(body)}`,
+        );
+      })
+      .catch((error: unknown) => {
+        appendReadDebugEvent(
+          `body cache failed id=${messageId} +${Date.now() - startedAt}ms error=${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+
+    appendReadDebugEvent(`body fetch start id=${messageId}`);
     void loadMessageBody(messageId, { refresh: true })
       .then((body) => {
+        appendReadDebugEvent(
+          `body fetch ${body ? 'finished' : 'empty'} id=${messageId} +${Date.now() - startedAt}ms ${getBodyLoadDebugSummary(body)}`,
+        );
+
         if (body) {
           applyMessageBody(messageId, body);
         }
       })
-      .catch(() => {});
-  }, [applyMessageBody, messageId, source, messageBodyFetchRevision]);
+      .catch((error: unknown) => {
+        appendReadDebugEvent(
+          `body fetch failed id=${messageId} +${Date.now() - startedAt}ms error=${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+  }, [appendReadDebugEvent, applyMessageBody, messageId, source, messageBodyFetchRevision]);
   useEffect(() => {
     if (source !== 'jmap') {
       return;
     }
 
-    const messageIds = Array.from(expandedThreadMessageIds);
+    const messageIds = Array.from(expandedThreadMessageIds).filter(
+      (threadMessageId) => threadMessageId !== messageId,
+    );
 
     for (const threadMessageId of messageIds) {
       void hydrateMessageBodyFromCache(threadMessageId).catch(() => {});
       void loadMessageBody(threadMessageId, { refresh: true }).catch(() => {});
     }
-  }, [expandedThreadMessageKey, expandedThreadMessageIds, source]);
+  }, [expandedThreadMessageKey, expandedThreadMessageIds, messageId, source]);
   useEffect(() => {
     for (const unreadMessage of expandedUnreadMessages) {
       markVisibleMessageRead(unreadMessage);
     }
   }, [expandedUnreadMessageKey, expandedUnreadMessages, markVisibleMessageRead]);
-  const runMessageAction = (action: MessageAction) => {
+  const runMessageAction = (action: MessageAction, targetMessageId = focusedThreadMessageId) => {
     pressHaptic();
 
     if (action === 'reply' || action === 'reply-all') {
@@ -425,7 +553,9 @@ export default function MessageScreen() {
       return;
     }
 
-    const targetMessage = actionTargetMessage;
+    const targetMessage =
+      detailMessages.find((detailMessage) => detailMessage.id === targetMessageId) ??
+      actionTargetMessage;
     const previousPatch = {
       keywords: targetMessage.keywords,
       pinned: targetMessage.pinned,
@@ -444,6 +574,40 @@ export default function MessageScreen() {
 
     setPendingAction(action);
 
+    if (isOptimisticMailboxExitAction(action)) {
+      const actionMailboxId = getActionMailboxId(targetMessage, routeMailboxId, mailboxName);
+      const previousSnapshot = selectMailboxSnapshot(useMailStore.getState(), actionMailboxId);
+
+      recordOptimisticMailAction(targetMessage.id);
+      hideMessageInMailbox(targetMessage.id, actionMailboxId);
+      dismissReadNotification(targetMessage.id);
+      if (targetMessage.unread && isInboxMailboxName(mailboxName)) {
+        void adjustInboxUnreadBadgeCount(-1).catch(() => {});
+      }
+      router.back();
+
+      getMessageActionRequest(action, targetMessage.id, targetMessage)
+        .then(() => {
+          removeStoreMessageFromMailbox(targetMessage.id, actionMailboxId);
+          if (actionMailboxId) {
+            void removeCachedEmailFromMailbox(targetMessage.id, actionMailboxId).catch(() => {});
+          }
+          setTimeout(() => {
+            clearHiddenMessageInMailbox(targetMessage.id, actionMailboxId);
+          }, optimisticMailboxHideTtlMs);
+        })
+        .catch(() => {
+          clearHiddenMessageInMailbox(targetMessage.id, actionMailboxId);
+          if (previousSnapshot) {
+            applyMailboxSnapshot(previousSnapshot, actionMailboxId);
+          }
+          if (targetMessage.unread && isInboxMailboxName(mailboxName)) {
+            void adjustInboxUnreadBadgeCount(1).catch(() => {});
+          }
+        });
+      return;
+    }
+
     if (action === 'toggle-pin') {
       const nextPinned = !targetMessage.pinned;
       const optimisticPatch = {
@@ -451,7 +615,9 @@ export default function MessageScreen() {
         pinned: nextPinned,
       };
 
+      recordOptimisticMailAction(targetMessage.id);
       patchVisibleMessage(targetMessage.id, optimisticPatch);
+      void updateCachedEmail(targetMessage.id, optimisticPatch).catch(() => {});
     }
 
     if (action === 'toggle-unread') {
@@ -461,29 +627,25 @@ export default function MessageScreen() {
         unread: nextUnread,
       };
 
+      recordOptimisticMailAction(targetMessage.id);
       patchVisibleMessage(targetMessage.id, optimisticPatch);
+      void updateCachedEmail(targetMessage.id, optimisticPatch).catch(() => {});
+      if (isInboxMailboxName(mailboxName)) {
+        void adjustInboxUnreadBadgeCount(nextUnread ? 1 : -1).catch(() => {});
+      }
+      if (!nextUnread) {
+        dismissReadNotification(targetMessage.id);
+      }
     }
 
     const request = getMessageActionRequest(action, targetMessage.id, targetMessage);
 
     request
-      .then((result) => {
-        if (action === 'archive' || action === 'trash') {
-          router.back();
-          return;
-        }
-
-        const resultPatch = {
-          keywords: result.keywords,
-          pinned: result.pinned,
-          unread: result.unread,
-        };
-
-        patchVisibleMessage(targetMessage.id, resultPatch);
-        void updateCachedEmail(targetMessage.id, resultPatch).catch(() => {});
-      })
       .catch((error: unknown) => {
         patchVisibleMessage(targetMessage.id, previousPatch);
+        if (action === 'toggle-unread' && isInboxMailboxName(mailboxName)) {
+          void adjustInboxUnreadBadgeCount(targetMessage.unread ? 1 : -1).catch(() => {});
+        }
         void updateCachedEmail(targetMessage.id, previousPatch).catch(() => {});
       })
       .finally(() => {
@@ -608,6 +770,7 @@ export default function MessageScreen() {
         <MessageDetail
           bodyDebug={jmapBody?.debug}
           colors={colors}
+          contactAvatarUriByEmail={contactAvatarUriByEmail}
           expandedMessageIds={expandedThreadMessageIds}
           focusedMessageId={focusedThreadMessageId}
           insetsTop={insets.top}
@@ -841,6 +1004,7 @@ function getRouteMessage(
     ...fallbackMessage,
     avatar: getRouteParam(params.avatar) || fallbackMessage.avatar,
     avatarColor: getRouteParam(params.avatarColor) || fallbackMessage.avatarColor,
+    avatarUrl: getRouteParam(params.avatarUrl) || fallbackMessage.avatarUrl,
     count: Number.isFinite(count) ? count : fallbackMessage.count,
     date: getRouteParam(params.date) || fallbackMessage.date,
     fromEmail: getRouteParam(params.fromEmail) || fallbackMessage.fromEmail,
@@ -855,6 +1019,9 @@ function getRouteMessage(
     subject: getRouteParam(params.subject) || fallbackMessage.subject,
     threadId: getRouteParam(params.threadId) || fallbackMessage.threadId,
     to: getRouteParam(params.to) || fallbackMessage.to,
+    toAddresses: getRouteStringArray(params.toAddresses) ?? fallbackMessage.toAddresses,
+    ccAddresses: getRouteStringArray(params.ccAddresses) ?? fallbackMessage.ccAddresses,
+    bccAddresses: getRouteStringArray(params.bccAddresses) ?? fallbackMessage.bccAddresses,
     unread: unread ? unread === '1' : fallbackMessage.unread,
   };
 }
@@ -938,6 +1105,24 @@ function getRouteRecord(value: string | string[] | undefined) {
     }
 
     return record;
+  } catch {
+    return undefined;
+  }
+}
+
+function getRouteStringArray(value: string | string[] | undefined) {
+  const text = getRouteParam(value);
+
+  if (!text) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : undefined;
   } catch {
     return undefined;
   }
@@ -1093,8 +1278,17 @@ function getMessageMenuActions(message: Message, debugMode: boolean, hasHtmlBody
   return actions;
 }
 
+function recordOptimisticMailAction(messageId: string) {
+  recordLocalMailAction();
+  void recordInboxNotificationLocalAction(messageId).catch(() => {});
+}
+
 function isMessageAction(action: string): action is MessageAction {
   return ['archive', 'reply', 'reply-all', 'toggle-pin', 'toggle-unread', 'trash'].includes(action);
+}
+
+function isOptimisticMailboxExitAction(action: MessageAction): action is 'archive' | 'trash' {
+  return action === 'archive' || action === 'trash';
 }
 
 function getMessageActionRequest(
@@ -1117,9 +1311,69 @@ function getMessageActionRequest(
   }
 }
 
+function getActionMailboxId(
+  message: Message,
+  routeMailboxId?: string | null,
+  routeMailboxName?: string | null,
+) {
+  if (routeMailboxId) {
+    return routeMailboxId;
+  }
+
+  const snapshots = Object.values(useMailStore.getState().snapshots);
+  const normalizedRouteMailboxName = routeMailboxName ? normalizeMailboxName(routeMailboxName) : null;
+  const snapshotForRouteName = snapshots.find((snapshot) =>
+    snapshot.mailbox?.id &&
+    snapshot.messages.some((snapshotMessage) => snapshotMessage.id === message.id) &&
+    (!normalizedRouteMailboxName || normalizeMailboxName(snapshot.mailbox.name) === normalizedRouteMailboxName)
+  );
+
+  if (snapshotForRouteName?.mailbox?.id) {
+    return snapshotForRouteName.mailbox.id;
+  }
+
+  const snapshotForMessageMailbox = snapshots.find((snapshot) =>
+    snapshot.mailbox?.id &&
+    message.mailboxIds?.[snapshot.mailbox.id] === true &&
+    snapshot.messages.some((snapshotMessage) => snapshotMessage.id === message.id)
+  );
+
+  if (snapshotForMessageMailbox?.mailbox?.id) {
+    return snapshotForMessageMailbox.mailbox.id;
+  }
+
+  const mailboxIds = Object.keys(message.mailboxIds ?? {});
+
+  return mailboxIds.length === 1 ? mailboxIds[0] : null;
+}
+
+function normalizeMailboxName(name: string) {
+  return name.trim().toLowerCase();
+}
+
+function isInboxMailboxName(name?: string | null) {
+  return normalizeMailboxName(name ?? '') === 'inbox';
+}
+
+function getContactEmailKey(messages: Message[]) {
+  return Array.from(
+    new Set(messages.map((message) => normalizeContactEmail(message.fromEmail)).filter(isPresent)),
+  ).join('\n');
+}
+
+function getContactAvatarUriForMessage(
+  message: Message,
+  contactAvatarUriByEmail: Record<string, string>,
+) {
+  const email = normalizeContactEmail(message.fromEmail);
+
+  return email ? contactAvatarUriByEmail[email] : undefined;
+}
+
 function MessageDetail({
   bodyDebug,
   colors,
+  contactAvatarUriByEmail,
   expandedMessageIds,
   focusedMessageId,
   insetsTop,
@@ -1133,13 +1387,14 @@ function MessageDetail({
 }: {
   bodyDebug?: JmapMessageBodyDebug;
   colors: ColorSet;
+  contactAvatarUriByEmail: Record<string, string>;
   expandedMessageIds: Set<string>;
   focusedMessageId: string;
   insetsTop: number;
   mailboxName?: string;
   message: Message;
   messages: Message[];
-  onAction: (action: MessageAction) => void;
+  onAction: (action: MessageAction, messageId?: string) => void;
   onExpandAll: () => void;
   onToggleMessage: (messageId: string) => void;
   threadDebugText: string | null;
@@ -1226,6 +1481,7 @@ function MessageDetail({
               bodyDebug={threadMessage.id === message.id ? bodyDebug : undefined}
               canToggle={canToggleThreadMessages}
               colors={colors}
+              contactAvatarUriByEmail={contactAvatarUriByEmail}
               expanded={expanded}
               focused={threadMessage.id === focusedMessageId}
               isLast={index === messages.length - 1}
@@ -1234,7 +1490,7 @@ function MessageDetail({
               onAction={onAction}
               onLayout={handleThreadItemLayout}
               onToggle={() => onToggleMessage(threadMessage.id)}
-              showMenu={threadMessage.id === focusedMessageId}
+              showMenu={expanded}
             />
           );
         })}
@@ -1254,6 +1510,7 @@ function MessageThreadItem({
   bodyDebug,
   canToggle,
   colors,
+  contactAvatarUriByEmail,
   expanded,
   focused,
   isLast,
@@ -1266,15 +1523,36 @@ function MessageThreadItem({
   bodyDebug?: JmapMessageBodyDebug;
   canToggle: boolean;
   colors: ColorSet;
+  contactAvatarUriByEmail: Record<string, string>;
   expanded: boolean;
   focused: boolean;
   isLast: boolean;
   message: Message;
-  onAction: (action: MessageAction) => void;
+  onAction: (action: MessageAction, messageId?: string) => void;
   onLayout: (messageId: string, y: number) => void;
   onToggle: () => void;
   showMenu: boolean;
 }) {
+  const debugMode = useDebugMode();
+  const collapsedMenuActions = useMemo(
+    () => getMessageMenuActions(message, debugMode, Boolean(message.htmlBody?.trim())),
+    [debugMode, message.htmlBody, message.pinned, message.unread],
+  );
+
+  const handleCollapsedMenuAction = (event: NativeActionEvent) => {
+    const action = event.nativeEvent.event;
+    const htmlBody = message.htmlBody?.trim();
+
+    if (isMessageAction(action)) {
+      onAction(action, message.id);
+    } else if (action === copyEmailHtmlAction && htmlBody) {
+      Clipboard.setString(message.htmlBody ?? '');
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } else {
+      pressHaptic();
+    }
+  };
+
   return (
     <View
       onLayout={(event) => onLayout(message.id, event.nativeEvent.layout.y)}
@@ -1283,6 +1561,7 @@ function MessageThreadItem({
         <ExpandedThreadMessage
           bodyDebug={bodyDebug}
           colors={colors}
+          contactAvatarUri={getContactAvatarUriForMessage(message, contactAvatarUriByEmail)}
           focused={focused}
           message={message}
           onAction={onAction}
@@ -1292,7 +1571,10 @@ function MessageThreadItem({
       ) : (
         <CollapsedThreadMessage
           colors={colors}
+          contactAvatarUri={getContactAvatarUriForMessage(message, contactAvatarUriByEmail)}
+          menuActions={collapsedMenuActions}
           message={message}
+          onAction={handleCollapsedMenuAction}
           onPress={onToggle}
         />
       )}
@@ -1302,20 +1584,30 @@ function MessageThreadItem({
 
 function CollapsedThreadMessage({
   colors,
+  contactAvatarUri,
+  menuActions,
   message,
+  onAction,
   onPress,
 }: {
   colors: ColorSet;
+  contactAvatarUri?: string;
+  menuActions: MenuAction[];
   message: Message;
+  onAction: (event: NativeActionEvent) => void;
   onPress: () => void;
 }) {
   return (
     <View style={styles.threadCollapsedItem}>
       <ThreadMessageHeader
         colors={colors}
+        contactAvatarUri={contactAvatarUri}
+        menuActions={menuActions}
         message={message}
+        onMenuAction={onAction}
         onPress={onPress}
-        showMenu={false}
+        sentInfoEnabled={false}
+        showMenu
       />
     </View>
   );
@@ -1324,6 +1616,7 @@ function CollapsedThreadMessage({
 function ExpandedThreadMessage({
   bodyDebug,
   colors,
+  contactAvatarUri,
   focused,
   message,
   onAction,
@@ -1332,9 +1625,10 @@ function ExpandedThreadMessage({
 }: {
   bodyDebug?: JmapMessageBodyDebug;
   colors: ColorSet;
+  contactAvatarUri?: string;
   focused: boolean;
   message: Message;
-  onAction: (action: MessageAction) => void;
+  onAction: (action: MessageAction, messageId?: string) => void;
   onToggle?: () => void;
   showMenu: boolean;
 }) {
@@ -1368,6 +1662,13 @@ function ExpandedThreadMessage({
   const [quoteHistoryExpanded, setQuoteHistoryExpanded] = useState(false);
   const visibleHtmlBody = htmlReplySplit?.bodyHtml ?? htmlBody;
   const quoteHtmlBody = htmlReplySplit?.quoteHtml ?? null;
+  const afterQuoteHtmlBody = htmlReplySplit?.afterQuoteHtml ?? null;
+  const htmlForwardSplit = useMemo(
+    () => (visibleHtmlBody ? splitEmailForwardHtml(visibleHtmlBody) : null),
+    [visibleHtmlBody],
+  );
+  const primaryHtmlBody = htmlForwardSplit?.introHtml ?? visibleHtmlBody;
+  const forwardedHtmlBody = htmlForwardSplit?.forwardedHtml ?? null;
   const visibleTextBody = textReplySplit?.bodyText ?? body;
   const quoteTextBody = textReplySplit?.quoteText ?? null;
   const hasQuoteHistory = Boolean(quoteHtmlBody || quoteTextBody);
@@ -1391,7 +1692,7 @@ function ExpandedThreadMessage({
     const action = event.nativeEvent.event;
 
     if (isMessageAction(action)) {
-      onAction(action);
+      onAction(action, message.id);
     } else if (action === copyEmailHtmlAction && htmlBody && rawHtmlBody) {
       Clipboard.setString(rawHtmlBody);
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -1408,21 +1709,31 @@ function ExpandedThreadMessage({
     <View style={[styles.threadExpandedItem, focused && styles.threadFocusedItem]}>
       <ThreadMessageHeader
         colors={colors}
+        contactAvatarUri={contactAvatarUri}
         menuActions={messageMenuActions}
         message={message}
         onMenuAction={handleMenuAction}
         onPress={onToggle}
+        sentInfoEnabled
         showMenu={showMenu}
       />
 
-      {visibleHtmlBody ? (
+      {primaryHtmlBody ? (
         <>
           <EmailBodyWebView
             colors={colors}
-            html={visibleHtmlBody}
+            html={primaryHtmlBody}
             onDarkModeDebug={setDarkModeDebug}
             onImageDebug={setImageDebug}
           />
+          {forwardedHtmlBody ? (
+            <EmailBodyWebView
+              colors={colors}
+              html={forwardedHtmlBody}
+              onDarkModeDebug={setDarkModeDebug}
+              onImageDebug={setImageDebug}
+            />
+          ) : null}
           {hasQuoteHistory ? (
             <EmailHistoryButton
               colors={colors}
@@ -1437,13 +1748,20 @@ function ExpandedThreadMessage({
               onImageDebug={() => {}}
             />
           ) : null}
+          {afterQuoteHtmlBody ? (
+            <EmailBodyWebView
+              colors={colors}
+              html={afterQuoteHtmlBody}
+              onImageDebug={() => {}}
+            />
+          ) : null}
           <AttachmentList attachments={attachments} colors={colors} />
           {debugMode ? (
             <EmailBodyDebugReport
               colors={colors}
               debug={bodyDebug}
               darkModeDebug={darkModeDebug}
-              html={htmlBody ?? visibleHtmlBody}
+              html={htmlBody ?? visibleHtmlBody ?? ''}
               imageDebug={imageDebug}
             />
           ) : null}
@@ -1503,28 +1821,102 @@ function EmailHistoryButton({
   );
 }
 
+type SentInfoRow = {
+  label: string;
+  values: string[];
+};
+
+function getMessageSentInfoRows(message: Message): SentInfoRow[] {
+  const rows: SentInfoRow[] = [];
+  const fromValue = getFromSentInfoValue(message);
+
+  if (fromValue) {
+    rows.push({ label: 'From', values: [fromValue] });
+  }
+
+  const ccValues = getAddressSentInfoValues(message.ccAddresses);
+
+  if (ccValues.length) {
+    rows.push({ label: 'Cc', values: ccValues });
+  }
+
+  const bccValues = getAddressSentInfoValues(message.bccAddresses);
+
+  if (bccValues.length) {
+    rows.push({ label: 'Bcc', values: bccValues });
+  }
+
+  return rows;
+}
+
+function getFromSentInfoValue(message: Message) {
+  const sender = message.sender.trim();
+  const fromEmail = message.fromEmail?.trim();
+
+  if (sender && fromEmail && !sender.includes(fromEmail)) {
+    return `${sender} <${fromEmail}>`;
+  }
+
+  return sender || fromEmail || null;
+}
+
+function getAddressSentInfoValues(values?: string[], fallback?: string) {
+  const structuredValues = values?.map((value) => value.trim()).filter(Boolean) ?? [];
+
+  return structuredValues.length ? structuredValues : parseCommaSeparatedAddressList(fallback);
+}
+
+function parseCommaSeparatedAddressList(value?: string) {
+  return value
+    ? value
+        .split(',')
+        .map((address) => address.trim())
+        .filter(Boolean)
+    : [];
+}
+
 function ThreadMessageHeader({
   colors,
+  contactAvatarUri,
   menuActions,
   message,
   onMenuAction,
   onPress,
+  sentInfoEnabled = true,
   showMenu,
 }: {
   colors: ColorSet;
+  contactAvatarUri?: string;
   menuActions?: MenuAction[];
   message: Message;
   onMenuAction?: (event: NativeActionEvent) => void;
   onPress?: () => void;
+  sentInfoEnabled?: boolean;
   showMenu: boolean;
 }) {
+  const [sentInfoExpanded, setSentInfoExpanded] = useState(false);
+  const sentInfoRows = useMemo(() => getMessageSentInfoRows(message), [message]);
+  const toValues = useMemo(
+    () => getAddressSentInfoValues(message.toAddresses, message.to),
+    [message.to, message.toAddresses],
+  );
+  const toLine = message.to ? `To: ${message.to}` : 'To: Me';
+  const handleHeaderPress = onPress;
+  const toggleSentInfo = () => {
+    pressHaptic();
+    setSentInfoExpanded((expanded) => !expanded);
+  };
+  const handleSentInfoPress = sentInfoEnabled ? toggleSentInfo : onPress;
+  const sentInfoAccessibilityLabel = sentInfoEnabled
+    ? sentInfoExpanded
+      ? 'Hide sent information'
+      : 'Show sent information'
+    : 'Expand message';
+
   return (
-    <Pressable
-      accessibilityRole={onPress ? 'button' : undefined}
-      disabled={!onPress}
-      onPress={onPress}
-      style={({ pressed }) => [styles.messageHeaderRow, pressed && styles.pressed]}>
-      <GradientAvatar
+    <View style={styles.messageHeaderRow}>
+      <ProfileAvatar
+        avatarUrl={contactAvatarUri ?? message.avatarUrl}
         color={message.avatarColor}
         label={message.avatar}
         size={38}
@@ -1532,44 +1924,117 @@ function ThreadMessageHeader({
         textSize={(message.avatar?.length ?? 1) > 1 ? 15 : 20}
       />
       <View style={styles.messageSenderBlock}>
-        <View style={styles.messageSenderTopRow}>
-          <Text {...textScale} numberOfLines={1} style={[styles.messageSender, { color: colors.text }]}>
-            {message.sender}
-          </Text>
-          <View style={styles.messageHeaderMeta}>
-            {message.hasAttachment ? (
-              <SymbolView name="paperclip" tintColor={colors.secondaryText} size={15} weight="semibold" />
-            ) : null}
-            <Text
-              {...textScale}
-              numberOfLines={1}
-              style={[styles.messageDetailDate, { color: colors.secondaryText }]}>
-              {message.date}
+        <Pressable
+          accessibilityRole={handleHeaderPress ? 'button' : undefined}
+          disabled={!handleHeaderPress}
+          onPress={handleHeaderPress}
+          style={({ pressed }) => [styles.messageHeaderPressTarget, pressed && styles.pressed]}>
+          <View style={styles.messageSenderTopRow}>
+            <Text {...textScale} numberOfLines={1} style={[styles.messageSender, { color: colors.text }]}>
+              {message.sender}
             </Text>
+            <View style={styles.messageHeaderMeta}>
+              {message.hasAttachment ? (
+                <SymbolView name="paperclip" tintColor={colors.secondaryText} size={15} weight="semibold" />
+              ) : null}
+              <Text
+                {...textScale}
+                numberOfLines={1}
+                style={[styles.messageDetailDate, { color: colors.secondaryText }]}>
+                {message.date}
+              </Text>
+            </View>
           </View>
-        </View>
+        </Pressable>
         <View style={styles.messageSenderBottomRow}>
-          <View style={styles.messageRecipientRow}>
-            <Text {...textScale} numberOfLines={1} style={[styles.messageRecipient, { color: colors.secondaryText }]}>
-              {message.to ? `To: ${message.to}` : 'To: Me'}
-            </Text>
-            <SymbolView name="chevron.down" tintColor={colors.secondaryText} size={12} weight="semibold" />
-          </View>
-          {showMenu && menuActions && onMenuAction ? (
-            <MenuView
-              actions={menuActions}
-              onPressAction={onMenuAction}
-              style={styles.messageMenuHost}>
-              <View style={styles.messageEllipsisButton}>
-                <SymbolView name="ellipsis" tintColor={colors.secondaryText} size={20} weight="semibold" />
+          <Pressable
+            accessibilityLabel={sentInfoAccessibilityLabel}
+            accessibilityRole={handleSentInfoPress ? 'button' : undefined}
+            disabled={!handleSentInfoPress}
+            onPress={handleSentInfoPress}
+            style={({ pressed }) => [styles.messageRecipientRow, pressed && styles.pressed]}>
+            {sentInfoEnabled && sentInfoExpanded ? (
+              <View style={styles.sentInfoDetails}>
+                <SentInfoDetailRow colors={colors} label="To" values={toValues.length ? toValues : ['Me']} />
+                {sentInfoRows.map((row) => (
+                  <SentInfoDetailRow colors={colors} key={row.label} label={row.label} values={row.values} />
+                ))}
               </View>
-            </MenuView>
-          ) : (
-            <View style={styles.messageMenuHost} />
-          )}
+            ) : (
+              <Text {...textScale} numberOfLines={1} style={[styles.messageRecipient, { color: colors.secondaryText }]}>
+                {toLine}
+              </Text>
+            )}
+          </Pressable>
+          <Pressable
+            accessibilityLabel={sentInfoAccessibilityLabel}
+            accessibilityRole={handleSentInfoPress ? 'button' : undefined}
+            disabled={!handleSentInfoPress}
+            onPress={handleSentInfoPress}
+            style={({ pressed }) => [styles.messageRecipientChevronButton, pressed && styles.pressed]}>
+            <SymbolView
+              name={sentInfoEnabled && sentInfoExpanded ? 'chevron.up' : 'chevron.down'}
+              tintColor={colors.secondaryText}
+              size={12}
+              weight="semibold"
+            />
+          </Pressable>
+          {showMenu && menuActions && onMenuAction ? (
+            <MessageHeaderMenu actions={menuActions} colors={colors} onPressAction={onMenuAction} />
+          ) : null}
         </View>
       </View>
-    </Pressable>
+    </View>
+  );
+}
+
+function SentInfoDetailRow({
+  colors,
+  label,
+  values,
+}: {
+  colors: ColorSet;
+  label: string;
+  values: string[];
+}) {
+  return (
+    <View style={styles.sentInfoRow}>
+      <Text {...textScale} style={[styles.sentInfoLabel, { color: colors.secondaryText }]}>
+        {label}:
+      </Text>
+      <View style={styles.sentInfoValueBlock}>
+        {values.map((value, index) => (
+          <Text
+            {...textScale}
+            key={`${label}-${index}-${value}`}
+            selectable
+            style={[styles.messageRecipient, { color: colors.secondaryText }]}>
+            {value}
+          </Text>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+function MessageHeaderMenu({
+  actions,
+  colors,
+  onPressAction,
+}: {
+  actions: MenuAction[];
+  colors: ColorSet;
+  onPressAction: (event: NativeActionEvent) => void;
+}) {
+  return (
+    <View style={styles.messageMenuHost}>
+      <View pointerEvents="none" style={styles.messageEllipsisButton}>
+        <SymbolView name="ellipsis" tintColor={colors.secondaryText} size={18} weight="semibold" />
+      </View>
+      <MenuView actions={actions} onPressAction={onPressAction} style={styles.messageMenuOverlay}>
+        <View style={styles.messageMenuHitTarget} />
+      </MenuView>
+    </View>
   );
 }
 
@@ -2113,6 +2578,10 @@ const styles = StyleSheet.create({
     alignItems: 'flex-start',
     flexDirection: 'row',
   },
+  messageHeaderPressTarget: {
+    alignSelf: 'stretch',
+    minWidth: 0,
+  },
   detailAvatar: {
     alignItems: 'center',
     borderRadius: 19,
@@ -2129,6 +2598,7 @@ const styles = StyleSheet.create({
   messageSenderBlock: {
     flex: 1,
     marginLeft: 10,
+    minWidth: 0,
   },
   messageSenderTopRow: {
     alignItems: 'flex-start',
@@ -2144,9 +2614,11 @@ const styles = StyleSheet.create({
     minWidth: 78,
   },
   messageSenderBottomRow: {
-    alignItems: 'center',
+    alignItems: 'flex-start',
     flexDirection: 'row',
+    gap: 0,
     justifyContent: 'space-between',
+    minWidth: 0,
   },
   messageSender: {
     flex: 1,
@@ -2156,15 +2628,23 @@ const styles = StyleSheet.create({
     lineHeight: 19,
   },
   messageRecipientRow: {
+    flex: 1,
+    minWidth: 0,
+  },
+  messageRecipientChevronButton: {
     alignItems: 'center',
-    flexDirection: 'row',
-    gap: 5,
+    height: 18,
+    justifyContent: 'center',
+    marginLeft: 5,
+    width: 18,
   },
   messageRecipient: {
+    alignSelf: 'stretch',
     fontFamily: systemFont,
     fontSize: 14,
     fontWeight: '400',
     lineHeight: 18,
+    minWidth: 0,
   },
   messageDetailDate: {
     fontFamily: systemFont,
@@ -2173,15 +2653,53 @@ const styles = StyleSheet.create({
     lineHeight: 19,
     textAlign: 'right',
   },
+  sentInfoDetails: {
+    gap: 2,
+  },
+  sentInfoRow: {
+    alignItems: 'flex-start',
+    flexDirection: 'row',
+    gap: 4,
+    minWidth: 0,
+  },
+  sentInfoLabel: {
+    flexShrink: 0,
+    fontFamily: systemFont,
+    fontSize: 14,
+    fontWeight: '400',
+    lineHeight: 18,
+  },
+  sentInfoValueBlock: {
+    flex: 1,
+    minWidth: 0,
+  },
   messageMenuHost: {
-    height: 30,
-    width: 34,
+    flexShrink: 0,
+    height: 18,
+    marginLeft: 10,
+    position: 'relative',
+    width: 16,
   },
   messageEllipsisButton: {
     alignItems: 'center',
-    height: 30,
+    bottom: 0,
+    height: 18,
     justifyContent: 'center',
-    width: 34,
+    position: 'absolute',
+    right: -2,
+    top: 0,
+    width: 18,
+  },
+  messageMenuOverlay: {
+    height: 30,
+    position: 'absolute',
+    right: -2,
+    top: -6,
+    width: 40,
+  },
+  messageMenuHitTarget: {
+    height: 30,
+    width: 40,
   },
   messageBodyText: {
     fontFamily: systemFont,

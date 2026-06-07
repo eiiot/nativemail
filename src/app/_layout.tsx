@@ -1,9 +1,30 @@
 import { hydrateMailboxSnapshotFromCache } from '@/lib/mail-store';
-import { getNotificationMessageRoute } from '@/lib/inbox-notifications';
+import {
+  handleInboxNotificationPayload,
+  registerInboxNotificationBackgroundTask,
+} from '@/lib/notification-background-task';
+import {
+  archiveInboxNotificationResponse,
+  getNotificationMessageRoute,
+  isArchiveInboxNotificationResponse,
+  registerInboxNotificationCategories,
+  syncInboxUnreadBadgeCount,
+  syncPresentedInboxNotifications,
+} from '@/lib/inbox-notifications';
 import * as Notifications from 'expo-notifications';
-import { Stack, ThemeProvider, DarkTheme, DefaultTheme, router } from 'expo-router';
-import { useEffect } from 'react';
-import { Text, TextInput, useColorScheme, type TextInputProps, type TextProps } from 'react-native';
+import { Stack, ThemeProvider, DarkTheme, DefaultTheme, router, usePathname } from 'expo-router';
+import { useCallback, useEffect, useRef } from 'react';
+import {
+  AppState,
+  Text,
+  TextInput,
+  View,
+  useColorScheme,
+  type AppStateStatus,
+  type GestureResponderEvent,
+  type TextInputProps,
+  type TextProps,
+} from 'react-native';
 import { KeyboardProvider } from 'react-native-keyboard-controller';
 
 type TextWithDefaults = typeof Text & { defaultProps?: Partial<TextProps> };
@@ -25,7 +46,7 @@ DefaultTextInput.defaultProps = {
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldPlaySound: false,
-    shouldSetBadge: false,
+    shouldSetBadge: true,
     shouldShowBanner: true,
     shouldShowList: true,
   }),
@@ -37,16 +58,83 @@ export const unstable_settings = {
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
+  const pathname = usePathname();
+  const settingsGestureGuardRef = useRef(false);
+
+  const openSettingsSheet = useCallback(() => {
+    if (pathname === '/settings' || settingsGestureGuardRef.current) {
+      return;
+    }
+
+    settingsGestureGuardRef.current = true;
+    router.push('/settings');
+    setTimeout(() => {
+      settingsGestureGuardRef.current = false;
+    }, 800);
+  }, [pathname]);
+
+  const handleGlobalStartShouldSetResponderCapture = useCallback(
+    (event: GestureResponderEvent) => {
+      if (event.nativeEvent.touches.length >= 3) {
+        openSettingsSheet();
+      }
+
+      return false;
+    },
+    [openSettingsSheet],
+  );
 
   useEffect(() => {
     void hydrateMailboxSnapshotFromCache().catch(() => {});
   }, []);
   useEffect(() => {
+    void registerInboxNotificationBackgroundTask().catch(() => {});
+  }, []);
+  useEffect(() => {
+    void registerInboxNotificationCategories().catch(() => {});
+  }, []);
+  useEffect(() => {
+    const subscription = Notifications.addNotificationReceivedListener((notification) => {
+      void handleInboxNotificationPayload(notification.request.content.data ?? null).catch(() => {});
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    const syncNotificationState = (signal?: AbortSignal) => {
+      void syncInboxUnreadBadgeCount(signal).catch(() => {});
+      void syncPresentedInboxNotifications(signal).catch(() => {});
+    };
+    const handleAppStateChange = (nextState: AppStateStatus) => {
+      if (nextState === 'active') {
+        syncNotificationState();
+      }
+    };
+
+    syncNotificationState(controller.signal);
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+
+    return () => {
+      controller.abort();
+      subscription.remove();
+    };
+  }, []);
+  useEffect(() => {
     const openNotificationMessage = (response: Notifications.NotificationResponse | null) => {
+      if (response && isArchiveInboxNotificationResponse(response)) {
+        Notifications.clearLastNotificationResponse();
+        void archiveInboxNotificationResponse(response).catch(() => {});
+        return;
+      }
+
       const data = response?.notification.request.content.data;
       const route = data ? getNotificationMessageRoute(data) : null;
 
       if (route) {
+        Notifications.clearLastNotificationResponse();
         router.push(route);
       }
     };
@@ -64,23 +152,35 @@ export default function RootLayout() {
   return (
     <KeyboardProvider>
       <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-        <Stack screenOptions={{ gestureEnabled: true, headerShown: false }}>
-          <Stack.Screen name="folders" options={{ animation: 'slide_from_left' }} />
-          <Stack.Screen name="index" />
-          <Stack.Screen name="message/[id]" />
-          <Stack.Screen name="settings" />
-          <Stack.Screen
-            name="compose"
-            options={{
-              presentation: 'formSheet',
-              sheetAllowedDetents: [1],
-              sheetCornerRadius: 34,
-              sheetExpandsWhenScrolledToEdge: false,
-              sheetGrabberVisible: true,
-              sheetInitialDetentIndex: 0,
-            }}
-          />
-        </Stack>
+        <View onStartShouldSetResponderCapture={handleGlobalStartShouldSetResponderCapture} style={{ flex: 1 }}>
+          <Stack screenOptions={{ gestureEnabled: true, headerShown: false }}>
+            <Stack.Screen name="folders" options={{ animation: 'slide_from_left' }} />
+            <Stack.Screen name="index" />
+            <Stack.Screen name="message/[id]" />
+            <Stack.Screen
+              name="settings"
+              options={{
+                presentation: 'formSheet',
+                sheetAllowedDetents: [0.88, 1],
+                sheetCornerRadius: 34,
+                sheetExpandsWhenScrolledToEdge: false,
+                sheetGrabberVisible: true,
+                sheetInitialDetentIndex: 0,
+              }}
+            />
+            <Stack.Screen
+              name="compose"
+              options={{
+                presentation: 'formSheet',
+                sheetAllowedDetents: [1],
+                sheetCornerRadius: 34,
+                sheetExpandsWhenScrolledToEdge: false,
+                sheetGrabberVisible: true,
+                sheetInitialDetentIndex: 0,
+              }}
+            />
+          </Stack>
+        </View>
       </ThemeProvider>
     </KeyboardProvider>
   );

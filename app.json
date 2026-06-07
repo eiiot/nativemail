@@ -46,9 +46,22 @@
         }
       ],
       "expo-sqlite",
-      "expo-notifications"
+      [
+        "expo-notifications",
+        {
+          "enableBackgroundRemoteNotifications": true
+        }
+      ]
     ],
     "owner": "elioth",
+    "updates": {
+      "url": "https://u.expo.dev/41b01e33-b640-4793-a841-7df5a63cf05d",
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 0
+    },
+    "runtimeVersion": {
+      "policy": "fingerprint"
+    },
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true,

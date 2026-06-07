@@ -4,7 +4,7 @@ import type { JmapMailbox, JmapMailboxSnapshot, JmapMessageBody, JmapThread } fr
 import type { Message, MessageAttachment } from '@/lib/mock-mail';
 
 const DATABASE_NAME = 'nativemail-cache.db';
-const CACHE_SCHEMA_VERSION = 2;
+const CACHE_SCHEMA_VERSION = 4;
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS mailboxes (
     account_id TEXT NOT NULL,
@@ -27,9 +27,13 @@ const SCHEMA_SQL = `
     preview TEXT NOT NULL,
     date TEXT NOT NULL,
     avatar TEXT,
+    avatar_url TEXT,
     avatar_color TEXT NOT NULL,
     from_email TEXT,
     to_addresses TEXT,
+    to_addresses_json TEXT NOT NULL DEFAULT '[]',
+    cc_addresses_json TEXT NOT NULL DEFAULT '[]',
+    bcc_addresses_json TEXT NOT NULL DEFAULT '[]',
     has_attachment INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
     unread INTEGER NOT NULL DEFAULT 0,
@@ -107,9 +111,13 @@ type EmailRow = {
   preview: string;
   date: string;
   avatar: string | null;
+  avatar_url: string | null;
   avatar_color: string;
   from_email: string | null;
   to_addresses: string | null;
+  to_addresses_json: string | null;
+  cc_addresses_json: string | null;
+  bcc_addresses_json: string | null;
   has_attachment: number;
   pinned: number;
   unread: number;
@@ -126,6 +134,33 @@ type ThreadRow = {
   account_id: string;
   id: string;
   email_ids_json: string;
+};
+
+export type CachedInboxNotificationMessageInput = {
+  accountId: string;
+  date?: string | null;
+  fromEmail?: string | null;
+  inboxUnreadEmails?: number | null;
+  mailboxId: string;
+  mailboxName?: string | null;
+  messageId: string;
+  preview?: string | null;
+  sender?: string | null;
+  subject?: string | null;
+  threadId?: string | null;
+};
+
+export type CachedInboxStateMessageInput = CachedInboxNotificationMessageInput & {
+  keywords?: Record<string, unknown> | null;
+  mailboxIds?: Record<string, unknown> | null;
+};
+
+export type CachedInboxStateSnapshotInput = {
+  accountId: string;
+  inboxUnreadEmails?: number | null;
+  mailboxId: string;
+  mailboxName?: string | null;
+  messages: CachedInboxStateMessageInput[];
 };
 
 export async function readCachedMailboxSnapshot({
@@ -191,6 +226,138 @@ export async function writeCachedMailboxPage(snapshot: JmapMailboxSnapshot) {
     await writeCachedMailboxMessages(txn, snapshot, now, startPosition);
     await writeCachedThreads(txn, snapshot, now);
     await writeCachedSnapshotState(txn, snapshot, now, startPosition + snapshot.messages.length);
+  });
+}
+
+export async function writeCachedInboxNotificationMessage(
+  input: CachedInboxNotificationMessageInput,
+) {
+  const db = await getMailCacheDatabase();
+  const now = Date.now();
+  const mailboxName = input.mailboxName?.trim() || 'Inbox';
+  const message = cachedInboxInputToMessage(input, mailboxName);
+
+  await db.withExclusiveTransactionAsync(async (txn) => {
+    await txn.runAsync(
+      `INSERT INTO mailboxes (
+        account_id, id, name, parent_id, role, sort_order, total_emails, unread_emails, updated_at
+      ) VALUES (?, ?, ?, NULL, 'inbox', 0, NULL, ?, ?)
+      ON CONFLICT(account_id, id) DO UPDATE SET
+        name = excluded.name,
+        role = COALESCE(mailboxes.role, excluded.role),
+        sort_order = COALESCE(mailboxes.sort_order, excluded.sort_order),
+        unread_emails = COALESCE(excluded.unread_emails, mailboxes.unread_emails),
+        updated_at = excluded.updated_at`,
+      [
+        input.accountId,
+        input.mailboxId,
+        mailboxName,
+        normalizeCount(input.inboxUnreadEmails),
+        now,
+      ],
+    );
+    await writeCachedMessage(txn, input.accountId, message, now);
+    const existingPosition = await txn.getFirstAsync<{ position: number }>(
+      `SELECT position FROM mailbox_emails
+       WHERE account_id = ?
+         AND mailbox_id = ?
+         AND email_id = ?
+       LIMIT 1`,
+      [input.accountId, input.mailboxId, input.messageId],
+    );
+
+    if (existingPosition?.position === undefined) {
+      await txn.runAsync(
+        `UPDATE mailbox_emails SET
+          position = position + 1,
+          updated_at = ?
+         WHERE account_id = ?
+           AND mailbox_id = ?`,
+        [now, input.accountId, input.mailboxId],
+      );
+    } else if (existingPosition.position > 0) {
+      await txn.runAsync(
+        `UPDATE mailbox_emails SET
+          position = position + 1,
+          updated_at = ?
+         WHERE account_id = ?
+           AND mailbox_id = ?
+           AND position < ?`,
+        [now, input.accountId, input.mailboxId, existingPosition.position],
+      );
+    }
+
+    await txn.runAsync(
+      `INSERT OR REPLACE INTO mailbox_emails (
+        account_id, mailbox_id, email_id, position, updated_at
+      ) VALUES (?, ?, ?, 0, ?)`,
+      [input.accountId, input.mailboxId, input.messageId, now],
+    );
+  });
+}
+
+export async function writeCachedInboxStateSnapshot(input: CachedInboxStateSnapshotInput) {
+  const db = await getMailCacheDatabase();
+  const now = Date.now();
+  const mailboxName = input.mailboxName?.trim() || 'Inbox';
+
+  await db.withExclusiveTransactionAsync(async (txn) => {
+    await txn.runAsync(
+      `INSERT INTO mailboxes (
+        account_id, id, name, parent_id, role, sort_order, total_emails, unread_emails, updated_at
+      ) VALUES (?, ?, ?, NULL, 'inbox', 0, NULL, ?, ?)
+      ON CONFLICT(account_id, id) DO UPDATE SET
+        name = excluded.name,
+        role = COALESCE(mailboxes.role, excluded.role),
+        sort_order = COALESCE(mailboxes.sort_order, excluded.sort_order),
+        unread_emails = COALESCE(excluded.unread_emails, mailboxes.unread_emails),
+        updated_at = excluded.updated_at`,
+      [
+        input.accountId,
+        input.mailboxId,
+        mailboxName,
+        normalizeCount(input.inboxUnreadEmails),
+        now,
+      ],
+    );
+
+    if (!input.messages.length) {
+      await txn.runAsync(
+        `DELETE FROM mailbox_emails
+         WHERE account_id = ?
+           AND mailbox_id = ?`,
+        [input.accountId, input.mailboxId],
+      );
+      return;
+    }
+
+    await txn.runAsync(
+      `DELETE FROM mailbox_emails
+       WHERE account_id = ?
+         AND mailbox_id = ?
+         AND position < ?`,
+      [input.accountId, input.mailboxId, input.messages.length],
+    );
+
+    for (const [index, inputMessage] of input.messages.entries()) {
+      const message = cachedInboxInputToMessage(
+        {
+          ...inputMessage,
+          accountId: input.accountId,
+          mailboxId: input.mailboxId,
+          mailboxName,
+        },
+        mailboxName,
+      );
+
+      await writeCachedMessage(txn, input.accountId, message, now);
+      await txn.runAsync(
+        `INSERT OR REPLACE INTO mailbox_emails (
+          account_id, mailbox_id, email_id, position, updated_at
+        ) VALUES (?, ?, ?, ?, ?)`,
+        [input.accountId, input.mailboxId, inputMessage.messageId, index, now],
+      );
+    }
   });
 }
 
@@ -409,11 +576,19 @@ export async function writeCachedEmailBody(messageId: string, body: JmapMessageB
 
 async function getMailCacheDatabase() {
   databasePromise ??= openDatabaseAsync(DATABASE_NAME).then(async (db) => {
+    await configureDatabase(db);
     await migrate(db);
     return db;
   });
 
   return databasePromise;
+}
+
+async function configureDatabase(db: SQLiteDatabase) {
+  await db.execAsync(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA busy_timeout = 1000;
+  `);
 }
 
 async function migrate(db: SQLiteDatabase) {
@@ -452,8 +627,17 @@ async function migrate(db: SQLiteDatabase) {
 
         CREATE INDEX IF NOT EXISTS thread_emails_order_idx
           ON thread_emails(account_id, thread_id, position);
-        PRAGMA user_version = ${CACHE_SCHEMA_VERSION};
       `);
+    }
+
+    if (currentVersion < 3) {
+      await ensureEmailAvatarUrlColumn(txn);
+      await txn.execAsync(`PRAGMA user_version = ${CACHE_SCHEMA_VERSION};`);
+    }
+
+    if (currentVersion < 4) {
+      await ensureEmailRecipientColumns(txn);
+      await txn.execAsync(`PRAGMA user_version = ${CACHE_SCHEMA_VERSION};`);
     }
   });
 }
@@ -464,6 +648,32 @@ async function ensureEmailThreadIdColumn(db: SQLiteDatabase) {
 
   if (!hasThreadIdColumn) {
     await db.execAsync('ALTER TABLE emails ADD COLUMN thread_id TEXT');
+  }
+}
+
+async function ensureEmailAvatarUrlColumn(db: SQLiteDatabase) {
+  const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(emails)');
+  const hasAvatarUrlColumn = columns.some((column) => column.name === 'avatar_url');
+
+  if (!hasAvatarUrlColumn) {
+    await db.execAsync('ALTER TABLE emails ADD COLUMN avatar_url TEXT');
+  }
+}
+
+async function ensureEmailRecipientColumns(db: SQLiteDatabase) {
+  const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(emails)');
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  if (!columnNames.has('to_addresses_json')) {
+    await db.execAsync("ALTER TABLE emails ADD COLUMN to_addresses_json TEXT NOT NULL DEFAULT '[]'");
+  }
+
+  if (!columnNames.has('cc_addresses_json')) {
+    await db.execAsync("ALTER TABLE emails ADD COLUMN cc_addresses_json TEXT NOT NULL DEFAULT '[]'");
+  }
+
+  if (!columnNames.has('bcc_addresses_json')) {
+    await db.execAsync("ALTER TABLE emails ADD COLUMN bcc_addresses_json TEXT NOT NULL DEFAULT '[]'");
   }
 }
 
@@ -564,19 +774,24 @@ async function writeCachedMessage(
 ) {
   await db.runAsync(
     `INSERT INTO emails (
-      account_id, id, sender, subject, preview, date, avatar, avatar_color,
-      from_email, to_addresses, has_attachment, pinned, unread, count,
+      account_id, id, sender, subject, preview, date, avatar, avatar_url, avatar_color,
+      from_email, to_addresses, to_addresses_json, cc_addresses_json, bcc_addresses_json,
+      has_attachment, pinned, unread, count,
       thread_id, keywords_json, mailbox_ids_json, attachments_json, body, html_body, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(account_id, id) DO UPDATE SET
       sender = excluded.sender,
       subject = excluded.subject,
       preview = excluded.preview,
       date = excluded.date,
       avatar = excluded.avatar,
+      avatar_url = COALESCE(excluded.avatar_url, emails.avatar_url),
       avatar_color = excluded.avatar_color,
       from_email = excluded.from_email,
       to_addresses = excluded.to_addresses,
+      to_addresses_json = excluded.to_addresses_json,
+      cc_addresses_json = excluded.cc_addresses_json,
+      bcc_addresses_json = excluded.bcc_addresses_json,
       has_attachment = excluded.has_attachment,
       pinned = excluded.pinned,
       unread = excluded.unread,
@@ -596,9 +811,13 @@ async function writeCachedMessage(
       message.preview,
       message.date,
       message.avatar ?? null,
+      message.avatarUrl ?? null,
       message.avatarColor,
       message.fromEmail ?? null,
       message.to ?? null,
+      JSON.stringify(message.toAddresses ?? parseAddressList(message.to)),
+      JSON.stringify(message.ccAddresses ?? []),
+      JSON.stringify(message.bccAddresses ?? []),
       boolToInt(Boolean(message.hasAttachment)),
       boolToInt(Boolean(message.pinned)),
       boolToInt(Boolean(message.unread)),
@@ -660,10 +879,12 @@ function rowToMailbox(row: MailboxRow): JmapMailbox {
 
 function rowToMessage(row: EmailRow): Message {
   const attachments = parseJsonArray<MessageAttachment>(row.attachments_json);
+  const toAddresses = parseJsonArray<string>(row.to_addresses_json ?? '');
 
   return {
     attachments,
     avatar: row.avatar ?? undefined,
+    avatarUrl: row.avatar_url ?? undefined,
     avatarColor: row.avatar_color,
     body: row.body ?? undefined,
     count: row.count ?? undefined,
@@ -680,8 +901,20 @@ function rowToMessage(row: EmailRow): Message {
     subject: row.subject,
     threadId: row.thread_id ?? undefined,
     to: row.to_addresses ?? undefined,
+    toAddresses: toAddresses.length ? toAddresses : parseAddressList(row.to_addresses),
+    ccAddresses: parseJsonArray<string>(row.cc_addresses_json ?? ''),
+    bccAddresses: parseJsonArray<string>(row.bcc_addresses_json ?? ''),
     unread: row.unread === 1,
   };
+}
+
+function parseAddressList(value?: string | null) {
+  return value
+    ? value
+        .split(',')
+        .map((address) => address.trim())
+        .filter(Boolean)
+    : [];
 }
 
 function parseJsonArray<T>(value: string) {
@@ -708,4 +941,126 @@ function parseJsonRecord(value: string) {
 
 function boolToInt(value: boolean) {
   return value ? 1 : 0;
+}
+
+function cachedInboxInputToMessage(
+  input: CachedInboxNotificationMessageInput | CachedInboxStateMessageInput,
+  mailboxName: string,
+): Message {
+  const sender = input.sender?.trim() || input.fromEmail?.trim() || 'New mail';
+  const fallbackMailboxIds: Record<string, true> = { [input.mailboxId]: true };
+  const keywords = isStateMessageInput(input) ? normalizeTrueRecord(input.keywords) : {};
+  const mailboxIds = isStateMessageInput(input)
+    ? normalizeTrueRecord(input.mailboxIds, fallbackMailboxIds)
+    : fallbackMailboxIds;
+  const unread = isStateMessageInput(input) ? keywords.$seen !== true : true;
+
+  return {
+    avatar: getInitials(sender),
+    avatarColor: colorForString(input.fromEmail ?? sender),
+    date: formatMessageDate(input.date ?? null),
+    fromEmail: input.fromEmail ?? undefined,
+    id: input.messageId,
+    keywords,
+    mailboxIds,
+    mailboxName,
+    pinned: keywords.$flagged === true,
+    preview: input.preview ?? '',
+    sender,
+    subject: input.subject?.trim() || '(No subject)',
+    threadId: input.threadId?.trim() || input.messageId,
+    unread,
+  };
+}
+
+function isStateMessageInput(
+  input: CachedInboxNotificationMessageInput | CachedInboxStateMessageInput,
+): input is CachedInboxStateMessageInput {
+  return 'keywords' in input || 'mailboxIds' in input;
+}
+
+function normalizeTrueRecord(
+  value: Record<string, unknown> | null | undefined,
+  fallback: Record<string, true> = {},
+) {
+  if (!value) {
+    return fallback;
+  }
+
+  const record: Record<string, true> = {};
+
+  for (const [key, enabled] of Object.entries(value)) {
+    if (enabled === true) {
+      record[key] = true;
+    }
+  }
+
+  return record;
+}
+
+function normalizeCount(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : null;
+}
+
+function formatMessageDate(value: string | null) {
+  if (!value) {
+    return '';
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+
+  const today = new Date();
+
+  if (date.toDateString() === today.toDateString()) {
+    return date.toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  }
+
+  return date.toLocaleDateString([], {
+    day: 'numeric',
+    month: 'numeric',
+    year: date.getFullYear() === today.getFullYear() ? undefined : '2-digit',
+  });
+}
+
+function getInitials(value: string) {
+  const parts = value
+    .replace(/@.*$/, '')
+    .split(/[\s._-]+/)
+    .filter(Boolean);
+
+  if (parts.length === 0) {
+    return '?';
+  }
+
+  return parts
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join('');
+}
+
+function colorForString(value: string) {
+  const palette = [
+    '#2E7BEF',
+    '#0F6B59',
+    '#8D54E8',
+    '#D16B24',
+    '#C3437A',
+    '#287C89',
+  ];
+  let hash = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) | 0;
+  }
+
+  return palette[Math.abs(hash) % palette.length] ?? palette[0];
 }

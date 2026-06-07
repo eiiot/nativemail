@@ -1,4 +1,8 @@
 import { describeJmapError, fetchJmapMailboxes, type JmapMailbox } from '@/lib/jmap-client';
+import {
+  getInboxUnreadCountFromMailboxes,
+  setInboxUnreadBadgeCount,
+} from '@/lib/inbox-notifications';
 import { markNavigationTrace, startNavigationTrace } from '@/lib/navigation-debug';
 import * as Haptics from 'expo-haptics';
 import { Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router';
@@ -174,6 +178,7 @@ export default function FoldersScreen() {
     fetchJmapMailboxes(controller.signal)
       .then((mailboxes) => {
         setLiveSections(getFolderSections(mailboxes));
+        void setInboxUnreadBadgeCount(getInboxUnreadCountFromMailboxes(mailboxes)).catch(() => {});
       })
       .catch((error: unknown) => {
         if (controller.signal.aborted) {
@@ -512,7 +517,7 @@ function mapMailboxToRow(mailbox: JmapMailbox, systemKey: SystemMailboxKey | nul
 
   return {
     color: systemConfig?.color ?? '#707070',
-    count: formatMailboxCount(mailbox.unreadEmails || mailbox.totalEmails),
+    count: formatMailboxCount(mailbox.unreadEmails),
     icon: systemConfig?.icon ?? 'folder',
     id: mailbox.id,
     label: systemConfig?.label ?? mailbox.name,

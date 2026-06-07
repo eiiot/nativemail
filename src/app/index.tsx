@@ -1,5 +1,15 @@
 import { ProgressiveBlurView } from '@/components/progressive-blur-view';
-import { GradientAvatar, avatarGradient } from '@/components/gradient-avatar';
+import { ProfileAvatar } from '@/components/profile-avatar';
+import { avatarGradient } from '@/components/gradient-avatar';
+import {
+  cacheAvatarFiles,
+  getCachedAvatarFileUri,
+  getMessageAvatarSourceUrl,
+} from '@/lib/avatar-cache';
+import {
+  getContactAvatarUrisForEmails,
+  normalizeContactEmail,
+} from '@/lib/contact-cache';
 import {
   hasCachedEmailBody,
   removeCachedEmailFromMailbox,
@@ -10,7 +20,10 @@ import {
 import {
   hydrateMailboxSnapshotFromCache,
   hydrateMessageBodyFromCache,
+  getLocalMailActionRefreshSuppressionRemainingMs,
+  isLocalMailActionRefreshSuppressed,
   prefetchMessageBodies,
+  recordLocalMailAction,
   selectMailboxSnapshot,
   useMailStore,
 } from '@/lib/mail-store';
@@ -32,6 +45,15 @@ import {
   useNavigationDebugTrace,
   type NavigationDebugTrace,
 } from '@/lib/navigation-debug';
+import {
+  adjustInboxUnreadBadgeCount,
+  dismissInboxNotificationForMessage,
+  getInboxUnreadCountFromMailboxes,
+  recordInboxNotificationLocalAction,
+  setInboxUnreadBadgeCount,
+  syncPresentedInboxNotifications,
+} from '@/lib/inbox-notifications';
+import { getFastmailDomainAvatarUrl } from '@/lib/avatar-photos';
 import type { Message } from '@/lib/mock-mail';
 import {
   GlassEffectContainer,
@@ -57,9 +79,11 @@ import {
 import {
   Animation,
   animation,
+  aspectRatio,
   autocorrectionDisabled,
   background,
   blur as swiftBlur,
+  clipShape,
   cornerRadius,
   font,
   foregroundColor,
@@ -79,6 +103,7 @@ import {
   opacity as swiftOpacity,
   padding,
   refreshable,
+  resizable,
   scrollContentBackground,
   shapes,
   submitLabel,
@@ -124,7 +149,7 @@ const inboxMailboxPageSize = 50;
 const inboxLoadMoreThreshold = 420;
 const inboxBottomLoadRearmOffsetDelta = 240;
 const inboxBodyWarmDelayMs = 650;
-const inboxBodyWarmBatchSize = 3;
+const inboxBodyWarmBatchSize = 1;
 const inboxBodyWarmBatchGapMs = 450;
 const inboxCacheWriteDelayMs = 700;
 const inboxDebugDiskBatchSize = 8;
@@ -140,6 +165,10 @@ const pressHaptic = () => {
 };
 type InboxSwipeAction = 'archive' | 'delete' | 'toggle-pin' | 'toggle-unread' | 'unarchive';
 type BodyCacheDebugState = 'checking' | 'disk' | 'memory' | 'missing';
+
+function isPresent<T>(value: T | null | undefined): value is T {
+  return value !== null && value !== undefined;
+}
 
 function interpolate(value: number, inputMin: number, inputMax: number, outputMin: number, outputMax: number) {
   const progress = Math.max(0, Math.min(1, (value - inputMin) / (inputMax - inputMin)));
@@ -198,8 +227,12 @@ export default function InboxScreen() {
   const [scrollY, setScrollY] = useState(0);
   const [listScrollPhase, setListScrollPhase] = useState<ScrollPhase>('idle');
   const [searchQuery, setSearchQuery] = useState('');
+  const [avatarFileUriBySourceUrl, setAvatarFileUriBySourceUrl] = useState<Record<string, string>>({});
+  const [contactAvatarUriByEmail, setContactAvatarUriByEmail] = useState<Record<string, string>>({});
   const [bodyDiskStateById, setBodyDiskStateById] = useState<Record<string, boolean | undefined>>({});
   const [rowRenderLimit, setRowRenderLimit] = useState(initialInboxRowRenderLimit);
+  const [screenFocused, setScreenFocused] = useState(false);
+  const [backgroundBodyWarmPaused, setBackgroundBodyWarmPaused] = useState(false);
   const activeMailboxName = liveMailboxName ?? mailboxName ?? 'Inbox';
   const sourceMessages = liveMessages ?? [];
   const visibleMessages = getSearchFilteredMessages(sourceMessages, searchQuery);
@@ -208,6 +241,9 @@ export default function InboxScreen() {
   const bodyDebugKey = bodyDebugMessageIds.join('\n');
   const bodyWarmMessageIds = renderedMessages.map((message) => message.id);
   const bodyWarmKey = bodyWarmMessageIds.join('\n');
+  const avatarSourceKey = getAvatarSourceKey(renderedMessages);
+  const contactEmailKey = getContactEmailKey(renderedMessages);
+  const isInboxView = isInboxMailbox(liveMailboxRole, activeMailboxName);
   const bodyCacheDebugStates = useMemo(
     () => getBodyCacheDebugStates({
       bodyDiskStateById,
@@ -226,7 +262,14 @@ export default function InboxScreen() {
   }, []);
   useFocusEffect(
     useCallback(() => {
+      setScreenFocused(true);
+      setBackgroundBodyWarmPaused(false);
       clearPendingMessageNavigation();
+
+      return () => {
+        setScreenFocused(false);
+        setBackgroundBodyWarmPaused(true);
+      };
     }, [clearPendingMessageNavigation]),
   );
   useEffect(() => clearPendingMessageNavigation, [clearPendingMessageNavigation]);
@@ -234,6 +277,7 @@ export default function InboxScreen() {
   const messageRouteSource = liveMessages ? 'jmap' : 'mock';
   const navTitleVisible = scrollY >= titleRevealStart;
   const listIsScrolling = listScrollPhase !== 'idle';
+  const inboxBackgroundWorkActive = screenFocused && !backgroundBodyWarmPaused && !listIsScrolling;
   const scrollGeometryModifier = useScrollGeometryChange(
     useCallback((geometry) => {
       if (initialScrollOffsetYRef.current === null) {
@@ -305,6 +349,13 @@ export default function InboxScreen() {
         }
 
         pendingDestructiveSwipeMessageIdsRef.current.add(item.id);
+        recordOptimisticMailAction(item.id);
+        if (action === 'archive' || action === 'delete') {
+          void dismissInboxNotificationForMessage(item.id).catch(() => {});
+          if (item.unread && isInboxView) {
+            void adjustInboxUnreadBadgeCount(-1).catch(() => {});
+          }
+        }
 
         let removedFromStore = false;
         let removalTimer: ReturnType<typeof setTimeout> | null = null;
@@ -343,6 +394,9 @@ export default function InboxScreen() {
             if (removedFromStore) {
               restoreMessages();
             }
+            if (item.unread && isInboxView && (action === 'archive' || action === 'delete')) {
+              void adjustInboxUnreadBadgeCount(1).catch(() => {});
+            }
           })
           .finally(() => {
             pendingDestructiveSwipeMessageIdsRef.current.delete(item.id);
@@ -352,55 +406,61 @@ export default function InboxScreen() {
 
       if (action === 'toggle-pin') {
         const nextPinned = !item.pinned;
+        const previousPatch = {
+          keywords: item.keywords,
+          pinned: item.pinned,
+          unread: item.unread,
+        };
         const optimisticPatch = {
           keywords: updateMessageKeyword(item.keywords, '$flagged', nextPinned),
           pinned: nextPinned,
         };
 
+        recordOptimisticMailAction(item.id);
         patchStoreMessage(item.id, optimisticPatch);
+        void updateCachedEmail(item.id, optimisticPatch).catch(() => {});
 
         setJmapEmailPinned(item.id, nextPinned)
-          .then((result) => {
-            const resultPatch = {
-              keywords: result.keywords,
-              pinned: result.pinned,
-              unread: result.unread,
-            };
-
-            patchStoreMessage(item.id, resultPatch);
-            void updateCachedEmail(item.id, resultPatch).catch(() => {});
-          })
           .catch(() => {
             restoreMessages();
+            void updateCachedEmail(item.id, previousPatch).catch(() => {});
           });
         return;
       }
 
       const nextUnread = !item.unread;
+      const previousPatch = {
+        keywords: item.keywords,
+        pinned: item.pinned,
+        unread: item.unread,
+      };
       const optimisticPatch = {
         keywords: updateMessageKeyword(item.keywords, '$seen', !nextUnread),
         unread: nextUnread,
       };
 
+      recordOptimisticMailAction(item.id);
       patchStoreMessage(item.id, optimisticPatch);
+      void updateCachedEmail(item.id, optimisticPatch).catch(() => {});
+      if (isInboxView) {
+        void adjustInboxUnreadBadgeCount(nextUnread ? 1 : -1).catch(() => {});
+      }
+      if (!nextUnread) {
+        void dismissInboxNotificationForMessage(item.id).catch(() => {});
+      }
 
       setJmapEmailUnread(item.id, nextUnread)
-        .then((result) => {
-          const resultPatch = {
-            keywords: result.keywords,
-            pinned: result.pinned,
-            unread: result.unread,
-          };
-
-          patchStoreMessage(item.id, resultPatch);
-          void updateCachedEmail(item.id, resultPatch).catch(() => {});
-        })
         .catch(() => {
           restoreMessages();
+          void updateCachedEmail(item.id, previousPatch).catch(() => {});
+          if (isInboxView) {
+            void adjustInboxUnreadBadgeCount(nextUnread ? -1 : 1).catch(() => {});
+          }
         });
     },
     [
       applyMailboxSnapshot,
+      isInboxView,
       liveMailboxId,
       liveMessages,
       mailboxId,
@@ -437,6 +497,17 @@ export default function InboxScreen() {
         `${tracePrefix} finished`,
         `position=${snapshot.position ?? position} rows=${snapshot.messages.length} threads=${Object.keys(snapshot.threads ?? {}).length} total=${snapshot.total ?? 'unknown'}`,
       );
+      void setInboxUnreadBadgeCount(getInboxUnreadCountFromMailboxes(snapshot.mailboxes)).catch(() => {});
+      void syncPresentedInboxNotifications(signal)
+        .then((result) => {
+          if (result.dismissed > 0) {
+            markNavigationTrace(
+              'inbox stale notifications dismissed',
+              `dismissed=${result.dismissed} stale=${result.staleMessageIds.length}`,
+            );
+          }
+        })
+        .catch(() => {});
       updateHasMoreMessages(getSnapshotHasMoreMessages(snapshot, limit));
 
       if (apply) {
@@ -571,7 +642,7 @@ export default function InboxScreen() {
     updateHasMoreMessages(getSnapshotHasMoreMessages(snapshot, Math.max(inboxMailboxPageSize, snapshot.messages.length)));
   }, [snapshot, updateHasMoreMessages]);
   useEffect(() => {
-    if (!debugMode || !bodyDebugKey || listIsScrolling) {
+    if (!debugMode || !bodyDebugKey || !inboxBackgroundWorkActive) {
       return;
     }
 
@@ -612,7 +683,93 @@ export default function InboxScreen() {
         clearTimeout(nextBatchTimer);
       }
     };
-  }, [bodyDebugKey, debugMode, listIsScrolling]);
+  }, [bodyDebugKey, debugMode, inboxBackgroundWorkActive]);
+  useEffect(() => {
+    if (!avatarSourceKey || !inboxBackgroundWorkActive) {
+      return;
+    }
+
+    let cancelled = false;
+    const sourceUrls = avatarSourceKey.split('\n').filter(Boolean);
+
+    const avatarCacheTask = InteractionManager.runAfterInteractions(() => {
+      setAvatarFileUriBySourceUrl((current) => {
+        let next = current;
+
+        for (const sourceUrl of sourceUrls) {
+          const cachedUri = getCachedAvatarFileUri(sourceUrl);
+
+          if (cachedUri && current[sourceUrl] !== cachedUri) {
+            next = next === current ? { ...current } : next;
+            next[sourceUrl] = cachedUri;
+          }
+        }
+
+        return next;
+      });
+
+      void cacheAvatarFiles(sourceUrls, (sourceUrl, fileUri) => {
+        if (cancelled) {
+          return;
+        }
+
+        setAvatarFileUriBySourceUrl((current) =>
+          current[sourceUrl] === fileUri ? current : { ...current, [sourceUrl]: fileUri },
+        );
+      }).catch((error: unknown) => {
+        markNavigationTrace(
+          'avatar cache failed',
+          error instanceof Error ? error.message : String(error),
+        );
+      });
+    });
+
+    return () => {
+      cancelled = true;
+      avatarCacheTask.cancel();
+    };
+  }, [avatarSourceKey, inboxBackgroundWorkActive]);
+  useEffect(() => {
+    if (!contactEmailKey || !inboxBackgroundWorkActive) {
+      return;
+    }
+
+    let cancelled = false;
+    const emails = contactEmailKey.split('\n').filter(Boolean);
+
+    const contactLookupTask = InteractionManager.runAfterInteractions(() => {
+      void getContactAvatarUrisForEmails(emails)
+        .then((result) => {
+          if (cancelled) {
+            return;
+          }
+
+          setContactAvatarUriByEmail((current) => ({
+            ...current,
+            ...result.avatarUriByEmail,
+          }));
+          if (debugMode && (result.fetched || result.fromCache)) {
+            markNavigationTrace(
+              'contact avatars resolved',
+              `cache=${result.fromCache} fetched=${result.fetched} missed=${result.missed}`,
+            );
+          }
+        })
+        .catch((error: unknown) => {
+          if (debugMode) {
+            markNavigationTrace(
+              'contact avatar lookup failed',
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+        });
+    });
+
+    return () => {
+      cancelled = true;
+      contactLookupTask.cancel();
+    };
+  }, [contactEmailKey, debugMode, inboxBackgroundWorkActive]);
   useEffect(() => {
     markNavigationTrace(
       'inbox committed',
@@ -634,7 +791,7 @@ export default function InboxScreen() {
     };
   }, [mailboxId]);
   useEffect(() => {
-    if (!liveMessages || !bodyWarmKey || listIsScrolling) {
+    if (!liveMessages || !bodyWarmKey || !inboxBackgroundWorkActive) {
       return;
     }
 
@@ -710,7 +867,7 @@ export default function InboxScreen() {
         clearTimeout(nextBatchTimer);
       }
     };
-  }, [bodyWarmKey, debugMode, listIsScrolling, liveMessages]);
+  }, [bodyWarmKey, debugMode, inboxBackgroundWorkActive, liveMessages]);
   useFocusEffect(
     useCallback(() => {
       const controller = new AbortController();
@@ -742,6 +899,14 @@ export default function InboxScreen() {
             });
         }
 
+        if (isLocalMailActionRefreshSuppressed()) {
+          markNavigationTrace(
+            'inbox JMAP fetch skipped',
+            `local action suppression ${Math.ceil(getLocalMailActionRefreshSuppressionRemainingMs())}ms`,
+          );
+          return;
+        }
+
         void refreshMailboxFromServer({
           limit: Math.max(inboxMailboxPageSize, memorySnapshot?.messages.length ?? 0),
           signal: controller.signal,
@@ -763,7 +928,7 @@ export default function InboxScreen() {
         refreshTask.cancel();
         controller.abort();
       };
-    }, [mailboxId, refreshMailboxFromServer]),
+  }, [mailboxId, refreshMailboxFromServer]),
   );
   const headerBackdropHeight = insets.top + 70;
   const headerOpacity = interpolate(scrollY, 0, titleRevealEnd, 0, 1);
@@ -786,7 +951,10 @@ export default function InboxScreen() {
       clearPendingMessageNavigation();
     }, messageNavigationGuardMs);
 
-    const messageHref = getMessageRouteHref(item, activeMailboxName, messageRouteSource);
+    const messageHref = getMessageRouteHref(item, activeMailboxName, messageRouteSource, liveMailboxId);
+
+    setBackgroundBodyWarmPaused(true);
+    markNavigationTrace('body warm paused for message navigation', `message=${item.id}`);
 
     if (liveMessages) {
       void hydrateMessageBodyFromCache(item.id).catch(() => {});
@@ -892,6 +1060,7 @@ export default function InboxScreen() {
               ...(scrollGeometryModifier ? [scrollGeometryModifier] : []),
             ]}>
             <HStack
+              key="mailbox-header"
               modifiers={[
               listRowInsets({ top: 0, leading: 0, bottom: 0, trailing: 0 }),
               listRowBackground(colors.background),
@@ -914,21 +1083,34 @@ export default function InboxScreen() {
                 />
               </RNHostView>
             </HStack>
-            {renderedMessages.map((item) => {
-              return (
-                <MessageRow
-                  bodyCacheDebugState={debugMode ? bodyCacheDebugStates[item.id] : undefined}
-                  colors={colors}
-                  item={item}
-                  key={item.id}
-                  mailboxName={activeMailboxName}
-                  mailboxRole={liveMailboxRole}
-                  onSwipeAction={(action) => handleMessageSwipeAction(item, action)}
-                  onPress={() => openMessage(item)}
-                />
-              );
-            })}
+            <List.ForEach key="mailbox-messages">
+              {renderedMessages.map((item) => {
+                const avatarSourceUrl = getMessageAvatarSourceUrl(item);
+                const contactAvatarUri = getContactAvatarUriForMessage(item, contactAvatarUriByEmail);
+                const displayItem = contactAvatarUri
+                  ? { ...item, avatarUrl: contactAvatarUri }
+                  : item;
+
+                return (
+                  <MessageRow
+                    avatarFileUri={
+                      contactAvatarUri ??
+                      (avatarSourceUrl ? avatarFileUriBySourceUrl[avatarSourceUrl] : undefined)
+                    }
+                    bodyCacheDebugState={debugMode ? bodyCacheDebugStates[item.id] : undefined}
+                    colors={colors}
+                    item={displayItem}
+                    key={item.id}
+                    mailboxName={activeMailboxName}
+                    mailboxRole={liveMailboxRole}
+                    onSwipeAction={(action) => handleMessageSwipeAction(item, action)}
+                    onPress={() => openMessage(displayItem)}
+                  />
+                );
+              })}
+            </List.ForEach>
             <HStack
+              key="mailbox-footer"
               modifiers={[
               listRowInsets({ top: 0, leading: 0, bottom: 0, trailing: 0 }),
               listRowBackground(colors.background),
@@ -953,15 +1135,29 @@ export default function InboxScreen() {
   );
 }
 
-function getMessageRouteParams(item: Message, mailboxName: string, source: 'jmap' | 'mock') {
+function recordOptimisticMailAction(messageId: string) {
+  recordLocalMailAction();
+  void recordInboxNotificationLocalAction(messageId).catch(() => {});
+}
+
+function getMessageRouteParams(
+  item: Message,
+  mailboxName: string,
+  source: 'jmap' | 'mock',
+  mailboxId?: string | null,
+) {
+  const avatarUrl = getDisplayAvatarUrl(item);
+
   return {
     avatar: item.avatar ?? '',
     avatarColor: item.avatarColor,
+    avatarUrl: avatarUrl ?? '',
     count: item.count ? String(item.count) : '',
     date: item.date,
     fromEmail: item.fromEmail ?? '',
     hasAttachment: item.hasAttachment ? '1' : '0',
     id: item.id,
+    mailboxId: mailboxId ?? '',
     keywords: JSON.stringify(item.keywords ?? {}),
     mailboxIds: JSON.stringify(item.mailboxIds ?? {}),
     mailboxName: item.mailboxName ?? mailboxName,
@@ -972,15 +1168,23 @@ function getMessageRouteParams(item: Message, mailboxName: string, source: 'jmap
     subject: item.subject,
     threadId: item.threadId ?? '',
     to: item.to ?? '',
+    toAddresses: JSON.stringify(item.toAddresses ?? []),
+    ccAddresses: JSON.stringify(item.ccAddresses ?? []),
+    bccAddresses: JSON.stringify(item.bccAddresses ?? []),
     wasUnreadOnOpen: item.unread ? '1' : '0',
     unread: item.unread ? '1' : '0',
   };
 }
 
-function getMessageRouteHref(item: Message, mailboxName: string, source: 'jmap' | 'mock') {
+function getMessageRouteHref(
+  item: Message,
+  mailboxName: string,
+  source: 'jmap' | 'mock',
+  mailboxId?: string | null,
+) {
   return {
     pathname: '/message/[id]' as const,
-    params: getMessageRouteParams(item, mailboxName, source),
+    params: getMessageRouteParams(item, mailboxName, source, mailboxId),
   };
 }
 
@@ -1043,6 +1247,29 @@ function getSearchFilteredMessages(messages: Message[], searchQuery: string) {
     message.subject.toLowerCase().includes(query) ||
     message.preview.toLowerCase().includes(query)
   );
+}
+
+function getAvatarSourceKey(messages: Message[]) {
+  return Array.from(new Set(messages.map(getMessageAvatarSourceUrl).filter(isPresent))).join('\n');
+}
+
+function getContactEmailKey(messages: Message[]) {
+  return Array.from(
+    new Set(messages.map((message) => normalizeContactEmail(message.fromEmail)).filter(isPresent)),
+  ).join('\n');
+}
+
+function getContactAvatarUriForMessage(
+  message: Message,
+  contactAvatarUriByEmail: Record<string, string>,
+) {
+  const email = normalizeContactEmail(message.fromEmail);
+
+  return email ? contactAvatarUriByEmail[email] : undefined;
+}
+
+function isInboxMailbox(role: string | null | undefined, name: string) {
+  return role?.toLowerCase() === 'inbox' || name.trim().toLowerCase() === 'inbox';
 }
 
 function updateMessageKeyword(
@@ -1533,7 +1760,8 @@ function MessageDetail({
       </View>
 
       <View style={styles.messageHeaderRow}>
-        <GradientAvatar
+        <ProfileAvatar
+          avatarUrl={getDisplayAvatarUrl(message)}
           color={message.avatarColor}
           label={message.avatar}
           size={50}
@@ -1571,6 +1799,7 @@ function MessageDetail({
 }
 
 function MessageRow({
+  avatarFileUri,
   bodyCacheDebugState,
   item,
   colors,
@@ -1579,6 +1808,7 @@ function MessageRow({
   onSwipeAction,
   onPress,
 }: {
+  avatarFileUri?: string;
   bodyCacheDebugState?: BodyCacheDebugState;
   item: Message;
   colors: ColorSet;
@@ -1607,9 +1837,9 @@ function MessageRow({
             <Circle modifiers={[frame({ width: 8, height: 8 }), foregroundColor(tint)]} />
           ) : null}
         </ZStack>
-        <SwiftGradientAvatar
-          color={item.avatarColor}
-          label={item.avatar}
+        <InboxRowAvatar
+          avatarFileUri={avatarFileUri}
+          item={item}
           size={44}
           textSize={avatarTextSize}
         />
@@ -1757,6 +1987,66 @@ function SwiftGradientAvatar({
       </SwiftText>
     </ZStack>
   );
+}
+
+function InboxRowAvatar({
+  avatarFileUri,
+  item,
+  size,
+  textSize,
+}: {
+  avatarFileUri?: string;
+  item: Message;
+  size: number;
+  textSize?: number;
+}) {
+  return (
+    <ZStack modifiers={[frame({ width: size, height: size })]}>
+      <SwiftGradientAvatar
+        color={item.avatarColor}
+        label={item.avatar}
+        size={size}
+        textSize={textSize}
+      />
+      {avatarFileUri ? (
+        <ZStack modifiers={[frame({ width: size, height: size })]}>
+          <Circle
+            modifiers={[
+              frame({ width: size, height: size }),
+              foregroundColor('#FFFFFF'),
+            ]}
+          />
+          <SwiftImage
+            uiImage={avatarFileUri}
+            modifiers={[
+              resizable(),
+              aspectRatio({ contentMode: 'fill' }),
+              frame({ width: size, height: size }),
+              clipShape('circle'),
+            ]}
+          />
+        </ZStack>
+      ) : null}
+    </ZStack>
+  );
+}
+
+function getDisplayAvatarUrl(message: Message) {
+  const domainAvatarUrl = getFastmailDomainAvatarUrl(message.fromEmail);
+
+  if (!message.avatarUrl || isGravatarAvatarUrl(message.avatarUrl)) {
+    return domainAvatarUrl ?? message.avatarUrl;
+  }
+
+  return message.avatarUrl;
+}
+
+function isGravatarAvatarUrl(avatarUrl: string) {
+  try {
+    return new URL(avatarUrl).hostname.endsWith('gravatar.com');
+  } catch {
+    return avatarUrl.includes('gravatar.com/avatar');
+  }
 }
 
 function SwiftInboxAttachmentPreview({
