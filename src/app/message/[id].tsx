@@ -4,6 +4,7 @@ import {
   canUseNativeAttachmentThumbnail,
   openNativeAttachmentPreviewAsync,
 } from '@/components/attachment-thumbnail-view';
+import { saveComposeDraft } from '@/lib/compose-drafts';
 import {
   archiveJmapEmail,
   fetchJmapThreadMessages,
@@ -1318,18 +1319,17 @@ function getActionTargetMessage({
 }
 
 function openReplyCompose(message: Message) {
-  const params: Record<string, string> = {
+  const draftId = saveComposeDraft({
+    body: getReplyPlainTextBody(message),
+    htmlBody: getReplyHtmlBody(message),
     mode: 'reply',
     replyToMessageId: message.id,
     subject: getReplySubject(message.subject),
     to: getReplyToAddress(message),
-  };
+    threadId: message.threadId,
+  });
 
-  if (message.threadId) {
-    params.threadId = message.threadId;
-  }
-
-  router.push({ pathname: '/compose', params });
+  router.push({ pathname: '/compose', params: { draftId } });
 }
 
 function getReplySubject(subject: string) {
@@ -1351,6 +1351,102 @@ function getReplyToAddress(message: Message) {
   }
 
   return fromEmail || sender;
+}
+
+function getReplyPlainTextBody(message: Message) {
+  const quoteText = getReplyQuoteText(message);
+
+  if (!quoteText) {
+    return '\nEliot';
+  }
+
+  return [
+    '',
+    'Eliot',
+    '',
+    getReplyIntroLine(message),
+    quoteText
+      .split(/\r?\n/)
+      .map((line) => (line.trim() ? `> ${line}` : '>'))
+      .join('\n'),
+  ].join('\n');
+}
+
+function getReplyHtmlBody(message: Message) {
+  const quoteText = getReplyQuoteText(message);
+
+  if (!quoteText) {
+    return '<div><br></div><div>Eliot</div>';
+  }
+
+  const quoteHtml = quoteText
+    .split(/\r?\n/)
+    .map((line) => (line.trim() ? escapeHtml(line) : '<br>'))
+    .join('<br>');
+
+  return [
+    '<div><br></div>',
+    '<div>Eliot</div>',
+    '<br>',
+    '<blockquote type="cite" style="border-left: 2px solid #C7C7CC; margin: 0 0 0 0.8em; padding-left: 0.8em;">',
+    `<div>${escapeHtml(getReplyIntroLine(message))}</div>`,
+    `<div>${quoteHtml}</div>`,
+    '</blockquote>',
+  ].join('');
+}
+
+function getReplyQuoteText(message: Message) {
+  const text = message.body?.trim() || getTextFromHtml(message.htmlBody).trim() || message.preview.trim();
+
+  return normalizeReplyQuoteText(text);
+}
+
+function getReplyIntroLine(message: Message) {
+  return `On ${message.date}, ${message.sender} wrote:`;
+}
+
+function normalizeReplyQuoteText(text: string) {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{4,}/g, '\n\n\n')
+    .trim();
+}
+
+function getTextFromHtml(html?: string) {
+  if (!html) {
+    return '';
+  }
+
+  return decodeBasicHtmlEntities(
+    html
+      .replace(/<script\b[\s\S]*?<\/script>/gi, '')
+      .replace(/<style\b[\s\S]*?<\/style>/gi, '')
+      .replace(/<(br|\/p|\/div|\/li|\/tr)\b[^>]*>/gi, '\n')
+      .replace(/<li\b[^>]*>/gi, '\n- ')
+      .replace(/<[^>]+>/g, '')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+  );
+}
+
+function decodeBasicHtmlEntities(text: string) {
+  return text
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/gi, "'");
+}
+
+function escapeHtml(text: string) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function isMessageAction(action: string): action is MessageAction {

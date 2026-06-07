@@ -1,4 +1,5 @@
 import { GradientAvatar } from '@/components/gradient-avatar';
+import { getComposeDraft } from '@/lib/compose-drafts';
 import {
   GlassView,
   isGlassEffectAPIAvailable,
@@ -49,6 +50,7 @@ const composeMenuActions: MenuAction[] = [
 export default function ComposeScreen() {
   const params = useLocalSearchParams<{
     body?: string;
+    draftId?: string;
     mode?: string;
     subject?: string;
     to?: string;
@@ -56,9 +58,10 @@ export default function ComposeScreen() {
   const scheme = useColorScheme();
   const insets = useSafeAreaInsets();
   const colors = scheme === 'dark' ? darkColors : lightColors;
-  const initialTo = getComposeParam(params.to);
-  const initialSubject = getComposeParam(params.subject);
-  const initialBody = getComposeParam(params.body) || defaultBody;
+  const draft = getComposeDraft(getComposeParam(params.draftId));
+  const initialTo = draft?.to ?? getComposeParam(params.to);
+  const initialSubject = draft?.subject ?? getComposeParam(params.subject);
+  const initialBody = (draft?.body ?? getComposeParam(params.body)) || defaultBody;
   const startsWithRecipient = initialTo.trim().length > 0;
   const [to, setTo] = useState(initialTo);
   const [cc, setCc] = useState('');
@@ -143,8 +146,11 @@ export default function ComposeScreen() {
             inputMode="email"
             keyboardType="email-address"
             maxFontSizeMultiplier={1.12}
+            multiline={false}
+            numberOfLines={1}
             onChangeText={setTo}
             returnKeyType="next"
+            scrollEnabled
             selectionColor={tint}
             style={[styles.fieldInput, { color: colors.text }]}
             value={to}
@@ -173,8 +179,11 @@ export default function ComposeScreen() {
                 inputMode="email"
                 keyboardType="email-address"
                 maxFontSizeMultiplier={1.12}
+                multiline={false}
+                numberOfLines={1}
                 onChangeText={setCc}
                 returnKeyType="next"
+                scrollEnabled
                 selectionColor={tint}
                 style={[styles.fieldInput, { color: colors.text }]}
                 value={cc}
@@ -189,8 +198,11 @@ export default function ComposeScreen() {
                 inputMode="email"
                 keyboardType="email-address"
                 maxFontSizeMultiplier={1.12}
+                multiline={false}
+                numberOfLines={1}
                 onChangeText={setBcc}
                 returnKeyType="next"
+                scrollEnabled
                 selectionColor={tint}
                 style={[styles.fieldInput, { color: colors.text }]}
                 value={bcc}
@@ -211,8 +223,11 @@ export default function ComposeScreen() {
           <Text {...textScale} style={[styles.fieldLabel, { color: colors.text }]}>Subject:</Text>
           <TextInput
             maxFontSizeMultiplier={1.12}
+            multiline={false}
+            numberOfLines={1}
             onChangeText={setSubject}
             returnKeyType="next"
+            scrollEnabled
             selectionColor={tint}
             style={[styles.fieldInput, { color: colors.text }]}
             value={subject}
@@ -374,6 +389,7 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     flexDirection: 'row',
     minHeight: 50,
+    overflow: 'hidden',
   },
   fieldLabel: {
     fontFamily: systemFont,
@@ -387,8 +403,10 @@ const styles = StyleSheet.create({
     fontFamily: systemFont,
     fontSize: 16,
     fontWeight: '400',
+    height: 42,
     lineHeight: 21,
     minHeight: 42,
+    overflow: 'hidden',
     padding: 0,
   },
   recipientToggle: {
