@@ -146,6 +146,7 @@ export type JmapMessageBody = {
 export type JmapMessageBodyDebug = {
     attachmentPartCount: number
     bodyStructurePartCount: number
+    cidImageInlineMode?: 'inline' | 'skipped'
     cidImagePartCount: number
     cidImageParts: {
         blobIdPrefix?: string
@@ -349,10 +350,15 @@ export async function fetchJmapMessage(
     }
 }
 
-export async function fetchJmapMessageBody(
-    messageId: string,
+export async function fetchJmapMessageBody({
+    inlineCidImageData = false,
+    messageId,
+    signal,
+}: {
+    inlineCidImageData?: boolean
+    messageId: string
     signal?: AbortSignal
-): Promise<JmapMessageBody | null> {
+}): Promise<JmapMessageBody | null> {
     const { accountId, client, token } = await createFastmailJmapClient(signal)
 
     try {
@@ -366,7 +372,10 @@ export async function fetchJmapMessageBody(
         const message = messages[0]
 
         return message
-            ? await getEmailBody(client, accountId, token, message, signal)
+            ? await getEmailBody(client, accountId, token, message, {
+                  inlineCidImageData,
+                  signal,
+              })
             : null
     } finally {
         await client.disconnect()
@@ -1467,11 +1476,28 @@ async function getEmailBody(
     accountId: Id,
     token: string,
     email: EmailObject,
-    signal?: AbortSignal
+    {
+        inlineCidImageData = false,
+        signal,
+    }: {
+        inlineCidImageData?: boolean
+        signal?: AbortSignal
+    } = {}
 ): Promise<JmapMessageBody> {
     const html = getHtmlBody(email)
-    const inlinedHtml = html
+    const inlinedHtml = html && inlineCidImageData
         ? await inlineCidImages(client, accountId, token, html, email, signal)
+        : html
+          ? {
+                debug: getCidImageDebug(
+                    email,
+                    getCidReferences(html),
+                    getCidImageParts(email),
+                    html,
+                    'skipped'
+                ),
+                html,
+            }
         : null
 
     return {
@@ -1746,11 +1772,13 @@ function getCidImageDebug(
     email: EmailObject,
     cidReferences: string[],
     cidImages: Omit<EmailBodyPart, 'subParts'>[],
-    html: string
+    html: string,
+    cidImageInlineMode: 'inline' | 'skipped' = 'inline'
 ): JmapMessageBodyDebug {
     return {
         attachmentPartCount: email.attachments?.length ?? 0,
         bodyStructurePartCount: flattenBodyParts(email.bodyStructure).length,
+        cidImageInlineMode,
         cidImagePartCount: cidImages.length,
         cidImageParts: cidImages.map((part) => ({
             blobIdPrefix: part.blobId

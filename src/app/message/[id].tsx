@@ -91,7 +91,7 @@ import WebView, { type WebViewMessageEvent } from 'react-native-webview';
 
 const textScale = { maxFontSizeMultiplier: 1.12 };
 const messageDetailHorizontalPadding = 20;
-const messageBodyFetchRevision = 9;
+const messageBodyFetchRevision = 10;
 const optimisticMailboxHideTtlMs = 30000;
 const threadScrollOffset = 12;
 const systemFont = Platform.select({ ios: 'system-ui', default: undefined });
@@ -102,6 +102,7 @@ const pressHaptic = () => {
 type MessageAction = 'archive' | 'reply' | 'reply-all' | 'toggle-pin' | 'toggle-unread' | 'trash';
 type MessageStatusPatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 const copyEmailHtmlAction = 'copy-email-html';
+const dumpEmailCacheAction = 'dump-email-cache';
 const maxReadDebugEvents = 24;
 
 function isPresent<T>(value: T | null | undefined): value is T {
@@ -109,7 +110,15 @@ function isPresent<T>(value: T | null | undefined): value is T {
 }
 
 function getBodyLoadDebugSummary(
-  body: { attachments?: MessageAttachment[]; html?: string | null; text?: string | null } | null | undefined,
+  body:
+    | {
+        attachments?: MessageAttachment[];
+        debug?: Pick<JmapMessageBodyDebug, 'cidImageInlineMode'>;
+        html?: string | null;
+        text?: string | null;
+      }
+    | null
+    | undefined,
 ) {
   if (!body) {
     return 'html=0 text=0 attachments=0';
@@ -119,6 +128,7 @@ function getBodyLoadDebugSummary(
     `html=${body.html?.trim() ? body.html.length : 0}`,
     `text=${body.text?.trim() ? body.text.length : 0}`,
     `attachments=${body.attachments?.length ?? 0}`,
+    `cidInline=${body.debug?.cidImageInlineMode ?? 'none'}`,
   ].join(' ');
 }
 
@@ -353,28 +363,35 @@ export default function MessageScreen() {
       }
       void updateCachedEmail(targetMessage.id, optimisticPatch).catch(() => {});
 
-      setJmapEmailUnread(targetMessage.id, false)
-        .then((result) => {
-          appendReadDebugEvent(
-            `mark-read success id=${targetMessage.id} unread=${result.unread === true ? '1' : '0'} seen=${result.keywords?.$seen === true ? '1' : '0'}`,
-          );
-        })
-        .catch((error: unknown) => {
-          const rollbackPatch = {
-            keywords: targetMessage.keywords,
-            pinned: targetMessage.pinned,
-            unread: targetMessage.unread,
-          };
+      appendReadDebugEvent(`mark-read sync deferred id=${targetMessage.id}`);
+      setTimeout(() => {
+        const markReadTask = InteractionManager.runAfterInteractions(() => {
+          setJmapEmailUnread(targetMessage.id, false)
+            .then((result) => {
+              appendReadDebugEvent(
+                `mark-read success id=${targetMessage.id} unread=${result.unread === true ? '1' : '0'} seen=${result.keywords?.$seen === true ? '1' : '0'}`,
+              );
+            })
+            .catch((error: unknown) => {
+              const rollbackPatch = {
+                keywords: targetMessage.keywords,
+                pinned: targetMessage.pinned,
+                unread: targetMessage.unread,
+              };
 
-          patchVisibleMessage(targetMessage.id, rollbackPatch);
-          if (isInboxMailboxName(mailboxName)) {
-            void adjustInboxUnreadBadgeCount(1).catch(() => {});
-          }
-          void updateCachedEmail(targetMessage.id, rollbackPatch).catch(() => {});
-          appendReadDebugEvent(
-            `mark-read failed id=${targetMessage.id} error=${error instanceof Error ? error.message : String(error)}`,
-          );
+              patchVisibleMessage(targetMessage.id, rollbackPatch);
+              if (isInboxMailboxName(mailboxName)) {
+                void adjustInboxUnreadBadgeCount(1).catch(() => {});
+              }
+              void updateCachedEmail(targetMessage.id, rollbackPatch).catch(() => {});
+              appendReadDebugEvent(
+                `mark-read failed id=${targetMessage.id} error=${error instanceof Error ? error.message : String(error)}`,
+              );
+            });
         });
+
+        setTimeout(() => markReadTask.cancel(), 10000);
+      }, 500);
     },
     [appendReadDebugEvent, dismissReadNotification, mailboxName, patchVisibleMessage, source],
   );
@@ -535,7 +552,7 @@ export default function MessageScreen() {
 
     for (const threadMessageId of messageIds) {
       void hydrateMessageBodyFromCache(threadMessageId).catch(() => {});
-      void loadMessageBody(threadMessageId, { refresh: true }).catch(() => {});
+      void loadMessageBody(threadMessageId, { priority: 'background', refresh: true }).catch(() => {});
     }
   }, [expandedThreadMessageKey, expandedThreadMessageIds, messageId, source]);
   useEffect(() => {
@@ -806,6 +823,7 @@ export default function MessageScreen() {
               return nextIds;
             });
           }}
+          readDebugEvents={readDebugEvents}
           threadDebugText={debugMode ? threadReadDebugText : null}
         />
       </View>
@@ -1206,6 +1224,58 @@ function getThreadReadDebugText({
   ].join('\n');
 }
 
+function getMessageCacheDumpText({
+  bodyDebug,
+  message,
+  readDebugEvents,
+}: {
+  bodyDebug?: JmapMessageBodyDebug;
+  message: Message;
+  readDebugEvents: string[];
+}) {
+  const html = message.htmlBody ?? '';
+  const text = message.body ?? '';
+  const attachments = message.attachments ?? [];
+
+  return [
+    `cache dump: ${new Date().toISOString()}`,
+    `id: ${message.id}`,
+    `thread: ${message.threadId ?? 'none'}`,
+    `unread: ${message.unread ? '1' : '0'}`,
+    `$seen: ${message.keywords?.$seen === true ? '1' : '0'}`,
+    `keywords: ${formatDebugRecordKeys(message.keywords)}`,
+    `mailboxes: ${formatDebugRecordKeys(message.mailboxIds)}`,
+    `from: ${message.fromEmail || 'none'}`,
+    `subject: ${JSON.stringify(message.subject)}`,
+    `sender: ${JSON.stringify(message.sender)}`,
+    `html length: ${html.trim() ? html.length : 0}`,
+    `text length: ${text.trim() ? text.length : 0}`,
+    `attachments: ${attachments.length}`,
+    `body debug: ${bodyDebug ? 'available' : 'none'}`,
+    bodyDebug ? getBodyDebugDumpText(bodyDebug) : null,
+    'events:',
+    readDebugEvents.length ? readDebugEvents.join('\n') : 'none',
+  ]
+    .filter(isPresent)
+    .join('\n');
+}
+
+function getBodyDebugDumpText(debug: JmapMessageBodyDebug) {
+  return [
+    `cid inline mode: ${debug.cidImageInlineMode ?? 'unknown'}`,
+    `cid refs: ${debug.cidReferenceCount}`,
+    `cid image parts: ${debug.cidImagePartCount}`,
+    `embedded image urls: ${debug.generatedDownloadUrlCount}`,
+    `replaced refs: ${debug.replacedCidReferenceCount}`,
+    `unresolved refs: ${debug.unresolvedCidReferences.length ? debug.unresolvedCidReferences.join(',') : 'none'}`,
+    `cid left after rewrite: ${debug.htmlContainsCidAfterRewrite ? '1' : '0'}`,
+    `body parts: ${debug.bodyStructurePartCount}`,
+    `html body parts: ${debug.htmlBodyPartCount}`,
+    `attachment parts: ${debug.attachmentPartCount}`,
+    `inline image errors: ${debug.downloadUrlErrorCount}`,
+  ].join('\n');
+}
+
 function formatThreadMessageDebugLine(message: Message, index: number) {
   return [
     `${index + 1}. id=${message.id}`,
@@ -1280,6 +1350,11 @@ function getMessageMenuActions(message: Message, debugMode: boolean, hasHtmlBody
           title: 'Copy Email HTML',
           image: 'doc.on.doc',
           attributes: hasHtmlBody ? undefined : { disabled: true },
+        },
+        {
+          id: dumpEmailCacheAction,
+          title: 'Dump Cache',
+          image: 'internaldrive',
         },
       ],
     });
@@ -1605,6 +1680,7 @@ function MessageDetail({
   onAction,
   onExpandAll,
   onToggleMessage,
+  readDebugEvents,
   threadDebugText,
 }: {
   bodyDebug?: JmapMessageBodyDebug;
@@ -1619,6 +1695,7 @@ function MessageDetail({
   onAction: (action: MessageAction, messageId?: string) => void;
   onExpandAll: () => void;
   onToggleMessage: (messageId: string) => void;
+  readDebugEvents: string[];
   threadDebugText: string | null;
 }) {
   const scrollViewRef = useRef<ScrollView>(null);
@@ -1712,6 +1789,7 @@ function MessageDetail({
               onAction={onAction}
               onLayout={handleThreadItemLayout}
               onToggle={() => onToggleMessage(threadMessage.id)}
+              readDebugEvents={readDebugEvents}
               showMenu={expanded}
             />
           );
@@ -1740,6 +1818,7 @@ function MessageThreadItem({
   onAction,
   onLayout,
   onToggle,
+  readDebugEvents,
   showMenu,
 }: {
   bodyDebug?: JmapMessageBodyDebug;
@@ -1753,6 +1832,7 @@ function MessageThreadItem({
   onAction: (action: MessageAction, messageId?: string) => void;
   onLayout: (messageId: string, y: number) => void;
   onToggle: () => void;
+  readDebugEvents: string[];
   showMenu: boolean;
 }) {
   const debugMode = useDebugMode();
@@ -1769,6 +1849,9 @@ function MessageThreadItem({
       onAction(action, message.id);
     } else if (action === copyEmailHtmlAction && htmlBody) {
       Clipboard.setString(message.htmlBody ?? '');
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } else if (action === dumpEmailCacheAction) {
+      Clipboard.setString(getMessageCacheDumpText({ bodyDebug, message, readDebugEvents }));
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } else {
       pressHaptic();
@@ -1788,6 +1871,7 @@ function MessageThreadItem({
           message={message}
           onAction={onAction}
           onToggle={canToggle ? onToggle : undefined}
+          readDebugEvents={readDebugEvents}
           showMenu={showMenu}
         />
       ) : (
@@ -1843,6 +1927,7 @@ function ExpandedThreadMessage({
   message,
   onAction,
   onToggle,
+  readDebugEvents,
   showMenu,
 }: {
   bodyDebug?: JmapMessageBodyDebug;
@@ -1852,6 +1937,7 @@ function ExpandedThreadMessage({
   message: Message;
   onAction: (action: MessageAction, messageId?: string) => void;
   onToggle?: () => void;
+  readDebugEvents: string[];
   showMenu: boolean;
 }) {
   const debugMode = useDebugMode();
@@ -1917,6 +2003,9 @@ function ExpandedThreadMessage({
       onAction(action, message.id);
     } else if (action === copyEmailHtmlAction && htmlBody && rawHtmlBody) {
       Clipboard.setString(rawHtmlBody);
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } else if (action === dumpEmailCacheAction) {
+      Clipboard.setString(getMessageCacheDumpText({ bodyDebug, message, readDebugEvents }));
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } else {
       pressHaptic();
@@ -2467,6 +2556,7 @@ function getEmailDebugReportText(
   const inlineImageErrors = debug.inlineImageErrors?.length ? debug.inlineImageErrors.join('\n') : 'none';
 
   return [
+    `cid inline mode: ${debug.cidImageInlineMode ?? 'unknown'}`,
     `cid refs: ${debug.cidReferenceCount} (${cidReferences})`,
     `cid image parts: ${debug.cidImagePartCount}`,
     `embedded image urls: ${debug.generatedDownloadUrlCount} (${embeddedImageKinds})`,

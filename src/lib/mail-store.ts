@@ -17,8 +17,17 @@ type MessagePatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 
 const LOCAL_ACTION_REFRESH_SUPPRESSION_MS = 8000;
 
-const messageBodyFetches = new Map<string, Promise<JmapMessageBody | null>>();
+type MessageBodyFetchPriority = 'background' | 'foreground';
+
+type MessageBodyFetchEntry = {
+  controller: AbortController;
+  priority: MessageBodyFetchPriority;
+  promise: Promise<JmapMessageBody | null>;
+};
+
+const messageBodyFetches = new Map<string, MessageBodyFetchEntry>();
 let localMailActionSuppressUntil = 0;
+let foregroundMessageBodyFetchCount = 0;
 
 type MailStoreState = {
   hiddenMailboxMessageIds: Record<string, Record<string, true>>;
@@ -226,8 +235,10 @@ export async function hydrateMessageBodyFromCache(messageId: string) {
 export async function loadMessageBody(
   messageId: string,
   {
+    priority = 'foreground',
     refresh = false,
   }: {
+    priority?: MessageBodyFetchPriority;
     refresh?: boolean;
   } = {},
 ) {
@@ -242,10 +253,25 @@ export async function loadMessageBody(
   const existingFetch = messageBodyFetches.get(messageId);
 
   if (existingFetch) {
-    return existingFetch;
+    if (priority === 'foreground' && existingFetch.priority === 'background') {
+      existingFetch.controller.abort();
+      messageBodyFetches.delete(messageId);
+    } else {
+      return existingFetch.promise;
+    }
   }
 
-  const fetchPromise = fetchJmapMessageBody(messageId)
+  if (priority === 'foreground') {
+    foregroundMessageBodyFetchCount += 1;
+    abortBackgroundMessageBodyFetches(messageId);
+  }
+
+  const controller = new AbortController();
+  const fetchPromise = fetchJmapMessageBody({
+    inlineCidImageData: false,
+    messageId,
+    signal: controller.signal,
+  })
     .then(async (body) => {
       if (body) {
         useMailStore.getState().applyMessageBody(messageId, body);
@@ -255,10 +281,20 @@ export async function loadMessageBody(
       return body;
     })
     .finally(() => {
-      messageBodyFetches.delete(messageId);
+      if (priority === 'foreground') {
+        foregroundMessageBodyFetchCount = Math.max(0, foregroundMessageBodyFetchCount - 1);
+      }
+
+      if (messageBodyFetches.get(messageId)?.promise === fetchPromise) {
+        messageBodyFetches.delete(messageId);
+      }
     });
 
-  messageBodyFetches.set(messageId, fetchPromise);
+  messageBodyFetches.set(messageId, {
+    controller,
+    priority,
+    promise: fetchPromise,
+  });
 
   return fetchPromise;
 }
@@ -283,6 +319,10 @@ export async function prefetchMessageBodies(
 
   async function runNext() {
     while (cursor < pendingIds.length) {
+      if (foregroundMessageBodyFetchCount > 0) {
+        break;
+      }
+
       const messageId = pendingIds[cursor];
       cursor += 1;
 
@@ -291,7 +331,7 @@ export async function prefetchMessageBodies(
       }
 
       try {
-        const body = await loadMessageBody(messageId);
+        const body = await loadMessageBody(messageId, { priority: 'background' });
 
         if (body) {
           loaded += 1;
@@ -318,6 +358,17 @@ export async function prefetchMessageBodies(
     requested: uniqueIds.length,
     skipped: uniqueIds.length - pendingIds.length,
   };
+}
+
+function abortBackgroundMessageBodyFetches(exceptMessageId?: string) {
+  for (const [messageId, fetchEntry] of messageBodyFetches) {
+    if (messageId === exceptMessageId || fetchEntry.priority !== 'background') {
+      continue;
+    }
+
+    fetchEntry.controller.abort();
+    messageBodyFetches.delete(messageId);
+  }
 }
 
 export function getMailboxSnapshotKey(mailboxId?: string | null) {
