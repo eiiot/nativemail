@@ -202,6 +202,10 @@ type SharedFastmailJmapClient = {
 let sharedFastmailJmapClient: SharedFastmailJmapClient | null = null
 let sharedFastmailJmapClientPromise: Promise<SharedFastmailJmapClient> | null =
     null
+let activeTransportRequestCount = 0
+let transportRequestSequence = 0
+
+const SLOW_TRANSPORT_REQUEST_MS = 1000
 
 export async function createFastmailJmapClient(
     _signal?: AbortSignal,
@@ -795,6 +799,114 @@ export function describeJmapError(
     return String(error)
 }
 
+export async function probeFastmailJmapSession({
+    messageId,
+    reason,
+}: {
+    messageId?: string
+    reason: string
+}) {
+    const startedAt = Date.now()
+    const tokenStartedAt = Date.now()
+    const token = await getFastmailJmapToken()
+
+    observeDuration('jmap.session-probe.token', tokenStartedAt, {
+        hasToken: Boolean(token),
+        messageId: messageId ?? 'none',
+        reason,
+    })
+
+    if (!token) {
+        throw new FastmailJmapTokenMissingError()
+    }
+
+    const requestId = `probe-${startedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const requestUrl = getFastmailRequestUrl(
+        `https://${FASTMAIL_JMAP_HOSTNAME}/.well-known/jmap`
+    )
+    const path = getObservabilityPath(requestUrl)
+    const fetchStartedAt = Date.now()
+
+    observeEvent('jmap.session-probe.fetch.call', {
+        activeTransportRequestCount,
+        messageId: messageId ?? 'none',
+        path,
+        reason,
+        requestId,
+    })
+
+    let response: Response
+
+    try {
+        response = await fetch(requestUrl, {
+            headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${token}`,
+            },
+            method: 'GET',
+        })
+    } catch (error: unknown) {
+        observeError('jmap.session-probe.fetch.failed', error, {
+            activeTransportRequestCount,
+            messageId: messageId ?? 'none',
+            path,
+            reason,
+            requestId,
+        })
+        throw error
+    }
+
+    observeDuration('jmap.session-probe.fetch.response', fetchStartedAt, {
+        activeTransportRequestCount,
+        messageId: messageId ?? 'none',
+        path,
+        reason,
+        requestId,
+        status: response.status,
+    })
+
+    const textStartedAt = Date.now()
+    let text = ''
+
+    try {
+        text = await response.text()
+    } catch (error: unknown) {
+        observeError('jmap.session-probe.text.failed', error, {
+            activeTransportRequestCount,
+            messageId: messageId ?? 'none',
+            path,
+            reason,
+            requestId,
+            status: response.status,
+        })
+        throw error
+    }
+
+    observeDuration('jmap.session-probe.text.success', textStartedAt, {
+        activeTransportRequestCount,
+        length: text.length,
+        messageId: messageId ?? 'none',
+        path,
+        reason,
+        requestId,
+        status: response.status,
+    })
+
+    if (!response.ok) {
+        throw new Error(`Fastmail session probe failed with HTTP ${response.status}`)
+    }
+
+    observeDuration('jmap.session-probe.success', startedAt, {
+        activeTransportRequestCount,
+        length: text.length,
+        messageId: messageId ?? 'none',
+        path,
+        reason,
+        requestId,
+        status: response.status,
+    })
+}
+
 function createBearerTransport(token: string, operation?: string): Transport {
     async function request<T>(
         method: 'GET' | 'POST',
@@ -803,6 +915,7 @@ function createBearerTransport(token: string, operation?: string): Transport {
     ): Promise<T> {
         const startedAt = Date.now()
         const requestId = `${startedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+        const sequence = ++transportRequestSequence
         const headers = new Headers(options.headers)
 
         headers.set('Authorization', `Bearer ${token}`)
@@ -832,6 +945,7 @@ function createBearerTransport(token: string, operation?: string): Transport {
         const requestDetails = getJmapRequestObservabilityDetails(options.body)
 
         observeEvent('jmap.transport.request.start', {
+            activeTransportRequestCount,
             bodyLength,
             ...requestDetails,
             method,
@@ -839,11 +953,70 @@ function createBearerTransport(token: string, operation?: string): Transport {
             path,
             requestId,
             responseType,
+            sequence,
             signalAborted: options.signal?.aborted === true,
         })
 
         let response: Response
         const fetchStartedAt = Date.now()
+        const activeAtFetchStart = ++activeTransportRequestCount
+        let fetchSlowTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+            observeEvent(
+                'jmap.transport.fetch.slow',
+                {
+                    activeAtFetchStart,
+                    activeTransportRequestCount,
+                    bodyLength,
+                    ...requestDetails,
+                    durationMs: Math.max(0, Date.now() - fetchStartedAt),
+                    method,
+                    operation: operation ?? 'unknown',
+                    path,
+                    requestId,
+                    responseType,
+                    sequence,
+                    signalAborted: options.signal?.aborted === true,
+                },
+                'warn'
+            )
+        }, SLOW_TRANSPORT_REQUEST_MS)
+        const abortListener = () => {
+            observeEvent(
+                'jmap.transport.signal.abort',
+                {
+                    activeAtFetchStart,
+                    activeTransportRequestCount,
+                    bodyLength,
+                    ...requestDetails,
+                    durationMs: Math.max(0, Date.now() - fetchStartedAt),
+                    method,
+                    operation: operation ?? 'unknown',
+                    path,
+                    requestId,
+                    responseType,
+                    sequence,
+                },
+                'warn'
+            )
+        }
+
+        if (options.signal) {
+            options.signal.addEventListener('abort', abortListener, { once: true })
+        }
+
+        observeEvent('jmap.transport.fetch.call', {
+            activeAtFetchStart,
+            activeTransportRequestCount,
+            bodyLength,
+            ...requestDetails,
+            method,
+            operation: operation ?? 'unknown',
+            path,
+            requestId,
+            responseType,
+            sequence,
+            signalAborted: options.signal?.aborted === true,
+        })
 
         try {
             response = await fetch(requestUrl, {
@@ -854,21 +1027,42 @@ function createBearerTransport(token: string, operation?: string): Transport {
             })
         } catch (error: unknown) {
             observeError('jmap.transport.fetch.failed', error, {
+                activeAtFetchStart,
+                activeTransportRequestCount,
                 ...requestDetails,
+                durationMs: Math.max(0, Date.now() - fetchStartedAt),
                 method,
                 operation: operation ?? 'unknown',
                 path,
                 requestId,
+                sequence,
             })
             throw error
+        } finally {
+            if (fetchSlowTimer) {
+                clearTimeout(fetchSlowTimer)
+                fetchSlowTimer = null
+            }
+
+            if (options.signal) {
+                options.signal.removeEventListener('abort', abortListener)
+            }
+
+            activeTransportRequestCount = Math.max(
+                0,
+                activeTransportRequestCount - 1
+            )
         }
 
         observeDuration('jmap.transport.fetch.response', fetchStartedAt, {
+            activeAtFetchStart,
+            activeTransportRequestCount,
             ...requestDetails,
             method,
             operation: operation ?? 'unknown',
             path,
             requestId,
+            sequence,
             status: response.status,
         })
 

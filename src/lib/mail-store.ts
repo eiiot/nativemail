@@ -7,6 +7,7 @@ import {
 } from '@/lib/mail-cache';
 import {
   fetchJmapMessageBody,
+  probeFastmailJmapSession,
   type JmapMailboxSnapshot,
   type JmapMessageBody,
   type JmapThread,
@@ -17,6 +18,7 @@ import { observeDuration, observeError, observeEvent } from '@/lib/observability
 type MessagePatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 
 const LOCAL_ACTION_REFRESH_SUPPRESSION_MS = 8000;
+const SLOW_FOREGROUND_BODY_FETCH_MS = 1000;
 
 type MessageBodyFetchPriority = 'background' | 'foreground';
 
@@ -29,6 +31,26 @@ type MessageBodyFetchEntry = {
 const messageBodyFetches = new Map<string, MessageBodyFetchEntry>();
 let localMailActionSuppressUntil = 0;
 let foregroundMessageBodyFetchCount = 0;
+
+function getMessageBodyFetchCounts() {
+  let background = 0;
+  let foreground = 0;
+
+  for (const fetchEntry of messageBodyFetches.values()) {
+    if (fetchEntry.priority === 'foreground') {
+      foreground += 1;
+    } else {
+      background += 1;
+    }
+  }
+
+  return {
+    background,
+    foreground,
+    foregroundMessageBodyFetchCount,
+    total: messageBodyFetches.size,
+  };
+}
 
 type MailStoreState = {
   hiddenMailboxMessageIds: Record<string, Record<string, true>>;
@@ -246,6 +268,7 @@ export async function loadMessageBody(
   const startedAt = Date.now();
 
   observeEvent('mail.body.load.start', {
+    ...getMessageBodyFetchCounts(),
     messageId,
     priority,
     refresh,
@@ -272,6 +295,7 @@ export async function loadMessageBody(
     const joinStartedAt = Date.now();
 
     observeEvent('mail.body.fetch.join', {
+      ...getMessageBodyFetchCounts(),
       existingPriority: existingFetch.priority,
       messageId,
       priority,
@@ -285,6 +309,7 @@ export async function loadMessageBody(
       if (existingFetch.priority === 'background') {
         existingFetch.priority = 'foreground';
         observeEvent('mail.body.fetch.upgrade', {
+          ...getMessageBodyFetchCounts(),
           messageId,
         });
       }
@@ -335,10 +360,35 @@ export async function loadMessageBody(
   const networkStartedAt = Date.now();
 
   observeEvent('mail.body.fetch.start', {
+    ...getMessageBodyFetchCounts(),
     messageId,
     priority,
     refresh,
   });
+
+  let slowForegroundProbeTimer: ReturnType<typeof setTimeout> | null =
+    priority === 'foreground'
+      ? setTimeout(() => {
+        observeEvent('mail.body.fetch.foreground-slow', {
+          ...getMessageBodyFetchCounts(),
+          durationMs: Math.max(0, Date.now() - networkStartedAt),
+          messageId,
+          refresh,
+        }, 'warn');
+
+        void probeFastmailJmapSession({
+          messageId,
+          reason: 'foreground-body-slow',
+        }).catch((error: unknown) => {
+          observeError('mail.body.fetch.foreground-slow.probe.failed', error, {
+            ...getMessageBodyFetchCounts(),
+            durationMs: Math.max(0, Date.now() - networkStartedAt),
+            messageId,
+            refresh,
+          });
+        });
+      }, SLOW_FOREGROUND_BODY_FETCH_MS)
+      : null;
 
   const fetchPromise = fetchJmapMessageBody({
     inlineCidImageData: false,
@@ -380,6 +430,7 @@ export async function loadMessageBody(
     })
     .catch((error: unknown) => {
       observeError('mail.body.fetch.failed', error, {
+        ...getMessageBodyFetchCounts(),
         messageId,
         priority,
         refresh,
@@ -387,6 +438,11 @@ export async function loadMessageBody(
       throw error;
     })
     .finally(() => {
+      if (slowForegroundProbeTimer) {
+        clearTimeout(slowForegroundProbeTimer);
+        slowForegroundProbeTimer = null;
+      }
+
       if (priority === 'foreground') {
         foregroundMessageBodyFetchCount = Math.max(0, foregroundMessageBodyFetchCount - 1);
       }
@@ -400,6 +456,13 @@ export async function loadMessageBody(
     controller,
     priority,
     promise: fetchPromise,
+  });
+
+  observeEvent('mail.body.fetch.registered', {
+    ...getMessageBodyFetchCounts(),
+    messageId,
+    priority,
+    refresh,
   });
 
   return fetchPromise;
@@ -423,9 +486,22 @@ export async function prefetchMessageBodies(
   let failed = 0;
   let cursor = 0;
 
+  observeEvent('mail.body.prefetch.start', {
+    concurrency,
+    foregroundMessageBodyFetchCount,
+    limit,
+    pending: pendingIds.length,
+    requested: uniqueIds.length,
+  });
+
   async function runNext() {
     while (cursor < pendingIds.length) {
       if (foregroundMessageBodyFetchCount > 0) {
+        observeEvent('mail.body.prefetch.paused-for-foreground', {
+          ...getMessageBodyFetchCounts(),
+          attempted: cursor,
+          pending: pendingIds.length,
+        });
         break;
       }
 
@@ -473,6 +549,7 @@ function abortBackgroundMessageBodyFetches(exceptMessageId?: string) {
     }
 
     observeEvent('mail.body.fetch.abort-background', {
+      ...getMessageBodyFetchCounts(),
       exceptMessageId: exceptMessageId ?? 'none',
       messageId,
     }, 'warn');
