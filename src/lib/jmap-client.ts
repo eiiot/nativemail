@@ -192,8 +192,19 @@ export class FastmailJmapTokenMissingError extends Error {
     }
 }
 
+type SharedFastmailJmapClient = {
+    accountId: Id
+    client: JMAPClient
+    disconnect: () => Promise<void>
+    token: string
+}
+
+let sharedFastmailJmapClient: SharedFastmailJmapClient | null = null
+let sharedFastmailJmapClientPromise: Promise<SharedFastmailJmapClient> | null =
+    null
+
 export async function createFastmailJmapClient(
-    signal?: AbortSignal,
+    _signal?: AbortSignal,
     operation?: string
 ) {
     const operationPrefix = operation ? `jmap.${operation}` : null
@@ -210,21 +221,95 @@ export async function createFastmailJmapClient(
         throw new FastmailJmapTokenMissingError()
     }
 
-    const client = new JMAPClient(createBearerTransport(token, operation), {
-        hostname: FASTMAIL_JMAP_HOSTNAME,
-    })
-
     const connectStartedAt = Date.now()
-
-    await client.registerCapabilities(EmailCapability)
-    await client.connect(signal)
+    const sharedClient = await getSharedFastmailJmapClient(token)
+    const { accountId, client } = sharedClient
 
     if (operationPrefix) {
         observeDuration(`${operationPrefix}.connect`, connectStartedAt, {
             accountCount: Object.keys(client.accounts ?? {}).length,
+            shared: true,
             username: client.username ? 'present' : 'missing',
         })
     }
+
+    return { accountId, client, token }
+}
+
+async function getSharedFastmailJmapClient(
+    token: string
+): Promise<SharedFastmailJmapClient> {
+    if (
+        sharedFastmailJmapClient?.token === token &&
+        sharedFastmailJmapClient.client.connectionStatus === 'connected'
+    ) {
+        observeEvent('jmap.shared-client.reuse', {
+            connectionStatus: sharedFastmailJmapClient.client.connectionStatus,
+        })
+        return sharedFastmailJmapClient
+    }
+
+    if (
+        sharedFastmailJmapClient &&
+        (sharedFastmailJmapClient.token !== token ||
+            sharedFastmailJmapClient.client.connectionStatus !== 'connected')
+    ) {
+        await disconnectSharedFastmailJmapClient(
+            sharedFastmailJmapClient.token !== token
+                ? 'token-changed'
+                : 'not-connected'
+        )
+    }
+
+    if (sharedFastmailJmapClientPromise) {
+        const pendingClient = await sharedFastmailJmapClientPromise
+
+        if (pendingClient.token === token) {
+            sharedFastmailJmapClient = pendingClient
+            observeEvent('jmap.shared-client.reuse-pending', {
+                connectionStatus: pendingClient.client.connectionStatus,
+            })
+            return pendingClient
+        }
+
+        observeEvent('jmap.shared-client.disconnect', {
+            connectionStatus: pendingClient.client.connectionStatus,
+            reason: 'pending-token-changed',
+        })
+        await pendingClient.disconnect()
+
+        if (sharedFastmailJmapClient === pendingClient) {
+            sharedFastmailJmapClient = null
+        }
+    }
+
+    const promise = connectSharedFastmailJmapClient(token)
+
+    sharedFastmailJmapClientPromise = promise
+
+    try {
+        const client = await promise
+
+        sharedFastmailJmapClient = client
+
+        return client
+    } finally {
+        if (sharedFastmailJmapClientPromise === promise) {
+            sharedFastmailJmapClientPromise = null
+        }
+    }
+}
+
+async function connectSharedFastmailJmapClient(
+    token: string
+): Promise<SharedFastmailJmapClient> {
+    const startedAt = Date.now()
+    const client = new JMAPClient(createBearerTransport(token, 'shared'), {
+        hostname: FASTMAIL_JMAP_HOSTNAME,
+    })
+
+    await client.registerCapabilities(EmailCapability)
+    await client.connect()
 
     const accountId = client.primaryAccounts[EMAIL_CAPABILITY_URI]
 
@@ -235,7 +320,46 @@ export async function createFastmailJmapClient(
         )
     }
 
-    return { accountId, client, token }
+    observeDuration('jmap.shared-client.connect.success', startedAt, {
+        accountCount: Object.keys(client.accounts ?? {}).length,
+        connectionStatus: client.connectionStatus,
+        username: client.username ? 'present' : 'missing',
+    })
+
+    return {
+        accountId,
+        client,
+        disconnect: client.disconnect.bind(client),
+        token,
+    }
+}
+
+async function disconnectSharedFastmailJmapClient(reason: string) {
+    const sharedClient = sharedFastmailJmapClient
+
+    sharedFastmailJmapClient = null
+    sharedFastmailJmapClientPromise = null
+
+    if (!sharedClient) {
+        return
+    }
+
+    observeEvent('jmap.shared-client.disconnect', {
+        connectionStatus: sharedClient.client.connectionStatus,
+        reason,
+    })
+    await sharedClient.disconnect()
+}
+
+async function releaseFastmailJmapClient(client: JMAPClient) {
+    if (sharedFastmailJmapClient?.client === client) {
+        observeEvent('jmap.shared-client.release', {
+            connectionStatus: client.connectionStatus,
+        })
+        return
+    }
+
+    await client.disconnect()
 }
 
 export async function fetchJmapMailboxes(signal?: AbortSignal) {
@@ -244,7 +368,7 @@ export async function fetchJmapMailboxes(signal?: AbortSignal) {
     try {
         return await getMailboxes(client, accountId, signal)
     } finally {
-        await client.disconnect()
+        await releaseFastmailJmapClient(client)
     }
 }
 
@@ -291,7 +415,7 @@ export async function fetchJmapMessageNotificationStates(
 
         return states
     } finally {
-        await client.disconnect()
+        await releaseFastmailJmapClient(client)
     }
 }
 
@@ -363,7 +487,7 @@ export async function fetchJmapMailboxSnapshot({
         })
         throw error
     } finally {
-        await client.disconnect()
+        await releaseFastmailJmapClient(client)
     }
 }
 
@@ -385,7 +509,7 @@ export async function fetchJmapMessage(
 
         return message ? mapEmailToMessage(message) : null
     } finally {
-        await client.disconnect()
+        await releaseFastmailJmapClient(client)
     }
 }
 
@@ -459,7 +583,7 @@ export async function fetchJmapMessageBody({
         })
         throw error
     } finally {
-        await client.disconnect()
+        await releaseFastmailJmapClient(client)
     }
 }
 
@@ -506,7 +630,7 @@ export async function fetchJmapThreadMessages({
 
         return emails.map((email) => mapEmailToMessage(email, mailboxes))
     } finally {
-        await client.disconnect()
+        await releaseFastmailJmapClient(client)
     }
 }
 
@@ -1320,7 +1444,7 @@ async function moveJmapEmailToRole(
         })
         throw error
     } finally {
-        await client.disconnect()
+        await releaseFastmailJmapClient(client)
     }
 }
 
@@ -1383,7 +1507,7 @@ async function updateJmapEmailKeywords(
         })
         throw error
     } finally {
-        await client.disconnect()
+        await releaseFastmailJmapClient(client)
     }
 }
 
