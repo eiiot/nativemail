@@ -210,7 +210,7 @@ export async function createFastmailJmapClient(
         throw new FastmailJmapTokenMissingError()
     }
 
-    const client = new JMAPClient(createBearerTransport(token), {
+    const client = new JMAPClient(createBearerTransport(token, operation), {
         hostname: FASTMAIL_JMAP_HOSTNAME,
     })
 
@@ -671,12 +671,14 @@ export function describeJmapError(
     return String(error)
 }
 
-function createBearerTransport(token: string): Transport {
+function createBearerTransport(token: string, operation?: string): Transport {
     async function request<T>(
         method: 'GET' | 'POST',
         url: string | URL,
         options: TransportRequestOptions = {}
     ): Promise<T> {
+        const startedAt = Date.now()
+        const requestId = `${startedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`
         const headers = new Headers(options.headers)
 
         headers.set('Authorization', `Bearer ${token}`)
@@ -697,11 +699,53 @@ function createBearerTransport(token: string): Transport {
         }
 
         const requestUrl = getFastmailRequestUrl(url)
-        const response = await fetch(requestUrl, {
-            body: method === 'POST' ? options.body : undefined,
-            headers,
+        const path = getObservabilityPath(requestUrl)
+        const bodyLength =
+            method === 'POST' && typeof options.body === 'string'
+                ? options.body.length
+                : 0
+        const responseType = options.responseType === 'blob' ? 'blob' : 'json'
+        const requestDetails = getJmapRequestObservabilityDetails(options.body)
+
+        observeEvent('jmap.transport.request.start', {
+            bodyLength,
+            ...requestDetails,
             method,
-            signal: options.signal,
+            operation: operation ?? 'unknown',
+            path,
+            requestId,
+            responseType,
+            signalAborted: options.signal?.aborted === true,
+        })
+
+        let response: Response
+        const fetchStartedAt = Date.now()
+
+        try {
+            response = await fetch(requestUrl, {
+                body: method === 'POST' ? options.body : undefined,
+                headers,
+                method,
+                signal: options.signal,
+            })
+        } catch (error: unknown) {
+            observeError('jmap.transport.fetch.failed', error, {
+                ...requestDetails,
+                method,
+                operation: operation ?? 'unknown',
+                path,
+                requestId,
+            })
+            throw error
+        }
+
+        observeDuration('jmap.transport.fetch.response', fetchStartedAt, {
+            ...requestDetails,
+            method,
+            operation: operation ?? 'unknown',
+            path,
+            requestId,
+            status: response.status,
         })
 
         if (!response.ok) {
@@ -709,15 +753,204 @@ function createBearerTransport(token: string): Transport {
         }
 
         if (options.responseType === 'blob') {
-            return (await response.blob()) as T
+            const blobStartedAt = Date.now()
+            let blob: Blob
+
+            try {
+                blob = await response.blob()
+            } catch (error: unknown) {
+                observeError('jmap.transport.blob-read.failed', error, {
+                    ...requestDetails,
+                    method,
+                    operation: operation ?? 'unknown',
+                    path,
+                    requestId,
+                })
+                throw error
+            }
+
+            observeDuration('jmap.transport.blob-read.success', blobStartedAt, {
+                ...requestDetails,
+                method,
+                operation: operation ?? 'unknown',
+                path,
+                requestId,
+                size: blob.size,
+            })
+            observeDuration('jmap.transport.request.success', startedAt, {
+                ...requestDetails,
+                method,
+                operation: operation ?? 'unknown',
+                path,
+                requestId,
+                responseType,
+                status: response.status,
+            })
+
+            return blob as T
         }
 
-        return (await response.json()) as T
+        const textStartedAt = Date.now()
+        let text: string
+
+        try {
+            text = await response.text()
+        } catch (error: unknown) {
+            observeError('jmap.transport.text-read.failed', error, {
+                ...requestDetails,
+                method,
+                operation: operation ?? 'unknown',
+                path,
+                requestId,
+            })
+            throw error
+        }
+
+        observeDuration('jmap.transport.text-read.success', textStartedAt, {
+            ...requestDetails,
+            length: text.length,
+            method,
+            operation: operation ?? 'unknown',
+            path,
+            requestId,
+        })
+
+        const parseStartedAt = Date.now()
+        let json: T
+
+        try {
+            json = JSON.parse(text) as T
+        } catch (error: unknown) {
+            observeError('jmap.transport.json-parse.failed', error, {
+                ...requestDetails,
+                length: text.length,
+                method,
+                operation: operation ?? 'unknown',
+                path,
+                requestId,
+            })
+            throw error
+        }
+
+        observeDuration('jmap.transport.json-parse.success', parseStartedAt, {
+            ...requestDetails,
+            length: text.length,
+            method,
+            operation: operation ?? 'unknown',
+            path,
+            requestId,
+        })
+        observeDuration('jmap.transport.request.success', startedAt, {
+            ...requestDetails,
+            length: text.length,
+            method,
+            operation: operation ?? 'unknown',
+            path,
+            requestId,
+            responseType,
+            status: response.status,
+        })
+
+        return json
     }
 
     return {
         get: (url, options) => request('GET', url, options),
         post: (url, options) => request('POST', url, options),
+    }
+}
+
+function getObservabilityPath(url: string) {
+    try {
+        const parsed = new URL(url)
+
+        return parsed.pathname
+    } catch {
+        return 'unknown'
+    }
+}
+
+function getJmapRequestObservabilityDetails(body: unknown) {
+    if (typeof body !== 'string' || !body.trim().startsWith('{')) {
+        return {}
+    }
+
+    try {
+        const parsed = JSON.parse(body) as {
+            methodCalls?: unknown
+        }
+        const methodCalls = Array.isArray(parsed.methodCalls)
+            ? parsed.methodCalls
+            : []
+        const methodNames: string[] = []
+        let primaryEmailId: string | null = null
+        let emailGetIds = 0
+        let fetchHTMLBodyValues: boolean | null = null
+        let fetchTextBodyValues: boolean | null = null
+        let bodyPropertiesCount: number | null = null
+        let propertiesCount: number | null = null
+
+        for (const methodCall of methodCalls) {
+            if (!Array.isArray(methodCall)) {
+                continue
+            }
+
+            const [name, args] = methodCall
+
+            if (typeof name === 'string') {
+                methodNames.push(name)
+            }
+
+            if (
+                name === 'Email/get' &&
+                args &&
+                typeof args === 'object' &&
+                !Array.isArray(args)
+            ) {
+                const emailArgs = args as {
+                    bodyProperties?: unknown
+                    fetchHTMLBodyValues?: unknown
+                    fetchTextBodyValues?: unknown
+                    ids?: unknown
+                    properties?: unknown
+                }
+                const ids = Array.isArray(emailArgs.ids)
+                    ? emailArgs.ids.filter((id): id is string => typeof id === 'string')
+                    : []
+
+                emailGetIds += ids.length
+                primaryEmailId ??= ids[0] ?? null
+                fetchHTMLBodyValues =
+                    typeof emailArgs.fetchHTMLBodyValues === 'boolean'
+                        ? emailArgs.fetchHTMLBodyValues
+                        : fetchHTMLBodyValues
+                fetchTextBodyValues =
+                    typeof emailArgs.fetchTextBodyValues === 'boolean'
+                        ? emailArgs.fetchTextBodyValues
+                        : fetchTextBodyValues
+                bodyPropertiesCount = Array.isArray(emailArgs.bodyProperties)
+                    ? emailArgs.bodyProperties.length
+                    : bodyPropertiesCount
+                propertiesCount = Array.isArray(emailArgs.properties)
+                    ? emailArgs.properties.length
+                    : propertiesCount
+            }
+        }
+
+        return {
+            bodyPropertiesCount,
+            emailGetIds,
+            fetchHTMLBodyValues,
+            fetchTextBodyValues,
+            jmapMethods: methodNames.join(',').slice(0, 120),
+            methodCalls: methodCalls.length,
+            primaryEmailId,
+            propertiesCount,
+        }
+    } catch {
+        return {
+            jmapBodyParsed: false,
+        }
     }
 }
 
