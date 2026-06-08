@@ -192,8 +192,19 @@ export class FastmailJmapTokenMissingError extends Error {
     }
 }
 
-export async function createFastmailJmapClient(signal?: AbortSignal) {
+export async function createFastmailJmapClient(
+    signal?: AbortSignal,
+    operation?: string
+) {
+    const operationPrefix = operation ? `jmap.${operation}` : null
+    const tokenStartedAt = Date.now()
     const token = await getFastmailJmapToken()
+
+    if (operationPrefix) {
+        observeDuration(`${operationPrefix}.token`, tokenStartedAt, {
+            hasToken: Boolean(token),
+        })
+    }
 
     if (!token) {
         throw new FastmailJmapTokenMissingError()
@@ -203,8 +214,17 @@ export async function createFastmailJmapClient(signal?: AbortSignal) {
         hostname: FASTMAIL_JMAP_HOSTNAME,
     })
 
+    const connectStartedAt = Date.now()
+
     await client.registerCapabilities(EmailCapability)
     await client.connect(signal)
+
+    if (operationPrefix) {
+        observeDuration(`${operationPrefix}.connect`, connectStartedAt, {
+            accountCount: Object.keys(client.accounts ?? {}).length,
+            username: client.username ? 'present' : 'missing',
+        })
+    }
 
     const accountId = client.primaryAccounts[EMAIL_CAPABILITY_URI]
 
@@ -379,9 +399,18 @@ export async function fetchJmapMessageBody({
     signal?: AbortSignal
 }): Promise<JmapMessageBody | null> {
     const startedAt = Date.now()
-    const { accountId, client, token } = await createFastmailJmapClient(signal)
+    const clientStartedAt = Date.now()
+    const { accountId, client, token } = await createFastmailJmapClient(
+        signal,
+        'message-body'
+    )
+
+    observeDuration('jmap.message-body.client-ready', clientStartedAt, {
+        messageId,
+    })
 
     try {
+        const emailGetStartedAt = Date.now()
         const messages = await getEmails(
             client,
             accountId,
@@ -390,12 +419,28 @@ export async function fetchJmapMessageBody({
             signal
         )
         const message = messages[0]
+
+        observeDuration('jmap.message-body.email-get', emailGetStartedAt, {
+            found: Boolean(message),
+            messageId,
+        })
+
+        const parseStartedAt = Date.now()
         const body = message
             ? await getEmailBody(client, accountId, token, message, {
                   inlineCidImageData,
                   signal,
               })
             : null
+
+        observeDuration('jmap.message-body.parse', parseStartedAt, {
+            attachments: body?.attachments?.length ?? 0,
+            hasBody: Boolean(body),
+            html: body?.html?.trim() ? body.html.length : 0,
+            inlineCidImageData,
+            messageId,
+            text: body?.text?.trim() ? body.text.length : 0,
+        })
 
         observeDuration('jmap.message-body.success', startedAt, {
             attachments: body?.attachments?.length ?? 0,

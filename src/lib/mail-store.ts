@@ -269,20 +269,61 @@ export async function loadMessageBody(
   const existingFetch = messageBodyFetches.get(messageId);
 
   if (existingFetch) {
-    if (priority === 'foreground' && existingFetch.priority === 'background') {
-      observeEvent('mail.body.fetch.abort-background', {
-        messageId,
-      }, 'warn');
-      existingFetch.controller.abort();
-      messageBodyFetches.delete(messageId);
-    } else {
-      observeEvent('mail.body.fetch.join', {
-        existingPriority: existingFetch.priority,
+    const joinStartedAt = Date.now();
+
+    observeEvent('mail.body.fetch.join', {
+      existingPriority: existingFetch.priority,
+      messageId,
+      priority,
+      refresh,
+    });
+
+    if (priority === 'foreground') {
+      foregroundMessageBodyFetchCount += 1;
+      abortBackgroundMessageBodyFetches(messageId);
+
+      if (existingFetch.priority === 'background') {
+        existingFetch.priority = 'foreground';
+        observeEvent('mail.body.fetch.upgrade', {
+          messageId,
+        });
+      }
+
+      return existingFetch.promise
+        .then((body) => {
+          observeDuration('mail.body.fetch.join.success', joinStartedAt, {
+            hasBody: Boolean(body),
+            messageId,
+            priority,
+            text: body?.text?.trim() ? body.text.length : 0,
+            html: body?.html?.trim() ? body.html.length : 0,
+          });
+
+          return body;
+        })
+        .catch((error: unknown) => {
+          observeError('mail.body.fetch.join.failed', error, {
+            messageId,
+            priority,
+          });
+          throw error;
+        })
+        .finally(() => {
+          foregroundMessageBodyFetchCount = Math.max(0, foregroundMessageBodyFetchCount - 1);
+        });
+    }
+
+    return existingFetch.promise.then((body) => {
+      observeDuration('mail.body.fetch.join.success', joinStartedAt, {
+        hasBody: Boolean(body),
         messageId,
         priority,
+        text: body?.text?.trim() ? body.text.length : 0,
+        html: body?.html?.trim() ? body.html.length : 0,
       });
-      return existingFetch.promise;
-    }
+
+      return body;
+    });
   }
 
   if (priority === 'foreground') {
@@ -316,7 +357,23 @@ export async function loadMessageBody(
 
       if (body) {
         useMailStore.getState().applyMessageBody(messageId, body);
-        await writeCachedEmailBody(messageId, body).catch(() => {});
+        const cacheWriteStartedAt = Date.now();
+
+        await writeCachedEmailBody(messageId, body)
+          .then(() => {
+            observeDuration('mail.body.cache-write.success', cacheWriteStartedAt, {
+              html: body.html?.trim() ? body.html.length : 0,
+              messageId,
+              priority,
+              text: body.text?.trim() ? body.text.length : 0,
+            });
+          })
+          .catch((error: unknown) => {
+            observeError('mail.body.cache-write.failed', error, {
+              messageId,
+              priority,
+            });
+          });
       }
 
       return body;
