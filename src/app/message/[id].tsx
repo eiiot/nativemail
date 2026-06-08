@@ -223,6 +223,7 @@ export default function MessageScreen() {
     () => new Set([messageId]),
   );
   const cachedThreadMessagesRef = useRef<Message[] | null>(null);
+  const bodyLoadPromiseRef = useRef<Promise<unknown> | null>(null);
   const jmapBody = source === 'jmap' ? storeMessageBody : null;
   const message = {
     ...routeMessage,
@@ -364,8 +365,7 @@ export default function MessageScreen() {
       }
       void updateCachedEmail(targetMessage.id, optimisticPatch).catch(() => {});
 
-      appendReadDebugEvent(`mark-read sync deferred id=${targetMessage.id}`);
-      setTimeout(() => {
+      const runMarkReadSync = () => {
         const markReadTask = InteractionManager.runAfterInteractions(() => {
           setJmapEmailUnread(targetMessage.id, false)
             .then((result) => {
@@ -392,9 +392,23 @@ export default function MessageScreen() {
         });
 
         setTimeout(() => markReadTask.cancel(), 10000);
-      }, 500);
+      };
+      const bodyLoadPromise = targetMessage.id === messageId ? bodyLoadPromiseRef.current : null;
+
+      if (bodyLoadPromise) {
+        appendReadDebugEvent(`mark-read sync deferred until body id=${targetMessage.id}`);
+        void bodyLoadPromise
+          .finally(() => {
+            setTimeout(runMarkReadSync, 250);
+          })
+          .catch(() => {});
+        return;
+      }
+
+      appendReadDebugEvent(`mark-read sync deferred id=${targetMessage.id}`);
+      setTimeout(runMarkReadSync, 1500);
     },
-    [appendReadDebugEvent, dismissReadNotification, mailboxName, patchVisibleMessage, source],
+    [appendReadDebugEvent, dismissReadNotification, mailboxName, messageId, patchVisibleMessage, source],
   );
 
   useEffect(() => {
@@ -540,7 +554,10 @@ export default function MessageScreen() {
       });
 
     appendReadDebugEvent(`body fetch start id=${messageId}`);
-    void loadMessageBody(messageId, { refresh: true })
+    const bodyLoadPromise = loadMessageBody(messageId, { refresh: true });
+
+    bodyLoadPromiseRef.current = bodyLoadPromise;
+    void bodyLoadPromise
       .then((body) => {
         observeDuration('message.body.fetch', startedAt, {
           attachments: body?.attachments?.length ?? 0,
@@ -564,6 +581,11 @@ export default function MessageScreen() {
         appendReadDebugEvent(
           `body fetch failed id=${messageId} +${Date.now() - startedAt}ms error=${error instanceof Error ? error.message : String(error)}`,
         );
+      })
+      .finally(() => {
+        if (bodyLoadPromiseRef.current === bodyLoadPromise) {
+          bodyLoadPromiseRef.current = null;
+        }
       });
   }, [appendReadDebugEvent, applyMessageBody, messageId, source, messageBodyFetchRevision]);
   useEffect(() => {
