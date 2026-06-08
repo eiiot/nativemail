@@ -858,6 +858,7 @@ export async function probeFastmailJmapSession({
 
     observeDuration('jmap.session-probe.fetch.response', fetchStartedAt, {
         activeTransportRequestCount,
+        ...getResponseHeaderObservability(response),
         messageId: messageId ?? 'none',
         path,
         reason,
@@ -904,6 +905,237 @@ export async function probeFastmailJmapSession({
         reason,
         requestId,
         status: response.status,
+    })
+}
+
+export async function probeFastmailMessageMetadata({
+    messageId,
+    reason,
+}: {
+    messageId: string
+    reason: string
+}) {
+    const startedAt = Date.now()
+    const tokenStartedAt = Date.now()
+    const token = await getFastmailJmapToken()
+
+    observeDuration('jmap.metadata-probe.token', tokenStartedAt, {
+        hasToken: Boolean(token),
+        messageId,
+        reason,
+    })
+
+    if (!token) {
+        throw new FastmailJmapTokenMissingError()
+    }
+
+    const sessionRequestId = `metadata-session-${startedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const sessionUrl = getFastmailRequestUrl(
+        `https://${FASTMAIL_JMAP_HOSTNAME}/.well-known/jmap`
+    )
+    const sessionPath = getObservabilityPath(sessionUrl)
+    const sessionFetchStartedAt = Date.now()
+
+    observeEvent('jmap.metadata-probe.session.fetch.call', {
+        activeTransportRequestCount,
+        messageId,
+        path: sessionPath,
+        reason,
+        requestId: sessionRequestId,
+    })
+
+    let sessionResponse: Response
+
+    try {
+        sessionResponse = await fetch(sessionUrl, {
+            headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${token}`,
+            },
+            method: 'GET',
+        })
+    } catch (error: unknown) {
+        observeError('jmap.metadata-probe.session.fetch.failed', error, {
+            activeTransportRequestCount,
+            messageId,
+            path: sessionPath,
+            reason,
+            requestId: sessionRequestId,
+        })
+        throw error
+    }
+
+    observeDuration(
+        'jmap.metadata-probe.session.fetch.response',
+        sessionFetchStartedAt,
+        {
+            activeTransportRequestCount,
+            ...getResponseHeaderObservability(sessionResponse),
+            messageId,
+            path: sessionPath,
+            reason,
+            requestId: sessionRequestId,
+            status: sessionResponse.status,
+        }
+    )
+
+    const sessionTextStartedAt = Date.now()
+    const sessionText = await sessionResponse.text()
+
+    observeDuration('jmap.metadata-probe.session.text.success', sessionTextStartedAt, {
+        activeTransportRequestCount,
+        length: sessionText.length,
+        messageId,
+        path: sessionPath,
+        reason,
+        requestId: sessionRequestId,
+        status: sessionResponse.status,
+    })
+
+    if (!sessionResponse.ok) {
+        throw new Error(
+            `Fastmail metadata probe session failed with HTTP ${sessionResponse.status}`
+        )
+    }
+
+    const sessionParseStartedAt = Date.now()
+    const session = JSON.parse(sessionText) as {
+        apiUrl?: unknown
+        primaryAccounts?: unknown
+    }
+    const primaryAccounts =
+        session.primaryAccounts &&
+        typeof session.primaryAccounts === 'object' &&
+        !Array.isArray(session.primaryAccounts)
+            ? (session.primaryAccounts as Record<string, unknown>)
+            : {}
+    const accountId =
+        typeof primaryAccounts[EMAIL_CAPABILITY_URI] === 'string'
+            ? primaryAccounts[EMAIL_CAPABILITY_URI]
+            : null
+    const apiUrl = typeof session.apiUrl === 'string' ? session.apiUrl : null
+
+    observeDuration('jmap.metadata-probe.session.parse.success', sessionParseStartedAt, {
+        accountId: accountId ? 'present' : 'missing',
+        apiUrl: apiUrl ? 'present' : 'missing',
+        messageId,
+        reason,
+    })
+
+    if (!accountId || !apiUrl) {
+        throw new Error('Fastmail metadata probe session missing apiUrl or accountId')
+    }
+
+    const apiRequestId = `metadata-api-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const apiRequestUrl = getFastmailRequestUrl(apiUrl)
+    const apiPath = getObservabilityPath(apiRequestUrl)
+    const body = JSON.stringify({
+        using: [EMAIL_CAPABILITY_URI],
+        methodCalls: [
+            [
+                'Email/get',
+                {
+                    accountId,
+                    ids: [messageId],
+                    properties: emailMetadataProperties,
+                },
+                'metadata',
+            ],
+        ],
+    })
+    const apiFetchStartedAt = Date.now()
+
+    observeEvent('jmap.metadata-probe.api.fetch.call', {
+        activeTransportRequestCount,
+        bodyLength: body.length,
+        messageId,
+        path: apiPath,
+        reason,
+        requestId: apiRequestId,
+    })
+
+    let apiResponse: Response
+
+    try {
+        apiResponse = await fetch(apiRequestUrl, {
+            body,
+            headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+            },
+            method: 'POST',
+        })
+    } catch (error: unknown) {
+        observeError('jmap.metadata-probe.api.fetch.failed', error, {
+            activeTransportRequestCount,
+            bodyLength: body.length,
+            messageId,
+            path: apiPath,
+            reason,
+            requestId: apiRequestId,
+        })
+        throw error
+    }
+
+    observeDuration('jmap.metadata-probe.api.fetch.response', apiFetchStartedAt, {
+        activeTransportRequestCount,
+        bodyLength: body.length,
+        ...getResponseHeaderObservability(apiResponse),
+        messageId,
+        path: apiPath,
+        reason,
+        requestId: apiRequestId,
+        status: apiResponse.status,
+    })
+
+    const apiTextStartedAt = Date.now()
+    const apiText = await apiResponse.text()
+
+    observeDuration('jmap.metadata-probe.api.text.success', apiTextStartedAt, {
+        activeTransportRequestCount,
+        length: apiText.length,
+        messageId,
+        path: apiPath,
+        reason,
+        requestId: apiRequestId,
+        status: apiResponse.status,
+    })
+
+    if (!apiResponse.ok) {
+        throw new Error(`Fastmail metadata probe API failed with HTTP ${apiResponse.status}`)
+    }
+
+    const apiParseStartedAt = Date.now()
+    const apiJson = JSON.parse(apiText) as { methodResponses?: unknown }
+    const methodResponses = Array.isArray(apiJson.methodResponses)
+        ? apiJson.methodResponses
+        : []
+    const firstResponse = methodResponses[0]
+    const firstArgs =
+        Array.isArray(firstResponse) &&
+        firstResponse[1] &&
+        typeof firstResponse[1] === 'object' &&
+        !Array.isArray(firstResponse[1])
+            ? (firstResponse[1] as { list?: unknown })
+            : null
+    const found =
+        firstArgs && Array.isArray(firstArgs.list) ? firstArgs.list.length > 0 : null
+
+    observeDuration('jmap.metadata-probe.api.parse.success', apiParseStartedAt, {
+        found,
+        length: apiText.length,
+        messageId,
+        methodResponses: methodResponses.length,
+        reason,
+    })
+
+    observeDuration('jmap.metadata-probe.success', startedAt, {
+        found,
+        length: apiText.length,
+        messageId,
+        methodResponses: methodResponses.length,
+        reason,
     })
 }
 
@@ -1057,6 +1289,7 @@ function createBearerTransport(token: string, operation?: string): Transport {
         observeDuration('jmap.transport.fetch.response', fetchStartedAt, {
             activeAtFetchStart,
             activeTransportRequestCount,
+            ...getResponseHeaderObservability(response),
             ...requestDetails,
             method,
             operation: operation ?? 'unknown',
@@ -1185,6 +1418,15 @@ function getObservabilityPath(url: string) {
         return parsed.pathname
     } catch {
         return 'unknown'
+    }
+}
+
+function getResponseHeaderObservability(response: Response) {
+    return {
+        contentLengthHeader: response.headers.get('content-length'),
+        contentTypeHeader: response.headers.get('content-type'),
+        dateHeader: response.headers.get('date'),
+        serverHeader: response.headers.get('server'),
     }
 }
 

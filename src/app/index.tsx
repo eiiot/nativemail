@@ -915,6 +915,7 @@ export default function InboxScreen() {
       void prefetchMessageBodies(batch, {
         concurrency: 1,
         limit: batch.length,
+        source: 'inbox-body-warm',
       })
         .then((result) => {
           if (cancelled) {
