@@ -8,7 +8,6 @@ import {
   type CachedInboxStateMessageInput,
 } from '@/lib/mail-cache';
 import { hydrateMailboxSnapshotFromCache } from '@/lib/mail-store';
-import { syncInboxMetadataFromServer } from '@/lib/inbox-metadata-sync';
 import { flushObservabilityEvents, observeDuration, observeError, observeEvent } from '@/lib/observability';
 import * as Notifications from 'expo-notifications';
 
@@ -157,15 +156,6 @@ async function handleInboxNotificationPayloadNow(payload: Record<string, unknown
   if (typeof inboxMessage.inboxUnreadEmails === 'number') {
     await setInboxUnreadBadgeCount(inboxMessage.inboxUnreadEmails);
   }
-
-  await syncInboxMetadataFromServer({
-    reason: 'notification-background-message',
-  }).catch((error: unknown) => {
-    observeError('notification.background.metadata-sync.failed', error, {
-      mailboxId: inboxMessage.mailboxId,
-      messageId: inboxMessage.messageId,
-    });
-  });
 
   observeDuration('notification.background.message.success', startedAt, {
     mailboxId: inboxMessage.mailboxId,

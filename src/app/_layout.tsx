@@ -3,7 +3,6 @@ import {
   handleInboxNotificationPayload,
   registerInboxNotificationBackgroundTask,
 } from '@/lib/notification-background-task';
-import { syncInboxMetadataFromServer } from '@/lib/inbox-metadata-sync';
 import {
   archiveInboxNotificationResponse,
   getNotificationMessageRoute,
@@ -87,7 +86,6 @@ export default function RootLayout() {
 
   useEffect(() => {
     void hydrateMailboxSnapshotFromCache().catch(() => {});
-    void syncInboxMetadataFromServer({ reason: 'app-start' }).catch(() => {});
   }, []);
   useEffect(() => {
     void registerInboxNotificationBackgroundTask().catch(() => {});
@@ -100,7 +98,6 @@ export default function RootLayout() {
       const data = notification.request.content.data ?? null;
 
       void handleInboxNotificationPayload(data).catch(() => {});
-      void syncInboxMetadataFromServer({ reason: 'notification-received' }).catch(() => {});
     });
 
     return () => {
@@ -112,7 +109,6 @@ export default function RootLayout() {
     const syncNotificationState = (signal?: AbortSignal) => {
       void syncInboxUnreadBadgeCount(signal).catch(() => {});
       void syncPresentedInboxNotifications(signal).catch(() => {});
-      void syncInboxMetadataFromServer({ reason: 'app-active', signal }).catch(() => {});
     };
     const handleAppStateChange = (nextState: AppStateStatus) => {
       if (nextState === 'active') {
@@ -142,7 +138,6 @@ export default function RootLayout() {
       if (route) {
         Notifications.clearLastNotificationResponse();
         void handleInboxNotificationPayload(data ?? null).catch(() => {});
-        void syncInboxMetadataFromServer({ reason: 'notification-response' }).catch(() => {});
         router.push(route);
       }
     };
