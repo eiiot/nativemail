@@ -29,15 +29,15 @@ import {
 } from '@/lib/mail-store';
 import { useDebugMode } from '@/lib/debug-mode';
 import {
-  archiveJmapEmailWithMailboxState,
   describeJmapError,
   fetchJmapMailboxSnapshot,
-  setJmapEmailPinned,
-  setJmapEmailUnread,
-  trashJmapEmailWithMailboxState,
-  unarchiveJmapEmailWithMailboxState,
   type JmapMailboxSnapshot,
 } from '@/lib/jmap-client';
+import {
+  enqueueMailMutation,
+  isMailMutationQueueDirty,
+  waitForMailMutationQueueIdle,
+} from '@/lib/mail-sync';
 import {
   getNavigationDebugReport,
   markNavigationTrace,
@@ -384,37 +384,22 @@ export default function InboxScreen() {
         const mutation = new Promise<void>((resolve, reject) => {
           const mutationStartedAt = Date.now();
 
-          InteractionManager.runAfterInteractions(() => {
-            observeEvent('inbox.swipe.mutation.start', swipeProperties);
-            const request =
-              action === 'archive'
-                ? archiveJmapEmailWithMailboxState({
-                    mailboxIds: item.mailboxIds,
-                    mailboxes: snapshot?.mailboxes,
-                    messageId: item.id,
-                  })
-                : action === 'unarchive'
-                  ? unarchiveJmapEmailWithMailboxState({
-                      mailboxIds: item.mailboxIds,
-                      mailboxes: snapshot?.mailboxes,
-                      messageId: item.id,
-                    })
-                  : trashJmapEmailWithMailboxState({
-                      mailboxIds: item.mailboxIds,
-                      mailboxes: snapshot?.mailboxes,
-                      messageId: item.id,
-                    });
-
-            request
-              .then(() => {
-                observeDuration('inbox.swipe.mutation.success', mutationStartedAt, swipeProperties);
-                resolve();
-              })
-              .catch((error: unknown) => {
-                observeError('inbox.swipe.mutation.failed', error, swipeProperties);
-                reject(error);
-              });
-          });
+          observeEvent('inbox.swipe.mutation.start', swipeProperties);
+          enqueueMailMutation({
+            mailboxIds: item.mailboxIds,
+            mailboxes: snapshot?.mailboxes,
+            messageId: item.id,
+            role: action === 'archive' ? 'archive' : action === 'unarchive' ? 'inbox' : 'trash',
+            type: 'move-to-role',
+          })
+            .then(() => {
+              observeDuration('inbox.swipe.mutation.success', mutationStartedAt, swipeProperties);
+              resolve();
+            })
+            .catch((error: unknown) => {
+              observeError('inbox.swipe.mutation.failed', error, swipeProperties);
+              reject(error);
+            });
         });
 
         Promise.all([removalDelay, mutation])
@@ -460,7 +445,12 @@ export default function InboxScreen() {
         patchStoreMessage(item.id, optimisticPatch);
         void updateCachedEmail(item.id, optimisticPatch).catch(() => {});
 
-        setJmapEmailPinned(item.id, nextPinned)
+        enqueueMailMutation({
+          currentKeywords: item.keywords,
+          flagged: nextPinned,
+          messageId: item.id,
+          type: 'set-flagged',
+        })
           .then(() => {
             observeDuration('inbox.action.toggle-pin.success', actionStartedAt, {
               messageId: item.id,
@@ -500,7 +490,12 @@ export default function InboxScreen() {
         void dismissInboxNotificationForMessage(item.id).catch(() => {});
       }
 
-      setJmapEmailUnread(item.id, nextUnread)
+      enqueueMailMutation({
+        currentKeywords: item.keywords,
+        messageId: item.id,
+        seen: !nextUnread,
+        type: 'set-seen',
+      })
         .then(() => {
           observeDuration('inbox.action.toggle-unread.success', actionStartedAt, {
             messageId: item.id,
@@ -547,6 +542,28 @@ export default function InboxScreen() {
       signal?: AbortSignal;
       tracePrefix: string;
     }) => {
+      const refreshWaitStartedAt = Date.now();
+
+      if (isMailMutationQueueDirty()) {
+        observeEvent('mailbox.refresh.wait-for-mail-sync.start', {
+          apply,
+          limit,
+          mailboxId: mailboxId ?? 'inbox',
+          position,
+          tracePrefix,
+        });
+        const didBecomeIdle = await waitForMailMutationQueueIdle();
+
+        observeDuration('mailbox.refresh.wait-for-mail-sync.finished', refreshWaitStartedAt, {
+          apply,
+          didBecomeIdle,
+          limit,
+          mailboxId: mailboxId ?? 'inbox',
+          position,
+          tracePrefix,
+        });
+      }
+
       const refreshStartedAt = Date.now();
 
       markNavigationTrace(`${tracePrefix} start`, `position=${position} limit=${limit}`);

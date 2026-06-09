@@ -6,14 +6,12 @@ import {
 } from '@/components/attachment-thumbnail-view';
 import { saveComposeDraft } from '@/lib/compose-drafts';
 import {
-  archiveJmapEmail,
   fetchJmapThreadMessages,
-  setJmapEmailPinned,
-  setJmapEmailUnread,
-  trashJmapEmail,
+  type JmapMailbox,
   type JmapMessageBodyDebug,
   type JmapMessageActionResult,
 } from '@/lib/jmap-client';
+import { enqueueMailMutation } from '@/lib/mail-sync';
 import { removeCachedEmailFromMailbox, updateCachedEmail } from '@/lib/mail-cache';
 import { useDebugMode } from '@/lib/debug-mode';
 import {
@@ -367,7 +365,12 @@ export default function MessageScreen() {
 
       const runMarkReadSync = () => {
         const markReadTask = InteractionManager.runAfterInteractions(() => {
-          setJmapEmailUnread(targetMessage.id, false)
+          enqueueMailMutation({
+            currentKeywords: targetMessage.keywords,
+            messageId: targetMessage.id,
+            seen: true,
+            type: 'set-seen',
+          })
             .then((result) => {
               appendReadDebugEvent(
                 `mark-read success id=${targetMessage.id} unread=${result.unread === true ? '1' : '0'} seen=${result.keywords?.$seen === true ? '1' : '0'}`,
@@ -669,7 +672,7 @@ export default function MessageScreen() {
       }
       router.back();
 
-      getMessageActionRequest(action, targetMessage.id, targetMessage)
+      getMessageActionRequest(action, targetMessage.id, targetMessage, previousSnapshot?.mailboxes)
         .then(() => {
           observeDuration('message.action.optimistic-exit.success', actionStartedAt, actionProperties);
           removeStoreMessageFromMailbox(targetMessage.id, actionMailboxId);
@@ -1650,16 +1653,39 @@ function getMessageActionRequest(
   action: MessageAction,
   messageId: string,
   message: Message,
+  mailboxes?: JmapMailbox[] | null,
 ): Promise<JmapMessageActionResult> {
   switch (action) {
     case 'archive':
-      return archiveJmapEmail(messageId);
+      return enqueueMailMutation({
+        mailboxIds: message.mailboxIds,
+        mailboxes,
+        messageId,
+        role: 'archive',
+        type: 'move-to-role',
+      });
     case 'toggle-pin':
-      return setJmapEmailPinned(messageId, !message.pinned);
+      return enqueueMailMutation({
+        currentKeywords: message.keywords,
+        flagged: !message.pinned,
+        messageId,
+        type: 'set-flagged',
+      });
     case 'toggle-unread':
-      return setJmapEmailUnread(messageId, !message.unread);
+      return enqueueMailMutation({
+        currentKeywords: message.keywords,
+        messageId,
+        seen: Boolean(message.unread),
+        type: 'set-seen',
+      });
     case 'trash':
-      return trashJmapEmail(messageId);
+      return enqueueMailMutation({
+        mailboxIds: message.mailboxIds,
+        mailboxes,
+        messageId,
+        role: 'trash',
+        type: 'move-to-role',
+      });
     case 'reply':
     case 'reply-all':
       return Promise.resolve({});

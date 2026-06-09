@@ -178,6 +178,18 @@ export type JmapMessageActionResult = {
     unread?: boolean
 }
 
+export type JmapEmailSetPatch = PatchObject
+
+export type JmapEmailSetNotUpdated = {
+    description?: string
+    type?: string
+}
+
+export type JmapEmailSetBatchResult = {
+    notUpdated: Record<string, JmapEmailSetNotUpdated>
+    updatedIds: string[]
+}
+
 export type JmapMessageNotificationState = {
     exists: boolean
     id: string
@@ -729,6 +741,53 @@ export async function setJmapEmailUnread(
     signal?: AbortSignal
 ): Promise<JmapMessageActionResult> {
     return updateJmapEmailKeywords(messageId, '$seen', !unread, signal)
+}
+
+export async function applyJmapEmailSetBatch(
+    updates: Record<string, JmapEmailSetPatch>,
+    signal?: AbortSignal
+): Promise<JmapEmailSetBatchResult> {
+    const { accountId, client } = await createFastmailJmapClient(signal)
+
+    try {
+        return updateEmails(client, accountId, updates, signal)
+    } finally {
+        await releaseFastmailJmapClient(client)
+    }
+}
+
+export function getJmapMailboxIdsForRole({
+    currentMailboxIds,
+    mailboxes,
+    role,
+}: {
+    currentMailboxIds?: Record<string, true> | null
+    mailboxes?: JmapMailbox[] | null
+    role: 'archive' | 'inbox' | 'trash'
+}): Record<string, true> | null {
+    const targetMailbox = mailboxes?.length ? findMailboxByRole(mailboxes, role) : null
+
+    if (!targetMailbox || (!currentMailboxIds && role !== 'trash')) {
+        return null
+    }
+
+    if (role === 'trash') {
+        return { [targetMailbox.id]: true as true }
+    }
+
+    if (role === 'inbox') {
+        return getUnarchivedMailboxIds(
+            currentMailboxIds ?? {},
+            mailboxes ?? [],
+            targetMailbox.id
+        )
+    }
+
+    return getArchivedMailboxIds(
+        currentMailboxIds ?? {},
+        mailboxes ?? [],
+        targetMailbox.id
+    )
 }
 
 export async function diagnoseFastmailJmap(
@@ -2225,9 +2284,13 @@ async function moveJmapEmailToRoleWithMailboxState({
     role: 'archive' | 'inbox' | 'trash'
 }): Promise<JmapMessageActionResult> {
     const startedAt = Date.now()
-    const targetMailbox = mailboxes?.length ? findMailboxByRole(mailboxes, role) : null
+    const nextMailboxIds = getJmapMailboxIdsForRole({
+        currentMailboxIds,
+        mailboxes,
+        role,
+    })
 
-    if (!targetMailbox || (!currentMailboxIds && role !== 'trash')) {
+    if (!nextMailboxIds) {
         observeEvent('jmap.message.move-known-state.fallback', {
             hasCurrentMailboxIds: Boolean(currentMailboxIds),
             mailboxCount: mailboxes?.length ?? 0,
@@ -2236,21 +2299,6 @@ async function moveJmapEmailToRoleWithMailboxState({
         })
         return moveJmapEmailToRole(messageId, role, signal)
     }
-
-    const nextMailboxIds =
-        role === 'trash'
-            ? { [targetMailbox.id]: true as true }
-            : role === 'inbox'
-              ? getUnarchivedMailboxIds(
-                    currentMailboxIds ?? {},
-                    mailboxes ?? [],
-                    targetMailbox.id
-                )
-              : getArchivedMailboxIds(
-                    currentMailboxIds ?? {},
-                    mailboxes ?? [],
-                    targetMailbox.id
-                )
 
     observeEvent('jmap.message.move-known-state.start', {
         mailboxCount: Object.keys(nextMailboxIds).length,
@@ -2376,13 +2424,34 @@ async function updateEmail(
     patch: PatchObject,
     signal?: AbortSignal
 ) {
+    const result = await updateEmails(
+        client,
+        accountId,
+        { [messageId]: patch },
+        signal
+    )
+    const error = result.notUpdated[messageId]
+
+    if (error) {
+        throw createEmailSetNotUpdatedError(error)
+    }
+}
+
+async function updateEmails(
+    client: JMAPClient,
+    accountId: Id,
+    updates: Record<string, PatchObject>,
+    signal?: AbortSignal
+): Promise<JmapEmailSetBatchResult> {
     const queuedAt = Date.now()
+    const messageIds = Object.keys(updates)
     const queued = emailSetQueue.catch(() => undefined).then(async () => {
         observeDuration('jmap.email-set.queue.wait', queuedAt, {
-            messageId,
+            messageCount: messageIds.length,
+            messageIds: formatDebugIdList(messageIds),
         })
 
-        return updateEmailWithRetry(client, accountId, messageId, patch, signal)
+        return updateEmailsWithRetry(client, accountId, updates, signal)
     })
 
     emailSetQueue = queued.then(() => undefined, () => undefined)
@@ -2390,34 +2459,37 @@ async function updateEmail(
     return queued
 }
 
-async function updateEmailWithRetry(
+async function updateEmailsWithRetry(
     client: JMAPClient,
     accountId: Id,
-    messageId: Id,
-    patch: PatchObject,
+    updates: Record<string, PatchObject>,
     signal?: AbortSignal
-) {
+): Promise<JmapEmailSetBatchResult> {
+    const messageIds = Object.keys(updates)
+
     for (let attempt = 1; attempt <= EMAIL_SET_MAX_ATTEMPTS; attempt += 1) {
         try {
             if (attempt > 1) {
                 observeEvent('jmap.email-set.retry.start', {
                     attempt,
                     maxAttempts: EMAIL_SET_MAX_ATTEMPTS,
-                    messageId,
+                    messageCount: messageIds.length,
+                    messageIds: formatDebugIdList(messageIds),
                 })
             }
 
-            await updateEmailOnce(client, accountId, messageId, patch, signal)
+            const result = await updateEmailsOnce(client, accountId, updates, signal)
 
             if (attempt > 1) {
                 observeEvent('jmap.email-set.retry.success', {
                     attempt,
                     maxAttempts: EMAIL_SET_MAX_ATTEMPTS,
-                    messageId,
+                    messageCount: messageIds.length,
+                    messageIds: formatDebugIdList(messageIds),
                 })
             }
 
-            return
+            return result
         } catch (error: unknown) {
             const canRetry =
                 attempt < EMAIL_SET_MAX_ATTEMPTS &&
@@ -2428,7 +2500,8 @@ async function updateEmailWithRetry(
             observeError('jmap.email-set.attempt.failed', error, {
                 attempt,
                 canRetry,
-                messageId,
+                messageCount: messageIds.length,
+                messageIds: formatDebugIdList(messageIds),
             })
 
             if (!canRetry) {
@@ -2443,33 +2516,37 @@ async function updateEmailWithRetry(
             observeEvent('jmap.email-set.retry.scheduled', {
                 attempt: attempt + 1,
                 delayMs,
-                messageId,
+                messageCount: messageIds.length,
+                messageIds: formatDebugIdList(messageIds),
             })
 
             await delay(delayMs, signal)
         }
     }
+
+    return { notUpdated: {}, updatedIds: [] }
 }
 
-async function updateEmailOnce(
+async function updateEmailsOnce(
     client: JMAPClient,
     accountId: Id,
-    messageId: Id,
-    patch: PatchObject,
+    updates: Record<string, PatchObject>,
     signal?: AbortSignal
-) {
+): Promise<JmapEmailSetBatchResult> {
     const response = await client
         .createRequestBuilder()
         .add(
             Email.request.set({
                 accountId,
-                update: {
-                    [messageId]: patch,
-                },
+                update: updates,
             })
         )
         .send(signal)
     let didReceiveSetResponse = false
+    let result: JmapEmailSetBatchResult = {
+        notUpdated: {},
+        updatedIds: [],
+    }
 
     for (const invocation of response.methodResponses) {
         if (isErrorInvocation(invocation)) {
@@ -2488,20 +2565,32 @@ async function updateEmailOnce(
             | Record<string, { description?: string; type?: string }>
             | null
             | undefined
-        const error = notUpdated?.[messageId]
+        const updated = invocation.getArgument('updated') as
+            | Record<string, unknown>
+            | null
+            | undefined
 
-        if (error) {
-            const detail = error.description ? `: ${error.description}` : ''
-
-            throw new Error(
-                `JMAP Email/set ${error.type ?? 'notUpdated'}${detail}`
-            )
+        result = {
+            notUpdated: notUpdated ?? {},
+            updatedIds: Object.keys(updated ?? {}),
         }
     }
 
     if (!didReceiveSetResponse) {
         throw new Error('JMAP Email/set did not return a response.')
     }
+
+    return result
+}
+
+function createEmailSetNotUpdatedError(error: JmapEmailSetNotUpdated) {
+    const detail = error.description ? `: ${error.description}` : ''
+
+    return new Error(`JMAP Email/set ${error.type ?? 'notUpdated'}${detail}`)
+}
+
+function formatDebugIdList(ids: string[]) {
+    return ids.slice(0, 10).join(',')
 }
 
 function isAbortError(error: unknown) {
