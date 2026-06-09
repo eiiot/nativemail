@@ -21,6 +21,7 @@ type MessagePatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 
 const LOCAL_ACTION_REFRESH_SUPPRESSION_MS = 8000;
 const SLOW_FOREGROUND_BODY_FETCH_MS = 1000;
+const BACKGROUND_MESSAGE_BODY_NETWORK_FETCHES_ENABLED = false;
 
 type MessageBodyFetchPriority = 'background' | 'foreground';
 
@@ -375,6 +376,21 @@ export async function loadMessageBody(
     priority,
     refresh,
   });
+
+  if (priority === 'background' && !BACKGROUND_MESSAGE_BODY_NETWORK_FETCHES_ENABLED) {
+    const cachedOrMemoryBody = await hydrateMessageBodyFromCache(messageId);
+
+    observeEvent('mail.body.fetch.background-network-disabled', {
+      ...getMessageBodyFetchCounts(),
+      hasBody: Boolean(cachedOrMemoryBody),
+      html: cachedOrMemoryBody?.html?.trim() ? cachedOrMemoryBody.html.length : 0,
+      messageId,
+      refresh,
+      text: cachedOrMemoryBody?.text?.trim() ? cachedOrMemoryBody.text.length : 0,
+    });
+
+    return cachedOrMemoryBody;
+  }
 
   if (!refresh) {
     const cachedOrMemoryBody = await hydrateMessageBodyFromCache(messageId);
