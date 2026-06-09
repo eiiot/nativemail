@@ -22,6 +22,8 @@ type MessagePatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 const LOCAL_ACTION_REFRESH_SUPPRESSION_MS = 8000;
 const SLOW_FOREGROUND_BODY_FETCH_MS = 1000;
 const BACKGROUND_MESSAGE_BODY_NETWORK_FETCHES_ENABLED = false;
+const FOREGROUND_MESSAGE_BODY_FETCH_MAX_ATTEMPTS = 3;
+const FOREGROUND_MESSAGE_BODY_FETCH_RETRY_DELAYS_MS = [120, 350];
 
 type MessageBodyFetchPriority = 'background' | 'foreground';
 
@@ -153,6 +155,143 @@ function clearForegroundBodySlowProbe(messageId: string) {
 
   clearTimeout(timer);
   foregroundSlowProbeTimers.delete(messageId);
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isAbortError(error: unknown) {
+  if (error instanceof Error) {
+    return error.name === 'AbortError';
+  }
+
+  return false;
+}
+
+function isRetriableMessageBodyFetchError(error: unknown) {
+  const message = getErrorMessage(error).toLowerCase();
+
+  return (
+    message.includes('network connection was lost') ||
+    message.includes('network request failed') ||
+    message.includes('fetch failed') ||
+    message.includes('timed out') ||
+    message.includes('the request timed out') ||
+    message.includes('offline') ||
+    message.includes('connection reset') ||
+    message.includes('connection closed')
+  );
+}
+
+function createBodyFetchRetryAbortError() {
+  const error = new Error('Body fetch retry aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+function delayMessageBodyRetry(delayMs: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(createBodyFetchRetryAbortError());
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, delayMs);
+
+    const onAbort = () => {
+      clearTimeout(timeout);
+      reject(createBodyFetchRetryAbortError());
+    };
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function fetchJmapMessageBodyWithRetry({
+  messageId,
+  priority,
+  signal,
+}: {
+  messageId: string;
+  priority: MessageBodyFetchPriority;
+  signal?: AbortSignal;
+}) {
+  const maxAttempts = priority === 'foreground' ? FOREGROUND_MESSAGE_BODY_FETCH_MAX_ATTEMPTS : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const attemptStartedAt = Date.now();
+
+    try {
+      if (attempt > 1) {
+        observeEvent('mail.body.fetch.retry.start', {
+          ...getMessageBodyFetchCounts(),
+          attempt,
+          maxAttempts,
+          messageId,
+          priority,
+        });
+      }
+
+      const body = await fetchJmapMessageBody({
+        inlineCidImageData: false,
+        messageId,
+        signal,
+      });
+
+      if (attempt > 1) {
+        observeDuration('mail.body.fetch.retry.success', attemptStartedAt, {
+          attempt,
+          hasBody: Boolean(body),
+          html: body?.html?.trim() ? body.html.length : 0,
+          maxAttempts,
+          messageId,
+          priority,
+          text: body?.text?.trim() ? body.text.length : 0,
+        });
+      }
+
+      return body;
+    } catch (error: unknown) {
+      const canRetry =
+        attempt < maxAttempts &&
+        !signal?.aborted &&
+        !isAbortError(error) &&
+        isRetriableMessageBodyFetchError(error);
+
+      observeError('mail.body.fetch.attempt.failed', error, {
+        ...getMessageBodyFetchCounts(),
+        attempt,
+        canRetry,
+        messageId,
+        priority,
+      });
+
+      if (!canRetry) {
+        throw error;
+      }
+
+      const delayMs =
+        FOREGROUND_MESSAGE_BODY_FETCH_RETRY_DELAYS_MS[
+          Math.min(attempt - 1, FOREGROUND_MESSAGE_BODY_FETCH_RETRY_DELAYS_MS.length - 1)
+        ] ?? 0;
+
+      observeEvent('mail.body.fetch.retry.scheduled', {
+        ...getMessageBodyFetchCounts(),
+        attempt: attempt + 1,
+        delayMs,
+        messageId,
+        priority,
+      });
+
+      await delayMessageBodyRetry(delayMs, signal);
+    }
+  }
+
+  return null;
 }
 
 type MailStoreState = {
@@ -493,9 +632,9 @@ export async function loadMessageBody(
     refresh,
   });
 
-  const fetchPromise = fetchJmapMessageBody({
-    inlineCidImageData: false,
+  const fetchPromise = fetchJmapMessageBodyWithRetry({
     messageId,
+    priority,
     signal: controller.signal,
   })
     .then(async (body) => {
