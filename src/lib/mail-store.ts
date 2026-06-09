@@ -8,6 +8,7 @@ import {
 import {
   fetchJmapMessageBody,
   probeFastmailMessageMetadata,
+  probeFastmailMessageBodyRaw,
   probeFastmailJmapSession,
   type JmapMailboxSnapshot,
   type JmapMessageBody,
@@ -117,6 +118,19 @@ function armForegroundBodySlowProbe({
       reason: `body-slow:${reason}`,
     }).catch((error: unknown) => {
       observeError('mail.body.fetch.foreground-slow.metadata-probe.failed', error, {
+        ...getMessageBodyFetchCounts(),
+        durationMs: Math.max(0, Date.now() - startedAt),
+        messageId,
+        reason,
+        refresh,
+      });
+    });
+
+    void probeFastmailMessageBodyRaw({
+      messageId,
+      reason: `body-slow:${reason}`,
+    }).catch((error: unknown) => {
+      observeError('mail.body.fetch.foreground-slow.raw-body-probe.failed', error, {
         ...getMessageBodyFetchCounts(),
         durationMs: Math.max(0, Date.now() - startedAt),
         messageId,
