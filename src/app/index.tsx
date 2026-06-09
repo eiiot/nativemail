@@ -29,13 +29,13 @@ import {
 } from '@/lib/mail-store';
 import { useDebugMode } from '@/lib/debug-mode';
 import {
-  archiveJmapEmail,
+  archiveJmapEmailWithMailboxState,
   describeJmapError,
   fetchJmapMailboxSnapshot,
   setJmapEmailPinned,
   setJmapEmailUnread,
-  trashJmapEmail,
-  unarchiveJmapEmail,
+  trashJmapEmailWithMailboxState,
+  unarchiveJmapEmailWithMailboxState,
   type JmapMailboxSnapshot,
 } from '@/lib/jmap-client';
 import {
@@ -388,10 +388,22 @@ export default function InboxScreen() {
             observeEvent('inbox.swipe.mutation.start', swipeProperties);
             const request =
               action === 'archive'
-                ? archiveJmapEmail(item.id)
+                ? archiveJmapEmailWithMailboxState({
+                    mailboxIds: item.mailboxIds,
+                    mailboxes: snapshot?.mailboxes,
+                    messageId: item.id,
+                  })
                 : action === 'unarchive'
-                  ? unarchiveJmapEmail(item.id)
-                  : trashJmapEmail(item.id);
+                  ? unarchiveJmapEmailWithMailboxState({
+                      mailboxIds: item.mailboxIds,
+                      mailboxes: snapshot?.mailboxes,
+                      messageId: item.id,
+                    })
+                  : trashJmapEmailWithMailboxState({
+                      mailboxIds: item.mailboxIds,
+                      mailboxes: snapshot?.mailboxes,
+                      messageId: item.id,
+                    });
 
             request
               .then(() => {

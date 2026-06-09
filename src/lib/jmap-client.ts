@@ -29,6 +29,8 @@ import {
 const FASTMAIL_JMAP_HOSTNAME = 'api.fastmail.com'
 const DEFAULT_MESSAGE_LIMIT = 50
 const MAX_ATTACHMENT_PREVIEW_BYTES = 10 * 1024 * 1024
+const EMAIL_SET_MAX_ATTEMPTS = 3
+const EMAIL_SET_RETRY_DELAYS_MS = [160, 500]
 
 const mailboxProperties = [
     'id',
@@ -184,6 +186,15 @@ export type JmapMessageNotificationState = {
     mailboxIds: Record<string, true>
     unread: boolean
 }
+
+export type JmapKnownMailboxStateInput = {
+    mailboxIds?: Record<string, true> | null
+    mailboxes?: JmapMailbox[] | null
+    messageId: string
+    signal?: AbortSignal
+}
+
+let emailSetQueue: Promise<void> = Promise.resolve()
 
 export class FastmailJmapTokenMissingError extends Error {
     constructor() {
@@ -645,6 +656,21 @@ export async function archiveJmapEmail(
     return moveJmapEmailToRole(messageId, 'archive', signal)
 }
 
+export async function archiveJmapEmailWithMailboxState({
+    mailboxIds,
+    mailboxes,
+    messageId,
+    signal,
+}: JmapKnownMailboxStateInput): Promise<JmapMessageActionResult> {
+    return moveJmapEmailToRoleWithMailboxState({
+        mailboxIds,
+        mailboxes,
+        messageId,
+        role: 'archive',
+        signal,
+    })
+}
+
 export async function unarchiveJmapEmail(
     messageId: string,
     signal?: AbortSignal
@@ -652,11 +678,41 @@ export async function unarchiveJmapEmail(
     return moveJmapEmailToRole(messageId, 'inbox', signal)
 }
 
+export async function unarchiveJmapEmailWithMailboxState({
+    mailboxIds,
+    mailboxes,
+    messageId,
+    signal,
+}: JmapKnownMailboxStateInput): Promise<JmapMessageActionResult> {
+    return moveJmapEmailToRoleWithMailboxState({
+        mailboxIds,
+        mailboxes,
+        messageId,
+        role: 'inbox',
+        signal,
+    })
+}
+
 export async function trashJmapEmail(
     messageId: string,
     signal?: AbortSignal
 ): Promise<JmapMessageActionResult> {
     return moveJmapEmailToRole(messageId, 'trash', signal)
+}
+
+export async function trashJmapEmailWithMailboxState({
+    mailboxIds,
+    mailboxes,
+    messageId,
+    signal,
+}: JmapKnownMailboxStateInput): Promise<JmapMessageActionResult> {
+    return moveJmapEmailToRoleWithMailboxState({
+        mailboxIds,
+        mailboxes,
+        messageId,
+        role: 'trash',
+        signal,
+    })
 }
 
 export async function setJmapEmailPinned(
@@ -2159,6 +2215,72 @@ async function moveJmapEmailToRole(
     }
 }
 
+async function moveJmapEmailToRoleWithMailboxState({
+    mailboxIds: currentMailboxIds,
+    mailboxes,
+    messageId,
+    role,
+    signal,
+}: JmapKnownMailboxStateInput & {
+    role: 'archive' | 'inbox' | 'trash'
+}): Promise<JmapMessageActionResult> {
+    const startedAt = Date.now()
+    const targetMailbox = mailboxes?.length ? findMailboxByRole(mailboxes, role) : null
+
+    if (!targetMailbox || (!currentMailboxIds && role !== 'trash')) {
+        observeEvent('jmap.message.move-known-state.fallback', {
+            hasCurrentMailboxIds: Boolean(currentMailboxIds),
+            mailboxCount: mailboxes?.length ?? 0,
+            messageId,
+            role,
+        })
+        return moveJmapEmailToRole(messageId, role, signal)
+    }
+
+    const nextMailboxIds =
+        role === 'trash'
+            ? { [targetMailbox.id]: true as true }
+            : role === 'inbox'
+              ? getUnarchivedMailboxIds(
+                    currentMailboxIds ?? {},
+                    mailboxes ?? [],
+                    targetMailbox.id
+                )
+              : getArchivedMailboxIds(
+                    currentMailboxIds ?? {},
+                    mailboxes ?? [],
+                    targetMailbox.id
+                )
+
+    observeEvent('jmap.message.move-known-state.start', {
+        mailboxCount: Object.keys(nextMailboxIds).length,
+        messageId,
+        role,
+    })
+
+    const { accountId, client } = await createFastmailJmapClient(signal)
+
+    try {
+        await updateEmail(client, accountId, messageId, { mailboxIds: nextMailboxIds }, signal)
+
+        observeDuration('jmap.message.move-known-state.success', startedAt, {
+            mailboxCount: Object.keys(nextMailboxIds).length,
+            messageId,
+            role,
+        })
+
+        return { mailboxIds: nextMailboxIds }
+    } catch (error: unknown) {
+        observeError('jmap.message.move-known-state.failed', error, {
+            messageId,
+            role,
+        })
+        throw error
+    } finally {
+        await releaseFastmailJmapClient(client)
+    }
+}
+
 async function updateJmapEmailKeywords(
     messageId: string,
     keyword: '$flagged' | '$seen',
@@ -2254,6 +2376,88 @@ async function updateEmail(
     patch: PatchObject,
     signal?: AbortSignal
 ) {
+    const queuedAt = Date.now()
+    const queued = emailSetQueue.catch(() => undefined).then(async () => {
+        observeDuration('jmap.email-set.queue.wait', queuedAt, {
+            messageId,
+        })
+
+        return updateEmailWithRetry(client, accountId, messageId, patch, signal)
+    })
+
+    emailSetQueue = queued.then(() => undefined, () => undefined)
+
+    return queued
+}
+
+async function updateEmailWithRetry(
+    client: JMAPClient,
+    accountId: Id,
+    messageId: Id,
+    patch: PatchObject,
+    signal?: AbortSignal
+) {
+    for (let attempt = 1; attempt <= EMAIL_SET_MAX_ATTEMPTS; attempt += 1) {
+        try {
+            if (attempt > 1) {
+                observeEvent('jmap.email-set.retry.start', {
+                    attempt,
+                    maxAttempts: EMAIL_SET_MAX_ATTEMPTS,
+                    messageId,
+                })
+            }
+
+            await updateEmailOnce(client, accountId, messageId, patch, signal)
+
+            if (attempt > 1) {
+                observeEvent('jmap.email-set.retry.success', {
+                    attempt,
+                    maxAttempts: EMAIL_SET_MAX_ATTEMPTS,
+                    messageId,
+                })
+            }
+
+            return
+        } catch (error: unknown) {
+            const canRetry =
+                attempt < EMAIL_SET_MAX_ATTEMPTS &&
+                !signal?.aborted &&
+                !isAbortError(error) &&
+                isRetriableJmapNetworkError(error)
+
+            observeError('jmap.email-set.attempt.failed', error, {
+                attempt,
+                canRetry,
+                messageId,
+            })
+
+            if (!canRetry) {
+                throw error
+            }
+
+            const delayMs =
+                EMAIL_SET_RETRY_DELAYS_MS[
+                    Math.min(attempt - 1, EMAIL_SET_RETRY_DELAYS_MS.length - 1)
+                ] ?? 0
+
+            observeEvent('jmap.email-set.retry.scheduled', {
+                attempt: attempt + 1,
+                delayMs,
+                messageId,
+            })
+
+            await delay(delayMs, signal)
+        }
+    }
+}
+
+async function updateEmailOnce(
+    client: JMAPClient,
+    accountId: Id,
+    messageId: Id,
+    patch: PatchObject,
+    signal?: AbortSignal
+) {
     const response = await client
         .createRequestBuilder()
         .add(
@@ -2298,6 +2502,52 @@ async function updateEmail(
     if (!didReceiveSetResponse) {
         throw new Error('JMAP Email/set did not return a response.')
     }
+}
+
+function isAbortError(error: unknown) {
+    return error instanceof Error && error.name === 'AbortError'
+}
+
+function isRetriableJmapNetworkError(error: unknown) {
+    const message = (error instanceof Error ? error.message : String(error)).toLowerCase()
+
+    return (
+        message.includes('network connection was lost') ||
+        message.includes('network request failed') ||
+        message.includes('fetch failed') ||
+        message.includes('timed out') ||
+        message.includes('the request timed out') ||
+        message.includes('connection reset') ||
+        message.includes('connection closed') ||
+        message.includes('too many requests') ||
+        message.includes('http 429')
+    )
+}
+
+function delay(ms: number, signal?: AbortSignal) {
+    return new Promise<void>((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(createAbortError())
+            return
+        }
+
+        const timeout = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort)
+            resolve()
+        }, ms)
+        const onAbort = () => {
+            clearTimeout(timeout)
+            reject(createAbortError())
+        }
+
+        signal?.addEventListener('abort', onAbort, { once: true })
+    })
+}
+
+function createAbortError() {
+    const error = new Error('JMAP retry aborted')
+    error.name = 'AbortError'
+    return error
 }
 
 function findMailbox(mailboxes: JmapMailbox[], mailboxId?: string | null) {
