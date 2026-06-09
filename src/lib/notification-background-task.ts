@@ -7,7 +7,8 @@ import {
   writeCachedInboxStateSnapshot,
   type CachedInboxStateMessageInput,
 } from '@/lib/mail-cache';
-import { hydrateMailboxSnapshotFromCache, loadMessageBody } from '@/lib/mail-store';
+import { hydrateMailboxSnapshotFromCache } from '@/lib/mail-store';
+import { syncInboxMetadataFromServer } from '@/lib/inbox-metadata-sync';
 import { flushObservabilityEvents, observeDuration, observeError, observeEvent } from '@/lib/observability';
 import * as Notifications from 'expo-notifications';
 
@@ -107,12 +108,6 @@ async function handleInboxNotificationPayloadNow(payload: Record<string, unknown
       await setInboxUnreadBadgeCount(inboxState.inboxUnreadEmails);
     }
 
-    await warmNotificationMessageBodies(
-      inboxState.messages
-        .filter((message) => message.keywords?.$seen !== true)
-        .map((message) => message.messageId),
-    );
-
     observeDuration('notification.background.inbox-state.success', startedAt, {
       mailboxId: inboxState.mailboxId,
       messages: inboxState.messages.length,
@@ -163,7 +158,14 @@ async function handleInboxNotificationPayloadNow(payload: Record<string, unknown
     await setInboxUnreadBadgeCount(inboxMessage.inboxUnreadEmails);
   }
 
-  await warmNotificationMessageBodies([inboxMessage.messageId]);
+  await syncInboxMetadataFromServer({
+    reason: 'notification-background-message',
+  }).catch((error: unknown) => {
+    observeError('notification.background.metadata-sync.failed', error, {
+      mailboxId: inboxMessage.mailboxId,
+      messageId: inboxMessage.messageId,
+    });
+  });
 
   observeDuration('notification.background.message.success', startedAt, {
     mailboxId: inboxMessage.mailboxId,
@@ -172,34 +174,6 @@ async function handleInboxNotificationPayloadNow(payload: Record<string, unknown
   });
 
   return true;
-}
-
-async function warmNotificationMessageBodies(messageIds: string[]) {
-  const uniqueMessageIds = Array.from(new Set(messageIds.filter(Boolean))).slice(0, 2);
-
-  for (const messageId of uniqueMessageIds) {
-    const startedAt = Date.now();
-
-    observeEvent('notification.background.body-warm.start', {
-      messageId,
-    });
-
-    try {
-      const body = await loadMessageBody(messageId, { priority: 'background' });
-
-      observeDuration('notification.background.body-warm.success', startedAt, {
-        attachments: body?.attachments?.length ?? 0,
-        hasBody: Boolean(body),
-        html: body?.html?.trim() ? body.html.length : 0,
-        messageId,
-        text: body?.text?.trim() ? body.text.length : 0,
-      });
-    } catch (error: unknown) {
-      observeError('notification.background.body-warm.failed', error, {
-        messageId,
-      });
-    }
-  }
 }
 
 async function runWithSqliteLockRetry<T>(operation: () => Promise<T>) {
