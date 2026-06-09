@@ -552,7 +552,7 @@ export default function InboxScreen() {
           position,
           tracePrefix,
         });
-        const didBecomeIdle = await waitForMailMutationQueueIdle();
+        const didBecomeIdle = await waitForMailMutationQueueIdle(1200);
 
         observeDuration('mailbox.refresh.wait-for-mail-sync.finished', refreshWaitStartedAt, {
           apply,

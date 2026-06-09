@@ -38,6 +38,7 @@ const messageBodyFetches = new Map<string, MessageBodyFetchEntry>();
 const foregroundSlowProbeTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let localMailActionSuppressUntil = 0;
 let foregroundMessageBodyFetchCount = 0;
+let foregroundMessageBodyFetchLastActivityAt = 0;
 
 function getMessageBodyFetchCounts() {
   let background = 0;
@@ -56,6 +57,13 @@ function getMessageBodyFetchCounts() {
     foreground,
     foregroundMessageBodyFetchCount,
     total: messageBodyFetches.size,
+  };
+}
+
+export function getForegroundMessageBodyFetchStatus() {
+  return {
+    activeCount: foregroundMessageBodyFetchCount,
+    lastActivityAt: foregroundMessageBodyFetchLastActivityAt,
   };
 }
 
@@ -560,6 +568,7 @@ export async function loadMessageBody(
     });
 
     if (priority === 'foreground') {
+      foregroundMessageBodyFetchLastActivityAt = Date.now();
       foregroundMessageBodyFetchCount += 1;
       abortBackgroundMessageBodyFetches(messageId);
 
@@ -600,6 +609,7 @@ export async function loadMessageBody(
         })
         .finally(() => {
           clearForegroundBodySlowProbe(messageId);
+          foregroundMessageBodyFetchLastActivityAt = Date.now();
           foregroundMessageBodyFetchCount = Math.max(0, foregroundMessageBodyFetchCount - 1);
         });
     }
@@ -618,6 +628,7 @@ export async function loadMessageBody(
   }
 
   if (priority === 'foreground') {
+    foregroundMessageBodyFetchLastActivityAt = Date.now();
     foregroundMessageBodyFetchCount += 1;
     abortBackgroundMessageBodyFetches(messageId);
   }
@@ -688,6 +699,7 @@ export async function loadMessageBody(
       clearForegroundBodySlowProbe(messageId);
 
       if (priority === 'foreground') {
+        foregroundMessageBodyFetchLastActivityAt = Date.now();
         foregroundMessageBodyFetchCount = Math.max(0, foregroundMessageBodyFetchCount - 1);
       }
 

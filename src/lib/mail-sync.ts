@@ -9,10 +9,13 @@ import {
   type JmapMailbox,
   type JmapMessageActionResult,
 } from '@/lib/jmap-client';
+import { getForegroundMessageBodyFetchStatus } from '@/lib/mail-store';
 import { observeDuration, observeError, observeEvent } from '@/lib/observability';
 
 const mailMutationFlushDebounceMs = 500;
 const mailMutationIdleTimeoutMs = 5000;
+const mailMutationForegroundBodyQuietMs = 2500;
+const mailMutationForegroundBodyPollMs = 250;
 
 type MailMutationRole = 'archive' | 'inbox' | 'trash';
 
@@ -297,6 +300,17 @@ function scheduleFlush() {
   }, mailMutationFlushDebounceMs);
 }
 
+function scheduleDeferredFlush(delayMs: number) {
+  if (flushTimer || flushInFlight) {
+    return;
+  }
+
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    void flushPendingMutations();
+  }, delayMs);
+}
+
 async function flushPendingMutations() {
   if (flushInFlight) {
     scheduleFlush();
@@ -305,6 +319,27 @@ async function flushPendingMutations() {
 
   if (!pendingMutationsByMessageId.size) {
     notifyIdleWaitersIfIdle();
+    return;
+  }
+
+  const foregroundBodyFetch = getForegroundMessageBodyFetchStatus();
+  const msSinceForegroundBodyActivity =
+    foregroundBodyFetch.lastActivityAt > 0
+      ? Date.now() - foregroundBodyFetch.lastActivityAt
+      : Number.POSITIVE_INFINITY;
+
+  if (
+    foregroundBodyFetch.activeCount > 0 ||
+    msSinceForegroundBodyActivity < mailMutationForegroundBodyQuietMs
+  ) {
+    observeEvent('mail-sync.flush.deferred-for-foreground-body', {
+      activeForegroundBodyFetches: foregroundBodyFetch.activeCount,
+      msSinceForegroundBodyActivity: Number.isFinite(msSinceForegroundBodyActivity)
+        ? Math.max(0, msSinceForegroundBodyActivity)
+        : -1,
+      pendingMessages: pendingMutationsByMessageId.size,
+    });
+    scheduleDeferredFlush(mailMutationForegroundBodyPollMs);
     return;
   }
 
