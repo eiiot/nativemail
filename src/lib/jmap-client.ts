@@ -237,6 +237,41 @@ let transportRequestSequence = 0
 
 const SLOW_TRANSPORT_REQUEST_MS = 1000
 const MAX_CONCURRENT_TRANSPORT_REQUESTS = 3
+const TRANSPORT_REQUEST_TIMEOUT_MS = 6000
+const TRANSPORT_BLOB_TIMEOUT_MS = 30000
+
+function createJmapTransportTimeoutError(timeoutMs: number) {
+    const error = new Error(`JMAP request timed out after ${timeoutMs}ms`)
+    error.name = 'JmapTransportTimeoutError'
+    return error
+}
+
+function isTransientTransportError(error: unknown) {
+    if (!(error instanceof Error)) {
+        return false
+    }
+
+    if (error.name === 'JmapTransportTimeoutError') {
+        return true
+    }
+
+    const message = error.message.toLowerCase()
+
+    if (message.startsWith('fastmail jmap')) {
+        // HTTP-status errors from getErrorMessage are not connection issues.
+        return false
+    }
+
+    return (
+        message.includes('network connection was lost') ||
+        message.includes('network request failed') ||
+        message.includes('fetch failed') ||
+        message.includes('could not connect') ||
+        message.includes('connection reset') ||
+        message.includes('connection closed') ||
+        message.includes('software caused connection abort')
+    )
+}
 
 // All JMAP transport requests flow through this scheduler: identical
 // concurrent reads collapse into a single request, mutations are never
@@ -1689,17 +1724,46 @@ function createBearerTransport(token: string, operation?: string): Transport {
             operation
         )
 
+        const run = () => performRequest<T>(method, url, options)
+        // Read requests (the only ones given a dedup key) get one immediate
+        // retry on timeout or connection loss: a fresh attempt usually lands
+        // on a healthy connection. Mutations keep their own retry handling.
+        const runWithRetry =
+            scheduling.key === undefined
+                ? run
+                : async () => {
+                      try {
+                          return await run()
+                      } catch (error: unknown) {
+                          if (
+                              options.signal?.aborted === true ||
+                              !isTransientTransportError(error)
+                          ) {
+                              throw error
+                          }
+
+                          observeEvent(
+                              'jmap.transport.read-retry',
+                              {
+                                  method,
+                                  operation: operation ?? 'unknown',
+                                  path: getObservabilityPath(getFastmailRequestUrl(url)),
+                              },
+                              'warn'
+                          )
+
+                          return run()
+                      }
+                  }
+
         // Joined callers share one network request. The shared fetch uses the
         // first caller's abort signal; if that caller aborts, joiners see the
         // abort and rely on their own retry handling.
-        return transportScheduler.schedule(
-            () => performRequest<T>(method, url, options),
-            {
-                key: scheduling.key,
-                priority: scheduling.priority,
-                signal: options.signal,
-            }
-        )
+        return transportScheduler.schedule(runWithRetry, {
+            key: scheduling.key,
+            priority: scheduling.priority,
+            signal: options.signal,
+        })
     }
 
     async function performRequest<T>(
@@ -1812,18 +1876,41 @@ function createBearerTransport(token: string, operation?: string): Transport {
             signalAborted: options.signal?.aborted === true,
         })
 
+        // iOS can leave requests hanging 10-30s on a dead pooled connection
+        // ("the network connection was lost" arriving for several requests at
+        // once). Abort locally after a timeout so retry layers get a fresh
+        // attempt quickly instead of waiting out the OS.
+        const timeoutMs =
+            options.responseType === 'blob'
+                ? TRANSPORT_BLOB_TIMEOUT_MS
+                : TRANSPORT_REQUEST_TIMEOUT_MS
+        const fetchController = new AbortController()
+        const forwardAbort = () => fetchController.abort()
+        options.signal?.addEventListener('abort', forwardAbort, { once: true })
+        let didTimeOut = false
+        const timeoutTimer = setTimeout(() => {
+            didTimeOut = true
+            fetchController.abort()
+        }, timeoutMs)
+
         try {
             response = await fetch(requestUrl, {
                 body: method === 'POST' ? options.body : undefined,
                 headers,
                 method,
-                signal: options.signal,
+                signal: fetchController.signal,
             })
         } catch (error: unknown) {
-            observeError('jmap.transport.fetch.failed', error, {
+            const timeoutError =
+                didTimeOut && options.signal?.aborted !== true
+                    ? createJmapTransportTimeoutError(timeoutMs)
+                    : null
+
+            observeError('jmap.transport.fetch.failed', timeoutError ?? error, {
                 activeAtFetchStart,
                 activeTransportRequestCount,
                 ...requestDetails,
+                didTimeOut,
                 durationMs: Math.max(0, Date.now() - fetchStartedAt),
                 method,
                 operation: operation ?? 'unknown',
@@ -1831,8 +1918,11 @@ function createBearerTransport(token: string, operation?: string): Transport {
                 requestId,
                 sequence,
             })
-            throw error
+            throw timeoutError ?? error
         } finally {
+            clearTimeout(timeoutTimer)
+            options.signal?.removeEventListener('abort', forwardAbort)
+
             if (fetchSlowTimer) {
                 clearTimeout(fetchSlowTimer)
                 fetchSlowTimer = null
