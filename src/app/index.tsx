@@ -604,13 +604,23 @@ export default function InboxScreen() {
           signal,
         });
       } catch (error: unknown) {
-        observeError('mailbox.refresh.failed', error, {
-          apply,
-          limit,
-          mailboxId: mailboxId ?? 'inbox',
-          position,
-          tracePrefix,
-        });
+        if (error instanceof Error && error.name === 'AbortError') {
+          observeEvent('mailbox.refresh.canceled', {
+            apply,
+            limit,
+            mailboxId: mailboxId ?? 'inbox',
+            position,
+            tracePrefix,
+          });
+        } else {
+          observeError('mailbox.refresh.failed', error, {
+            apply,
+            limit,
+            mailboxId: mailboxId ?? 'inbox',
+            position,
+            tracePrefix,
+          });
+        }
         throw error;
       }
 

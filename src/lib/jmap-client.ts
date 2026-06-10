@@ -641,11 +641,19 @@ export async function fetchJmapMailboxSnapshot({
 
         return snapshot
     } catch (error: unknown) {
-        observeError('jmap.mailbox-snapshot.failed', error, {
-            limit,
-            mailboxId: mailboxId ?? 'inbox',
-            position,
-        })
+        if (error instanceof Error && error.name === 'AbortError') {
+            observeEvent('jmap.mailbox-snapshot.canceled', {
+                limit,
+                mailboxId: mailboxId ?? 'inbox',
+                position,
+            })
+        } else {
+            observeError('jmap.mailbox-snapshot.failed', error, {
+                limit,
+                mailboxId: mailboxId ?? 'inbox',
+                position,
+            })
+        }
         throw error
     } finally {
         await releaseFastmailJmapClient(client)
