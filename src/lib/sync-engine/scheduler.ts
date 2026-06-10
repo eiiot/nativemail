@@ -107,8 +107,9 @@ export function createRequestScheduler({
             }
 
             running += 1
+            // Keys can embed full request bodies; truncate before emitting.
             emit('sync-scheduler.task.start', {
-                key: task.key ?? 'none',
+                key: task.key ? task.key.slice(0, 80) : 'none',
                 priority: task.priority,
                 queueWaitMs: Math.max(0, now() - task.enqueuedAt),
                 running,
@@ -149,7 +150,10 @@ export function createRequestScheduler({
                     }
                 }
 
-                emit('sync-scheduler.task.joined', { key, priority: options.priority ?? 'metadata' })
+                emit('sync-scheduler.task.joined', {
+                    key: key.slice(0, 80),
+                    priority: options.priority ?? 'metadata',
+                })
                 return inFlight.promise as Promise<T>
             }
         }

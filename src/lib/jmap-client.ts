@@ -7,6 +7,8 @@ import {
 import { getFastmailJmapToken } from '@/lib/fastmail-token'
 import type { Message, MessageAttachment } from '@/lib/mock-mail'
 import { observeDuration, observeError, observeEvent } from '@/lib/observability'
+import { createRequestScheduler, type SchedulerPriority } from '@/lib/sync-engine'
+import { sha256 } from 'js-sha256'
 import {
     EMAIL_CAPABILITY_URI,
     Email,
@@ -229,6 +231,69 @@ let activeTransportRequestCount = 0
 let transportRequestSequence = 0
 
 const SLOW_TRANSPORT_REQUEST_MS = 1000
+const MAX_CONCURRENT_TRANSPORT_REQUESTS = 3
+
+// All JMAP transport requests flow through this scheduler: identical
+// concurrent reads collapse into a single request, mutations are never
+// deduplicated, and foreground body fetches start before metadata and
+// prefetch traffic when slots are contended.
+const transportScheduler = createRequestScheduler({
+    maxConcurrent: MAX_CONCURRENT_TRANSPORT_REQUESTS,
+    onEvent: observeEvent,
+})
+
+const mutationJmapMethodPattern = /\/(set|copy|import)$/
+
+function getJmapMethodNames(body: unknown): string[] {
+    if (typeof body !== 'string' || !body.trim().startsWith('{')) {
+        return []
+    }
+
+    try {
+        const parsed = JSON.parse(body) as { methodCalls?: unknown }
+
+        if (!Array.isArray(parsed.methodCalls)) {
+            return []
+        }
+
+        return parsed.methodCalls
+            .map((call) =>
+                Array.isArray(call) && typeof call[0] === 'string' ? call[0] : null
+            )
+            .filter((name): name is string => name !== null)
+    } catch {
+        return []
+    }
+}
+
+function getTransportScheduling(
+    method: 'GET' | 'POST',
+    requestUrl: string,
+    options: TransportRequestOptions,
+    keyScope: string,
+    operation?: string
+): { key?: string; priority: SchedulerPriority } {
+    if (method === 'POST') {
+        const methodNames = getJmapMethodNames(options.body)
+
+        if (methodNames.some((name) => mutationJmapMethodPattern.test(name))) {
+            return { priority: 'mutation' }
+        }
+
+        if (typeof options.body !== 'string') {
+            return { priority: 'metadata' }
+        }
+    }
+
+    const priority: SchedulerPriority =
+        operation === 'message-body' ? 'foreground' : 'metadata'
+    const body = method === 'POST' && typeof options.body === 'string' ? options.body : ''
+
+    return {
+        key: `${keyScope}:${method}:${requestUrl}:${body}`,
+        priority,
+    }
+}
 
 export async function createFastmailJmapClient(
     _signal?: AbortSignal,
@@ -1530,7 +1595,37 @@ export async function probeFastmailMessageBodyRaw({
 }
 
 function createBearerTransport(token: string, operation?: string): Transport {
+    // Scopes dedup keys to this token so a request issued after re-auth
+    // never joins an in-flight request from the previous token.
+    const keyScope = sha256(token).slice(0, 8)
+
     async function request<T>(
+        method: 'GET' | 'POST',
+        url: string | URL,
+        options: TransportRequestOptions = {}
+    ): Promise<T> {
+        const scheduling = getTransportScheduling(
+            method,
+            getFastmailRequestUrl(url),
+            options,
+            keyScope,
+            operation
+        )
+
+        // Joined callers share one network request. The shared fetch uses the
+        // first caller's abort signal; if that caller aborts, joiners see the
+        // abort and rely on their own retry handling.
+        return transportScheduler.schedule(
+            () => performRequest<T>(method, url, options),
+            {
+                key: scheduling.key,
+                priority: scheduling.priority,
+                signal: options.signal,
+            }
+        )
+    }
+
+    async function performRequest<T>(
         method: 'GET' | 'POST',
         url: string | URL,
         options: TransportRequestOptions = {}
