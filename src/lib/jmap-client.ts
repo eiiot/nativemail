@@ -7,7 +7,12 @@ import {
 import { getFastmailJmapToken } from '@/lib/fastmail-token'
 import type { Message, MessageAttachment } from '@/lib/mock-mail'
 import { observeDuration, observeError, observeEvent } from '@/lib/observability'
-import { createRequestScheduler, type SchedulerPriority } from '@/lib/sync-engine'
+import {
+    createRequestScheduler,
+    createStateTracker,
+    type SchedulerPriority,
+    type SyncStateSnapshot,
+} from '@/lib/sync-engine'
 import { sha256 } from 'js-sha256'
 import {
     EMAIL_CAPABILITY_URI,
@@ -243,6 +248,28 @@ const transportScheduler = createRequestScheduler({
 })
 
 const mutationJmapMethodPattern = /\/(set|copy|import)$/
+
+// Server state strings recorded from snapshot fetches, used to skip a
+// refresh when nothing changed server-side. A mailbox view only counts as
+// fresh if its snapshot was fetched since the last recorded state change;
+// state strings are account-global, so an older cached view of another
+// mailbox must not be treated as current.
+const mailStateTracker = createStateTracker()
+let mailboxesFreshForCurrentState = new Set<string>()
+let lastKnownInboxMailboxId: string | null = null
+
+function recordMailboxViewStates(states: SyncStateSnapshot, mailboxKey: string) {
+    if (!Object.keys(states).length) {
+        return
+    }
+
+    if (!mailStateTracker.isCurrent(states)) {
+        mailboxesFreshForCurrentState = new Set()
+    }
+
+    mailStateTracker.recordStates(states)
+    mailboxesFreshForCurrentState.add(mailboxKey)
+}
 
 function getJmapMethodNames(body: unknown): string[] {
     if (typeof body !== 'string' || !body.trim().startsWith('{')) {
@@ -526,27 +553,69 @@ export async function fetchJmapMailboxSnapshot({
     const { accountId, client } = await createFastmailJmapClient(signal)
 
     try {
-        const mailboxes = await getMailboxes(client, accountId, signal)
-        const mailbox = findMailbox(mailboxes, mailboxId)
-        const page = mailbox
-            ? await getMailboxMessagesPage(
-                  client,
-                  accountId,
-                  mailbox.id,
-                  position,
-                  limit,
-                  signal
-              )
-            : null
-        const threads = page
-            ? await getThreadsForMessages(
-                  client,
-                  accountId,
-                  page.messages,
-                  mailboxes,
-                  signal
-              )
-            : {}
+        let mailboxes: JmapMailbox[] | null = null
+        let targetMailboxId = mailboxId ?? lastKnownInboxMailboxId
+
+        if (!targetMailboxId) {
+            mailboxes = await getMailboxes(client, accountId, signal)
+            targetMailboxId = findMailbox(mailboxes, null)?.id ?? null
+        }
+
+        let mailbox: JmapMailbox | null = null
+        let page: { messages: Message[]; position: number; total: number | null } | null =
+            null
+        let threads: Record<string, JmapThread> = {}
+
+        if (targetMailboxId) {
+            let batch: Awaited<ReturnType<typeof getMailboxSnapshotBatch>> | null = null
+
+            try {
+                batch = await getMailboxSnapshotBatch(
+                    client,
+                    accountId,
+                    targetMailboxId,
+                    position,
+                    limit,
+                    signal
+                )
+            } catch (error: unknown) {
+                // The target mailbox may have been deleted since we learned
+                // its id. Refetch the list; if it is gone, fall through to an
+                // empty snapshot like the pre-batch behavior, otherwise rethrow.
+                mailboxes = await getMailboxes(client, accountId, signal)
+
+                if (findMailbox(mailboxes, targetMailboxId)) {
+                    throw error
+                }
+            }
+
+            if (batch) {
+                mailboxes = batch.mailboxes
+                mailbox = findMailbox(batch.mailboxes, targetMailboxId)
+                page = {
+                    messages: batch.messages,
+                    position: batch.position,
+                    total: batch.total,
+                }
+                threads = await buildThreadMap(
+                    client,
+                    accountId,
+                    batch.threads,
+                    batch.messages,
+                    batch.mailboxes,
+                    signal
+                )
+                recordMailboxViewStates(batch.states, mailbox?.id ?? targetMailboxId)
+            }
+        }
+
+        if (!mailboxes) {
+            mailboxes = []
+        }
+
+        lastKnownInboxMailboxId =
+            findMailbox(mailboxes, null)?.id ?? lastKnownInboxMailboxId
+
         const messages = page?.messages
             ? applyThreadCountsToMessages(page.messages, threads)
             : []
@@ -2019,6 +2088,177 @@ async function getErrorMessage(response: Response, method: string) {
     return `Fastmail JMAP ${method} failed with HTTP ${response.status}${suffix}`
 }
 
+function getInvocationStates(invocations: Iterable<unknown>): SyncStateSnapshot {
+    const states: SyncStateSnapshot = {}
+
+    for (const invocation of invocations) {
+        const candidate = invocation as {
+            getArgument?: (name: string) => unknown
+            name?: string
+        }
+
+        if (typeof candidate.getArgument !== 'function') {
+            continue
+        }
+
+        const type =
+            candidate.name === 'Mailbox/get'
+                ? 'Mailbox'
+                : candidate.name === 'Email/get'
+                  ? 'Email'
+                  : null
+
+        if (!type) {
+            continue
+        }
+
+        const state = candidate.getArgument('state')
+
+        if (typeof state === 'string') {
+            states[type] = state
+        }
+    }
+
+    return states
+}
+
+/**
+ * Probes the server's Mailbox and Email state strings with one cheap
+ * request and reports whether the given mailbox view could be stale.
+ * Returns true (changed) whenever it cannot prove the view is current.
+ */
+export async function hasJmapMailboxViewChanged({
+    mailboxId,
+    signal,
+}: {
+    mailboxId?: string | null
+    signal?: AbortSignal
+} = {}): Promise<boolean> {
+    const mailboxKey = mailboxId ?? lastKnownInboxMailboxId
+
+    if (!mailboxKey || !mailboxesFreshForCurrentState.has(mailboxKey)) {
+        return true
+    }
+
+    const startedAt = Date.now()
+    const { accountId, client } = await createFastmailJmapClient(signal)
+
+    try {
+        const response = await client
+            .createRequestBuilder()
+            .add(Mailbox.request.get({ accountId, ids: [], properties: ['id'] }))
+            .add(Email.request.get({ accountId, ids: [], properties: ['id'] }))
+            .send(signal)
+        const states = getInvocationStates(response.methodResponses)
+        const changed = !mailStateTracker.isCurrent(states)
+
+        observeDuration('jmap.state-probe.success', startedAt, {
+            changed,
+            mailboxId: mailboxKey,
+        })
+
+        return changed
+    } catch (error: unknown) {
+        observeError('jmap.state-probe.failed', error, { mailboxId: mailboxKey })
+        return true
+    } finally {
+        await releaseFastmailJmapClient(client)
+    }
+}
+
+// One round trip for a full mailbox page: mailbox list, page message ids,
+// message metadata, and the threads they belong to, chained server-side
+// through JMAP back-references.
+async function getMailboxSnapshotBatch(
+    client: JMAPClient,
+    accountId: Id,
+    mailboxId: Id,
+    position: number,
+    limit: number,
+    signal?: AbortSignal
+) {
+    const query = Email.request.query({
+        accountId,
+        calculateTotal: true,
+        collapseThreads: true,
+        filter: { inMailbox: mailboxId },
+        limit,
+        position,
+        sort: [{ property: 'receivedAt', isAscending: false }],
+    })
+    const emailGet = Email.request.get({
+        accountId,
+        bodyProperties: emailBodyPartProperties,
+        ids: query.createReference('/ids'),
+        properties: emailSummaryProperties,
+    })
+    const response = await client
+        .createRequestBuilder()
+        .add(
+            Mailbox.request.get({
+                accountId,
+                ids: null,
+                properties: mailboxProperties,
+            })
+        )
+        .add(query)
+        .add(emailGet)
+        .add(
+            Thread.request.get({
+                accountId,
+                ids: emailGet.createReference('/list/*/threadId'),
+                properties: threadProperties,
+            })
+        )
+        .send(signal)
+
+    let mailboxObjects: MailboxObject[] = []
+    let emailIds: Id[] = []
+    let emails: EmailObject[] = []
+    let threadObjects: ThreadObject[] = []
+    let responsePosition = position
+    let total: number | null = null
+
+    for (const invocation of response.methodResponses) {
+        if (isErrorInvocation(invocation)) {
+            throw new Error(
+                `JMAP ${invocation.type}: ${JSON.stringify(invocation.arguments)}`
+            )
+        }
+
+        if (invocation.name === 'Mailbox/get') {
+            mailboxObjects = invocation.getArgument('list') as MailboxObject[]
+        }
+
+        if (invocation.name === 'Email/query') {
+            emailIds = invocation.getArgument('ids') as Id[]
+            responsePosition =
+                (invocation.getArgument('position') as number | undefined) ??
+                position
+            total = (invocation.getArgument('total') as number | undefined) ?? null
+        }
+
+        if (invocation.name === 'Email/get') {
+            emails = invocation.getArgument('list') as EmailObject[]
+        }
+
+        if (invocation.name === 'Thread/get') {
+            threadObjects = invocation.getArgument('list') as ThreadObject[]
+        }
+    }
+
+    return {
+        mailboxes: mailboxObjects.sort(sortMailboxes).map(toJmapMailbox),
+        messages: sortEmailsByQuery(emails, emailIds).map((email) =>
+            mapEmailToMessage(email)
+        ),
+        position: responsePosition,
+        states: getInvocationStates(response.methodResponses),
+        threads: threadObjects,
+        total,
+    }
+}
+
 async function getMailboxes(
     client: JMAPClient,
     accountId: Id,
@@ -2130,22 +2370,14 @@ async function getMailboxMessagesPage(
     }
 }
 
-async function getThreadsForMessages(
+async function buildThreadMap(
     client: JMAPClient,
     accountId: Id,
+    threads: ThreadObject[],
     messages: Message[],
     mailboxes: JmapMailbox[],
     signal?: AbortSignal
 ): Promise<Record<string, JmapThread>> {
-    const threadIds = Array.from(
-        new Set(messages.map((message) => message.threadId).filter(Boolean))
-    ) as Id[]
-
-    if (!threadIds.length) {
-        return {}
-    }
-
-    const threads = await getThreads(client, accountId, threadIds, signal)
     const knownMessagesById = new Map(
         messages.map((message) => [message.id, message])
     )

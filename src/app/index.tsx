@@ -31,6 +31,7 @@ import { useDebugMode } from '@/lib/debug-mode';
 import {
   describeJmapError,
   fetchJmapMailboxSnapshot,
+  hasJmapMailboxViewChanged,
   type JmapMailboxSnapshot,
 } from '@/lib/jmap-client';
 import {
@@ -562,6 +563,25 @@ export default function InboxScreen() {
           position,
           tracePrefix,
         });
+      }
+
+      if (apply && position === 0 && selectMailboxSnapshot(useMailStore.getState(), mailboxId)) {
+        const changed = await hasJmapMailboxViewChanged({ mailboxId, signal });
+
+        if (!changed) {
+          observeEvent('mailbox.refresh.skipped-unchanged', {
+            limit,
+            mailboxId: mailboxId ?? 'inbox',
+            position,
+            tracePrefix,
+          });
+          markNavigationTrace(`${tracePrefix} skipped`, 'server state unchanged');
+          const currentSnapshot = selectMailboxSnapshot(useMailStore.getState(), mailboxId);
+
+          if (currentSnapshot) {
+            return currentSnapshot;
+          }
+        }
       }
 
       const refreshStartedAt = Date.now();
