@@ -35,6 +35,13 @@ Run Expo lint:
 npm run lint
 ```
 
+Run unit tests (do not add a `test` script to package.json — changes to the
+scripts section alter the EAS runtime fingerprint and orphan OTA updates):
+
+```bash
+npx vitest run
+```
+
 ## Development
 
 Start the dev server for a dev-client build:
