@@ -1,5 +1,6 @@
 import Constants from 'expo-constants';
 import * as SecureStore from 'expo-secure-store';
+import * as Updates from 'expo-updates';
 import { Platform } from 'react-native';
 
 const observabilityDeviceIdKey = 'notifications.deviceId';
@@ -92,7 +93,8 @@ export async function flushObservabilityEvents() {
 
     await fetch(`${relayUrl}/observability`, {
       body: JSON.stringify({
-        appVersion: Constants.expoConfig?.version ?? null,
+        // The OTA update id suffix identifies which bundle produced these events.
+        appVersion: `${Constants.expoConfig?.version ?? '0'}+${Updates.updateId?.slice(0, 8) ?? 'embedded'}`,
         deviceId,
         events: batch,
         platform: Platform.OS,

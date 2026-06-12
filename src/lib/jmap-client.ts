@@ -2257,7 +2257,14 @@ export async function hasJmapMailboxViewChanged({
 
         return changed
     } catch (error: unknown) {
-        observeError('jmap.state-probe.failed', error, { mailboxId: mailboxKey })
+        const message = error instanceof Error ? error.message.toLowerCase() : ''
+
+        if ((error instanceof Error && error.name === 'AbortError') || message.includes('cancel')) {
+            observeEvent('jmap.state-probe.canceled', { mailboxId: mailboxKey })
+        } else {
+            observeError('jmap.state-probe.failed', error, { mailboxId: mailboxKey })
+        }
+
         return true
     } finally {
         await releaseFastmailJmapClient(client)
