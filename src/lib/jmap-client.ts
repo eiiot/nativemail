@@ -237,7 +237,12 @@ let transportRequestSequence = 0
 
 const SLOW_TRANSPORT_REQUEST_MS = 1000
 const MAX_CONCURRENT_TRANSPORT_REQUESTS = 3
-const TRANSPORT_REQUEST_TIMEOUT_MS = 2500
+// The native iOS layer (see plugins/withFastmailUrlSession.js) sets a 5s
+// URLSession inactivity timeout that actually evicts the dead connection so
+// the retry gets a fresh one. This JS timer is only a backstop in case the
+// native config is ever absent, so it sits above the native value — letting
+// native eviction happen first rather than aborting (which does not evict).
+const TRANSPORT_REQUEST_TIMEOUT_MS = 12000
 const TRANSPORT_BLOB_TIMEOUT_MS = 30000
 
 function createJmapTransportTimeoutError(timeoutMs: number) {
