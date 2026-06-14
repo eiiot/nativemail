@@ -1,3 +1,4 @@
+import { startConnectionKeepAlive } from '@/lib/connection-keepalive';
 import { hydrateMailboxSnapshotFromCache } from '@/lib/mail-store';
 import {
   handleInboxNotificationPayload,
@@ -124,6 +125,7 @@ export default function RootLayout() {
       subscription.remove();
     };
   }, []);
+  useEffect(() => startConnectionKeepAlive(), []);
   useEffect(() => {
     const openNotificationMessage = (response: Notifications.NotificationResponse | null) => {
       if (response && isArchiveInboxNotificationResponse(response)) {

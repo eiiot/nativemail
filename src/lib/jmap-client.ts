@@ -237,7 +237,7 @@ let transportRequestSequence = 0
 
 const SLOW_TRANSPORT_REQUEST_MS = 1000
 const MAX_CONCURRENT_TRANSPORT_REQUESTS = 3
-const TRANSPORT_REQUEST_TIMEOUT_MS = 6000
+const TRANSPORT_REQUEST_TIMEOUT_MS = 2500
 const TRANSPORT_BLOB_TIMEOUT_MS = 30000
 
 function createJmapTransportTimeoutError(timeoutMs: number) {
@@ -348,7 +348,11 @@ function getTransportScheduling(
     }
 
     const priority: SchedulerPriority =
-        operation === 'message-body' ? 'foreground' : 'metadata'
+        operation === 'message-body'
+            ? 'foreground'
+            : operation === 'keepalive'
+              ? 'prefetch'
+              : 'metadata'
     const body = method === 'POST' && typeof options.body === 'string' ? options.body : ''
 
     return {
@@ -485,6 +489,42 @@ async function connectSharedFastmailJmapClient(
         client,
         disconnect: client.disconnect.bind(client),
         token,
+    }
+}
+
+/**
+ * Sends one tiny request over the shared client so its pooled HTTP/2
+ * connection to Fastmail stays alive. Idle connections get dropped (NAT
+ * timeout / iOS pool staleness); reusing a dead one black-holes the next
+ * real request for seconds. Pinging on an interval while foregrounded keeps
+ * the connection warm so message opens hit a live connection (~150ms) instead
+ * of a dead one. Cheap: Mailbox/get with ids:[] returns no records.
+ */
+export async function keepFastmailConnectionWarm(signal?: AbortSignal) {
+    const startedAt = Date.now()
+
+    try {
+        const { accountId, client } = await createFastmailJmapClient(
+            signal,
+            'keepalive'
+        )
+
+        try {
+            await client
+                .createRequestBuilder()
+                .add(Mailbox.request.get({ accountId, ids: [], properties: ['id'] }))
+                .send(signal)
+
+            observeDuration('jmap.keepalive.success', startedAt, {})
+        } finally {
+            await releaseFastmailJmapClient(client)
+        }
+    } catch (error: unknown) {
+        if (error instanceof Error && error.name === 'AbortError') {
+            return
+        }
+
+        observeError('jmap.keepalive.failed', error, {})
     }
 }
 
@@ -1876,10 +1916,13 @@ function createBearerTransport(token: string, operation?: string): Transport {
             signalAborted: options.signal?.aborted === true,
         })
 
-        // iOS can leave requests hanging 10-30s on a dead pooled connection
-        // ("the network connection was lost" arriving for several requests at
-        // once). Abort locally after a timeout so retry layers get a fresh
-        // attempt quickly instead of waiting out the OS.
+        // A request that reuses a dead pooled HTTP/2 connection black-holes
+        // for seconds-to-minutes before iOS reports "network connection was
+        // lost". React Native ignores AbortController mid-flight, so aborting
+        // does not settle the fetch promise. Instead we race the fetch against
+        // a real timer that rejects on its own: the retry layer then opens a
+        // fresh connection (~240ms) rather than waiting out the dead one. We
+        // still call abort() best-effort to release the stuck request.
         const timeoutMs =
             options.responseType === 'blob'
                 ? TRANSPORT_BLOB_TIMEOUT_MS
@@ -1888,18 +1931,25 @@ function createBearerTransport(token: string, operation?: string): Transport {
         const forwardAbort = () => fetchController.abort()
         options.signal?.addEventListener('abort', forwardAbort, { once: true })
         let didTimeOut = false
-        const timeoutTimer = setTimeout(() => {
-            didTimeOut = true
-            fetchController.abort()
-        }, timeoutMs)
+        let timeoutTimer: ReturnType<typeof setTimeout> | null = null
+        const timeoutPromise = new Promise<never>((_resolve, reject) => {
+            timeoutTimer = setTimeout(() => {
+                didTimeOut = true
+                fetchController.abort()
+                reject(createJmapTransportTimeoutError(timeoutMs))
+            }, timeoutMs)
+        })
 
         try {
-            response = await fetch(requestUrl, {
-                body: method === 'POST' ? options.body : undefined,
-                headers,
-                method,
-                signal: fetchController.signal,
-            })
+            response = await Promise.race([
+                fetch(requestUrl, {
+                    body: method === 'POST' ? options.body : undefined,
+                    headers,
+                    method,
+                    signal: fetchController.signal,
+                }),
+                timeoutPromise,
+            ])
         } catch (error: unknown) {
             const timeoutError =
                 didTimeOut && options.signal?.aborted !== true
@@ -1920,7 +1970,10 @@ function createBearerTransport(token: string, operation?: string): Transport {
             })
             throw timeoutError ?? error
         } finally {
-            clearTimeout(timeoutTimer)
+            if (timeoutTimer) {
+                clearTimeout(timeoutTimer)
+                timeoutTimer = null
+            }
             options.signal?.removeEventListener('abort', forwardAbort)
 
             if (fetchSlowTimer) {

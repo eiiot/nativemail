@@ -7,9 +7,6 @@ import {
 } from '@/lib/mail-cache';
 import {
   fetchJmapMessageBody,
-  probeFastmailMessageMetadata,
-  probeFastmailMessageBodyRaw,
-  probeFastmailJmapSession,
   type JmapMailboxSnapshot,
   type JmapMessageBody,
   type JmapThread,
@@ -103,6 +100,10 @@ function armForegroundBodySlowProbe({
   const timer = setTimeout(() => {
     foregroundSlowProbeTimers.delete(messageId);
 
+    // Record that a foreground body fetch crossed the slow threshold, but do
+    // NOT fire diagnostic probe requests: those were raw fetches with no
+    // timeout that piled onto an already-stuck connection (one hung ~7
+    // minutes). The transport-level timeout now bounds slow fetches instead.
     observeEvent('mail.body.fetch.foreground-slow', {
       ...getMessageBodyFetchCounts(),
       durationMs: Math.max(0, Date.now() - startedAt),
@@ -110,45 +111,6 @@ function armForegroundBodySlowProbe({
       reason,
       refresh,
     }, 'warn');
-
-    void probeFastmailJmapSession({
-      messageId,
-      reason: `body-slow:${reason}`,
-    }).catch((error: unknown) => {
-      observeError('mail.body.fetch.foreground-slow.session-probe.failed', error, {
-        ...getMessageBodyFetchCounts(),
-        durationMs: Math.max(0, Date.now() - startedAt),
-        messageId,
-        reason,
-        refresh,
-      });
-    });
-
-    void probeFastmailMessageMetadata({
-      messageId,
-      reason: `body-slow:${reason}`,
-    }).catch((error: unknown) => {
-      observeError('mail.body.fetch.foreground-slow.metadata-probe.failed', error, {
-        ...getMessageBodyFetchCounts(),
-        durationMs: Math.max(0, Date.now() - startedAt),
-        messageId,
-        reason,
-        refresh,
-      });
-    });
-
-    void probeFastmailMessageBodyRaw({
-      messageId,
-      reason: `body-slow:${reason}`,
-    }).catch((error: unknown) => {
-      observeError('mail.body.fetch.foreground-slow.raw-body-probe.failed', error, {
-        ...getMessageBodyFetchCounts(),
-        durationMs: Math.max(0, Date.now() - startedAt),
-        messageId,
-        reason,
-        refresh,
-      });
-    });
   }, delayMs);
 
   foregroundSlowProbeTimers.set(messageId, timer);
