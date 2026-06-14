@@ -4,10 +4,11 @@ import { hasFastmailJmapToken } from '@/lib/fastmail-token';
 import { keepFastmailConnectionWarm } from '@/lib/jmap-client';
 import { observeEvent } from '@/lib/observability';
 
-// Ping interval. Must be shorter than the shortest connection idle-death we
-// see in the wild (NAT timeouts are often 30-60s; iOS pool staleness can be
-// quicker), so 12s keeps a comfortable margin while staying cheap.
-const KEEPALIVE_INTERVAL_MS = 12_000;
+// Ping interval. Telemetry shows the connection can go idle-dead in under 12s,
+// so ping every 8s to keep it warm during active use. A ping that does hit a
+// dead connection now fails fast (native 5s idle timeout) and iOS evicts it,
+// so the next ping/request opens a fresh one.
+const KEEPALIVE_INTERVAL_MS = 8_000;
 
 /**
  * While the app is foregrounded and signed in, sends a tiny JMAP request on an

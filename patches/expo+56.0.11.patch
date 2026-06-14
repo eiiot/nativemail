@@ -1,0 +1,19 @@
+diff --git a/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift b/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift
+index 8f31e93..dbdad37 100644
+--- a/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift
++++ b/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift
+@@ -24,7 +24,13 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
+     let request = NSMutableURLRequest(url: url)
+     URLProtocol.setProperty(requestInit.redirect == .follow, forKey: "shouldFollowRedirects", in: request)
+     request.httpMethod = requestInit.method
+-    request.timeoutInterval = 0
++    // Patched (fastmail-glass): expo/fetch hardcodes 0, disabling the
++    // per-request idle timeout and letting a request on a dead, reused HTTP/2
++    // connection black-hole for minutes. A finite idle timeout makes a dead
++    // connection (zero bytes) fail in ~5s so iOS evicts it and the retry opens
++    // a fresh connection. Resets on every received byte, so healthy/slow-but-
++    // progressing responses are unaffected.
++    request.timeoutInterval = 5
+     if requestInit.credentials == .include {
+       request.httpShouldHandleCookies = true
+       if let cookies = HTTPCookieStorage.shared.cookies(for: url) {
