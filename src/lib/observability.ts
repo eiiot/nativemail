@@ -4,9 +4,8 @@ import * as Updates from 'expo-updates';
 import { Platform } from 'react-native';
 
 const observabilityDeviceIdKey = 'notifications.deviceId';
-const observabilityRelayUrlKey = 'notifications.relayUrl';
 const defaultObservabilityRelayUrl =
-  process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://staging-nativemail-notifications.tuft.host';
+  process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://staging-nativemail-telemetry.tuft.host';
 const maxQueuedEvents = 200;
 const maxBatchSize = 25;
 const flushDelayMs = 750;
@@ -131,9 +130,11 @@ function scheduleObservabilityFlush() {
 }
 
 async function getObservabilityRelayUrl() {
-  const storedUrl = await SecureStore.getItemAsync(observabilityRelayUrlKey, secureStoreOptions);
-
-  return normalizeRelayUrl(storedUrl || defaultObservabilityRelayUrl);
+  // Always use the current default observability endpoint, ignoring any URL
+  // stored from push-notification registration: a device may have a stale
+  // relay URL persisted (e.g. an orphaned tunnel route), which would silently
+  // drop all telemetry. Push registration still uses its own stored URL.
+  return normalizeRelayUrl(defaultObservabilityRelayUrl);
 }
 
 async function getObservabilityDeviceId() {

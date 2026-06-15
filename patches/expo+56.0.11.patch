@@ -1,3 +1,24 @@
+diff --git a/node_modules/expo/ios/Fetch/ExpoFetchModule.swift b/node_modules/expo/ios/Fetch/ExpoFetchModule.swift
+index efdd744..ea38780 100644
+--- a/node_modules/expo/ios/Fetch/ExpoFetchModule.swift
++++ b/node_modules/expo/ios/Fetch/ExpoFetchModule.swift
+@@ -24,6 +24,16 @@ public final class ExpoFetchModule: Module {
+       urlSession.invalidateAndCancel()
+     }
+ 
++    // Patched (fastmail-glass): when the app returns to the foreground, flush
++    // the pooled HTTP connections. iOS reclaims sockets while the app is
++    // suspended (TN2277), so the first request after resume would otherwise
++    // reuse a dead connection and black-hole for seconds. reset() guarantees
++    // future requests open a new socket (~240ms) instead of a dead one — this
++    // is the fix for "open the app and the first email hangs".
++    OnAppBecomesActive {
++      urlSession.reset {}
++    }
++
+     // swiftlint:disable:next closure_body_length
+     Class(NativeResponse.self) {
+       Constructor {
 diff --git a/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift b/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift
 index 8f31e93..dbdad37 100644
 --- a/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift
