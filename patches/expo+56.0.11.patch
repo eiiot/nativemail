@@ -20,19 +20,10 @@ index efdd744..ea38780 100644
      Class(NativeResponse.self) {
        Constructor {
 diff --git a/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift b/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift
-index 8f31e93..72da88a 100644
+index 8f31e93..dbdad37 100644
 --- a/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift
 +++ b/node_modules/expo/ios/Fetch/ExpoURLSessionTask.swift
-@@ -8,6 +8,8 @@ import ExpoModulesCore
- internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSessionDataDelegate, @unchecked Sendable {
-   private let delegate: ExpoURLSessionTaskDelegate
-   private var task: URLSessionDataTask?
-+  // Patched (fastmail-glass): per-request URLSession (see start()).
-+  private var ownedSession: URLSession?
- 
-   init(delegate: ExpoURLSessionTaskDelegate) {
-     self.delegate = delegate
-@@ -24,7 +26,13 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
+@@ -24,7 +24,13 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
      let request = NSMutableURLRequest(url: url)
      URLProtocol.setProperty(requestInit.redirect == .follow, forKey: "shouldFollowRedirects", in: request)
      request.httpMethod = requestInit.method
@@ -47,29 +38,3 @@ index 8f31e93..72da88a 100644
      if requestInit.credentials == .include {
        request.httpShouldHandleCookies = true
        if let cookies = HTTPCookieStorage.shared.cookies(for: url) {
-@@ -38,10 +46,24 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
-     }
-     request.httpBody = requestBody
- 
--    let task = urlSession.dataTask(with: request as URLRequest)
-+    // Patched (fastmail-glass): run each request on its OWN URLSession so it
-+    // draws from an empty connection pool and opens a FRESH connection
-+    // (~240ms). The shared session otherwise reuses a pooled HTTP/2 connection
-+    // that has gone stale (sockets reclaimed on app suspension / NAT idle
-+    // timeout); iOS then limps ~6-8s recovering it. The per-request session
-+    // inherits the shared configuration (timeouts, cookies) and reuses the
-+    // shared delegate proxy (which routes purely by task), then is invalidated
-+    // once the task finishes so it does not leak.
-+    let perRequestSession = URLSession(
-+      configuration: urlSession.configuration,
-+      delegate: urlSessionDelegate,
-+      delegateQueue: nil)
-+    self.ownedSession = perRequestSession
-+    let task = perRequestSession.dataTask(with: request as URLRequest)
-     urlSessionDelegate.addDelegate(task: task, delegate: self)
-     self.task = task
-     task.resume()
-+    perRequestSession.finishTasksAndInvalidate()
-     self.delegate.urlSessionDidStart(self)
-   }
- 

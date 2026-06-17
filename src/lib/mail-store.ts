@@ -19,7 +19,11 @@ type MessagePatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 const LOCAL_ACTION_REFRESH_SUPPRESSION_MS = 8000;
 const SLOW_FOREGROUND_BODY_FETCH_MS = 1000;
 const BACKGROUND_MESSAGE_BODY_NETWORK_FETCHES_ENABLED = false;
-const FOREGROUND_MESSAGE_BODY_FETCH_MAX_ATTEMPTS = 3;
+// Capped at 2 (was 3): combined with the transport-level read-retry, 3 body
+// attempts could stack into a ~18s retry storm at cold start when each attempt
+// hit a hanging connection. With one reused connection (kept warm + flushed on
+// foreground) retries should rarely fire; bound the worst case regardless.
+const FOREGROUND_MESSAGE_BODY_FETCH_MAX_ATTEMPTS = 2;
 const FOREGROUND_MESSAGE_BODY_FETCH_RETRY_DELAYS_MS = [120, 350];
 
 type MessageBodyFetchPriority = 'background' | 'foreground';
