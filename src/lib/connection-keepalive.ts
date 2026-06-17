@@ -17,6 +17,14 @@ const KEEPALIVE_INTERVAL_MS = 8_000;
  * on a dead reused connection. Returns a cleanup function.
  */
 export function startConnectionKeepAlive(): () => void {
+  // Disabled: each request now opens its own fresh connection (per-request
+  // URLSession patch), so a periodic ping warms nothing — it's pure connection
+  // churn (~1 fresh TLS handshake every 8s). That churn, on top of per-request
+  // connections, can trip Fastmail's connection-rate throttling and is a likely
+  // cause of the intermittent multi-second stalls/timeouts. Turn it off.
+  return () => {};
+
+  // eslint-disable-next-line no-unreachable
   let timer: ReturnType<typeof setInterval> | null = null;
   let inFlight = false;
 
