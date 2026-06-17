@@ -237,12 +237,14 @@ let transportRequestSequence = 0
 
 const SLOW_TRANSPORT_REQUEST_MS = 1000
 const MAX_CONCURRENT_TRANSPORT_REQUESTS = 3
-// The native iOS layer sets a 5s per-request URLSession idle timeout (see
-// patches/expo+*.patch, which fixes expo/fetch hardcoding 0) so a dead
-// connection fails fast and iOS evicts it, letting the retry open a fresh one.
-// This JS timer is only a backstop in case the native patch is ever absent, so
-// it sits above the native value — native eviction should fire first.
-const TRANSPORT_REQUEST_TIMEOUT_MS = 9000
+// Each request runs on its own fresh URLSession (patches/expo+*.patch), so a
+// healthy connection returns the first byte in ~350ms even on a cold radio.
+// At cold boot, though, an occasional fresh connection hangs waiting for the
+// first byte; the iOS-level timeouts don't reliably fire, so this JS timer is
+// what actually bounds it. Keep it low so a hung cold connection fails fast
+// and the retry opens another fresh connection (which is typically ~350ms)
+// rather than the user waiting out a 9s+ stall on app launch.
+const TRANSPORT_REQUEST_TIMEOUT_MS = 3000
 const TRANSPORT_BLOB_TIMEOUT_MS = 30000
 
 function createJmapTransportTimeoutError(timeoutMs: number) {
