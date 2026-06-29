@@ -236,7 +236,13 @@ let activeTransportRequestCount = 0
 let transportRequestSequence = 0
 
 const SLOW_TRANSPORT_REQUEST_MS = 1000
-const MAX_CONCURRENT_TRANSPORT_REQUESTS = 3
+// Serialize transport requests (was 3 concurrent). Telemetry showed that on
+// app open, a burst of requests released onto the freshly-connected shared
+// HTTP/2 connection all at once wedges it — every request then times out for
+// ~20-30s before recovery, while total volume is tiny. Running them one at a
+// time keeps the connection from being overwhelmed. The dedup/single-flight in
+// the scheduler still collapses identical concurrent reads into one request.
+const MAX_CONCURRENT_TRANSPORT_REQUESTS = 1
 // Each request runs on its own fresh URLSession (patches/expo+*.patch), so a
 // healthy connection returns the first byte in ~350ms even on a cold radio.
 // At cold boot, though, an occasional fresh connection hangs waiting for the
