@@ -5,7 +5,7 @@ import { Platform } from 'react-native';
 
 const observabilityDeviceIdKey = 'notifications.deviceId';
 const defaultObservabilityRelayUrl =
-  process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://staging-nativemail-telemetry.tuft.host';
+  process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://s-nativemail-telemetry.tuft.host';
 const maxQueuedEvents = 200;
 const maxBatchSize = 25;
 const flushDelayMs = 750;
