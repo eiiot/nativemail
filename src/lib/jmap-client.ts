@@ -7,6 +7,7 @@ import {
 import { getFastmailJmapToken } from '@/lib/fastmail-token'
 import type { Message, MessageAttachment } from '@/lib/mock-mail'
 import { observeDuration, observeError, observeEvent } from '@/lib/observability'
+import { requireOptionalNativeModule } from 'expo-modules-core'
 import {
     createRequestScheduler,
     createStateTracker,
@@ -236,13 +237,11 @@ let activeTransportRequestCount = 0
 let transportRequestSequence = 0
 
 const SLOW_TRANSPORT_REQUEST_MS = 1000
-// Serialize transport requests (was 3 concurrent). Telemetry showed that on
-// app open, a burst of requests released onto the freshly-connected shared
-// HTTP/2 connection all at once wedges it — every request then times out for
-// ~20-30s before recovery, while total volume is tiny. Running them one at a
-// time keeps the connection from being overwhelmed. The dedup/single-flight in
-// the scheduler still collapses identical concurrent reads into one request.
-const MAX_CONCURRENT_TRANSPORT_REQUESTS = 1
+// Back to 3: serializing didn't prevent the wedge (a lone request wedges too)
+// and only added head-of-line blocking in our own queue (a stuck request
+// blocked everything behind it). The wedge is handled by flushing the
+// connection on a run of failures (see noteTransportOutcome) instead.
+const MAX_CONCURRENT_TRANSPORT_REQUESTS = 3
 // Each request runs on its own fresh URLSession (patches/expo+*.patch), so a
 // healthy connection returns the first byte in ~350ms even on a cold radio.
 // At cold boot, though, an occasional fresh connection hangs waiting for the
@@ -284,6 +283,49 @@ function isTransientTransportError(error: unknown) {
         message.includes('connection closed') ||
         message.includes('software caused connection abort')
     )
+}
+
+// Wedge recovery: the app keeps one long-lived HTTP/2 connection. It can wedge
+// — every request black-holes for ~20-30s — and retrying on the same dead
+// socket just rides out the stall. iOS pools sockets below the JS layer, so the
+// only way to force a fresh connection is the native socket flush we patched
+// into expo/fetch (resetConnections). When we see a run of transient
+// failures/timeouts, flush so the next request opens a clean socket.
+const WEDGE_TIMEOUT_THRESHOLD = 2
+const WEDGE_FLUSH_COOLDOWN_MS = 8000
+let consecutiveTransportFailures = 0
+let lastConnectionFlushAt = 0
+
+function flushTransportConnections() {
+    try {
+        const expoFetch = requireOptionalNativeModule<{
+            resetConnections?: () => void
+        }>('ExpoFetchModule')
+        expoFetch?.resetConnections?.()
+        observeEvent('jmap.transport.connection-flush', {
+            available: expoFetch?.resetConnections ? true : false,
+        })
+    } catch (error: unknown) {
+        observeError('jmap.transport.connection-flush.failed', error, {})
+    }
+}
+
+function noteTransportOutcome(failedTransiently: boolean) {
+    if (!failedTransiently) {
+        consecutiveTransportFailures = 0
+        return
+    }
+
+    consecutiveTransportFailures += 1
+
+    if (
+        consecutiveTransportFailures >= WEDGE_TIMEOUT_THRESHOLD &&
+        Date.now() - lastConnectionFlushAt > WEDGE_FLUSH_COOLDOWN_MS
+    ) {
+        lastConnectionFlushAt = Date.now()
+        consecutiveTransportFailures = 0
+        flushTransportConnections()
+    }
 }
 
 // All JMAP transport requests flow through this scheduler: identical
@@ -1812,11 +1854,25 @@ function createBearerTransport(token: string, operation?: string): Transport {
         // Joined callers share one network request. The shared fetch uses the
         // first caller's abort signal; if that caller aborts, joiners see the
         // abort and rely on their own retry handling.
-        return transportScheduler.schedule(runWithRetry, {
-            key: scheduling.key,
-            priority: scheduling.priority,
-            signal: options.signal,
-        })
+        return transportScheduler
+            .schedule(runWithRetry, {
+                key: scheduling.key,
+                priority: scheduling.priority,
+                signal: options.signal,
+            })
+            .then(
+                (value) => {
+                    noteTransportOutcome(false)
+                    return value
+                },
+                (error) => {
+                    noteTransportOutcome(
+                        options.signal?.aborted !== true &&
+                            isTransientTransportError(error)
+                    )
+                    throw error
+                }
+            )
     }
 
     async function performRequest<T>(

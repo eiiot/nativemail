@@ -1,8 +1,8 @@
 diff --git a/node_modules/expo/ios/Fetch/ExpoFetchModule.swift b/node_modules/expo/ios/Fetch/ExpoFetchModule.swift
-index efdd744..ea38780 100644
+index efdd744..1120b9d 100644
 --- a/node_modules/expo/ios/Fetch/ExpoFetchModule.swift
 +++ b/node_modules/expo/ios/Fetch/ExpoFetchModule.swift
-@@ -24,6 +24,16 @@ public final class ExpoFetchModule: Module {
+@@ -24,6 +24,25 @@ public final class ExpoFetchModule: Module {
        urlSession.invalidateAndCancel()
      }
  
@@ -13,6 +13,15 @@ index efdd744..ea38780 100644
 +    // future requests open a new socket (~240ms) instead of a dead one — this
 +    // is the fix for "open the app and the first email hangs".
 +    OnAppBecomesActive {
++      urlSession.reset {}
++    }
++
++    // Patched (fastmail-glass): JS-callable socket flush. When the app detects
++    // the shared HTTP/2 connection has wedged (a run of request timeouts),
++    // it calls this so future requests open a fresh socket instead of riding
++    // the dead connection for ~20s. iOS pools sockets below the JS layer, so
++    // this native reset is the only way JS can force a new connection.
++    Function("resetConnections") {
 +      urlSession.reset {}
 +    }
 +
