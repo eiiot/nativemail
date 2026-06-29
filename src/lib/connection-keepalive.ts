@@ -17,9 +17,13 @@ const KEEPALIVE_INTERVAL_MS = 8_000;
  * on a dead reused connection. Returns a cleanup function.
  */
 export function startConnectionKeepAlive(): () => void {
-  // Re-enabled now that requests share ONE reused connection again: a ping
-  // multiplexes on that connection (no new handshake, no churn) and keeps it
-  // from going idle-stale, so the connection stays warm between taps.
+  // Disabled: the stalls were never a stale-connection problem (a fresh socket
+  // fails too) — they're Fastmail rate-limiting the app after a request burst.
+  // A periodic ping is just extra request volume that adds to that, with no
+  // benefit. Leave the connection alone.
+  return () => {};
+
+  // eslint-disable-next-line no-unreachable
   let timer: ReturnType<typeof setInterval> | null = null;
   let inFlight = false;
 

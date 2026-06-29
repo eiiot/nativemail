@@ -334,6 +334,10 @@ function noteTransportOutcome(failedTransiently: boolean) {
 // prefetch traffic when slots are contended.
 const transportScheduler = createRequestScheduler({
     maxConcurrent: MAX_CONCURRENT_TRANSPORT_REQUESTS,
+    // Pace requests so the app can't fire a burst that trips Fastmail's
+    // rate/abuse protection (which then drops all of the app's requests for
+    // ~30s). Telemetry showed ~7 requests in ~1.2s preceding every stall.
+    minSpacingMs: 350,
     onEvent: observeEvent,
 })
 

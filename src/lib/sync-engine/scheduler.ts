@@ -40,10 +40,16 @@ function createAbortError(): Error {
 
 export function createRequestScheduler({
     maxConcurrent = 3,
+    minSpacingMs = 0,
     now = Date.now,
     onEvent,
 }: {
     maxConcurrent?: number
+    // Minimum gap between task STARTS. Bursts of requests trip Fastmail's
+    // rate/abuse protection (it then drops all of the app's requests for
+    // ~30s), so pacing keeps the app under the limit. A lone request after an
+    // idle gap still starts immediately; only back-to-back bursts are spread.
+    minSpacingMs?: number
     now?: () => number
     onEvent?: (name: string, properties: SchedulerEventProperties) => void
 } = {}): RequestScheduler {
@@ -51,6 +57,8 @@ export function createRequestScheduler({
     const inFlightByKey = new Map<string, { promise: Promise<unknown>; task: ScheduledTask | null }>()
     let running = 0
     let sequence = 0
+    let lastStartAt = 0
+    let spacingTimer: ReturnType<typeof setTimeout> | null = null
 
     function emit(name: string, properties: SchedulerEventProperties) {
         onEvent?.(name, properties)
@@ -87,6 +95,21 @@ export function createRequestScheduler({
 
     function pump() {
         while (running < maxConcurrent) {
+            // Enforce minimum spacing between starts so a queued burst is
+            // spread out instead of fired all at once.
+            if (minSpacingMs > 0 && queue.length > 0) {
+                const sinceLast = now() - lastStartAt
+                if (sinceLast < minSpacingMs) {
+                    if (!spacingTimer) {
+                        spacingTimer = setTimeout(() => {
+                            spacingTimer = null
+                            pump()
+                        }, minSpacingMs - sinceLast)
+                    }
+                    return
+                }
+            }
+
             const task = takeNextTask()
 
             if (!task) {
@@ -107,6 +130,7 @@ export function createRequestScheduler({
             }
 
             running += 1
+            lastStartAt = now()
             // Keys can embed full request bodies; truncate before emitting.
             emit('sync-scheduler.task.start', {
                 key: task.key ? task.key.slice(0, 80) : 'none',
