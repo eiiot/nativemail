@@ -816,8 +816,48 @@ export async function fetchJmapMessage(
     }
 }
 
+// Simplest possible body fetch: tap email -> one direct request for its body
+// -> parse -> show. No shared client, scheduler, dedup, pacing, retries, or
+// keepalive — none of the machinery that was burying (and likely causing) the
+// slowness. The JMAP session (apiUrl + accountId) is fetched once and cached.
+const DIRECT_SESSION_URL = 'https://api.fastmail.com/jmap/session'
+const DIRECT_BODY_TIMEOUT_MS = 12000
+let cachedDirectSession: { accountId: Id; apiUrl: string; token: string } | null = null
+
+async function getDirectJmapSession(token: string, signal?: AbortSignal) {
+    if (cachedDirectSession && cachedDirectSession.token === token) {
+        return cachedDirectSession
+    }
+    const response = await fetch(DIRECT_SESSION_URL, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal,
+    })
+    if (!response.ok) {
+        throw new Error(await getErrorMessage(response, 'GET'))
+    }
+    const session = (await response.json()) as {
+        apiUrl?: string
+        primaryAccounts?: Record<string, string>
+    }
+    const accountId = session.primaryAccounts?.[EMAIL_CAPABILITY_URI]
+    const apiUrl = session.apiUrl
+    if (!accountId || !apiUrl) {
+        throw new Error('Fastmail JMAP session is missing the mail account.')
+    }
+    cachedDirectSession = { accountId, apiUrl, token }
+    return cachedDirectSession
+}
+
+function buildMessageBodyFromEmail(email: EmailObject): JmapMessageBody {
+    const html = getHtmlBody(email)
+    return {
+        attachments: getDownloadableAttachments(email, html),
+        html: html ?? null,
+        text: getPlainTextBody(email, { allowPreviewFallback: true }),
+    }
+}
+
 export async function fetchJmapMessageBody({
-    inlineCidImageData = false,
     messageId,
     signal,
 }: {
@@ -826,67 +866,78 @@ export async function fetchJmapMessageBody({
     signal?: AbortSignal
 }): Promise<JmapMessageBody | null> {
     const startedAt = Date.now()
-    const clientStartedAt = Date.now()
-    const { accountId, client, token } = await createFastmailJmapClient(
-        signal,
-        'message-body'
-    )
+    const token = await getFastmailJmapToken()
+    if (!token) {
+        throw new FastmailJmapTokenMissingError()
+    }
 
-    observeDuration('jmap.message-body.client-ready', clientStartedAt, {
-        messageId,
-    })
+    const { accountId, apiUrl } = await getDirectJmapSession(token, signal)
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), DIRECT_BODY_TIMEOUT_MS)
+    const onAbort = () => controller.abort()
+    signal?.addEventListener('abort', onAbort, { once: true })
 
     try {
-        const emailGetStartedAt = Date.now()
-        const messages = await getEmails(
-            client,
-            accountId,
-            [messageId],
-            emailBodyProperties,
-            signal
-        )
-        const message = messages[0]
-
-        observeDuration('jmap.message-body.email-get', emailGetStartedAt, {
-            found: Boolean(message),
-            messageId,
+        const response = await fetch(apiUrl, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+            },
+            body: JSON.stringify({
+                using: ['urn:ietf:params:jmap:core', EMAIL_CAPABILITY_URI],
+                methodCalls: [
+                    [
+                        'Email/get',
+                        {
+                            accountId,
+                            ids: [messageId],
+                            properties: emailBodyProperties,
+                            bodyProperties: emailBodyPartProperties,
+                            fetchHTMLBodyValues: true,
+                            fetchTextBodyValues: true,
+                        },
+                        '0',
+                    ],
+                ],
+            }),
+            signal: controller.signal,
         })
 
-        const parseStartedAt = Date.now()
-        const body = message
-            ? await getEmailBody(client, accountId, token, message, {
-                  inlineCidImageData,
-                  signal,
-              })
-            : null
+        if (!response.ok) {
+            throw new Error(await getErrorMessage(response, 'POST'))
+        }
 
-        observeDuration('jmap.message-body.parse', parseStartedAt, {
-            attachments: body?.attachments?.length ?? 0,
-            hasBody: Boolean(body),
-            html: body?.html?.trim() ? body.html.length : 0,
-            inlineCidImageData,
-            messageId,
-            text: body?.text?.trim() ? body.text.length : 0,
-        })
+        const json = (await response.json()) as {
+            methodResponses?: [
+                string,
+                { list?: EmailObject[]; type?: string },
+                string,
+            ][]
+        }
+        const invocation = json.methodResponses?.[0]
+        if (invocation?.[0] === 'error') {
+            throw new Error(`JMAP Email/get: ${invocation[1]?.type ?? 'unknown'}`)
+        }
+        const email = invocation?.[1]?.list?.[0]
+        const body = email ? buildMessageBodyFromEmail(email) : null
 
         observeDuration('jmap.message-body.success', startedAt, {
-            attachments: body?.attachments?.length ?? 0,
             hasBody: Boolean(body),
             html: body?.html?.trim() ? body.html.length : 0,
-            inlineCidImageData,
             messageId,
             text: body?.text?.trim() ? body.text.length : 0,
         })
 
         return body
     } catch (error: unknown) {
-        observeError('jmap.message-body.failed', error, {
-            inlineCidImageData,
-            messageId,
-        })
+        observeError('jmap.message-body.failed', error, { messageId })
         throw error
     } finally {
-        await releaseFastmailJmapClient(client)
+        clearTimeout(timeout)
+        signal?.removeEventListener('abort', onAbort)
     }
 }
 
