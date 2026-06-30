@@ -46,7 +46,6 @@
         }
       ],
       "expo-sqlite",
-      "./plugins/withFastmailUrlSession",
       [
         "expo-notifications",
         {
