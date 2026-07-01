@@ -7,14 +7,10 @@ import {
 import { getFastmailJmapToken } from '@/lib/fastmail-token'
 import type { Message, MessageAttachment } from '@/lib/mock-mail'
 import { observeDuration, observeError, observeEvent } from '@/lib/observability'
-import { requireOptionalNativeModule } from 'expo-modules-core'
 import {
-    createRequestScheduler,
     createStateTracker,
-    type SchedulerPriority,
     type SyncStateSnapshot,
 } from '@/lib/sync-engine'
-import { sha256 } from 'js-sha256'
 import {
     EMAIL_CAPABILITY_URI,
     Email,
@@ -237,19 +233,12 @@ let activeTransportRequestCount = 0
 let transportRequestSequence = 0
 
 const SLOW_TRANSPORT_REQUEST_MS = 1000
-// Back to 3: serializing didn't prevent the wedge (a lone request wedges too)
-// and only added head-of-line blocking in our own queue (a stuck request
-// blocked everything behind it). The wedge is handled by flushing the
-// connection on a run of failures (see noteTransportOutcome) instead.
-const MAX_CONCURRENT_TRANSPORT_REQUESTS = 3
-// Each request runs on its own fresh URLSession (patches/expo+*.patch), so a
-// healthy connection returns the first byte in ~350ms even on a cold radio.
-// At cold boot, though, an occasional fresh connection hangs waiting for the
-// first byte; the iOS-level timeouts don't reliably fire, so this JS timer is
-// what actually bounds it. Keep it low so a hung cold connection fails fast
-// and the retry opens another fresh connection (which is typically ~350ms)
-// rather than the user waiting out a 9s+ stall on app launch.
-const TRANSPORT_REQUEST_TIMEOUT_MS = 3000
+// Every request is a plain stock fetch with no scheduler and no retry, so this
+// JS timer is the only thing that bounds a connection that hangs waiting for
+// the first byte (the iOS-level timeouts don't reliably fire). Match the direct
+// body fetch's budget so a legitimately slow-but-working request isn't killed;
+// a genuinely hung request fails here and the caller refetches on next use.
+const TRANSPORT_REQUEST_TIMEOUT_MS = 12000
 const TRANSPORT_BLOB_TIMEOUT_MS = 30000
 
 function createJmapTransportTimeoutError(timeoutMs: number) {
@@ -257,91 +246,6 @@ function createJmapTransportTimeoutError(timeoutMs: number) {
     error.name = 'JmapTransportTimeoutError'
     return error
 }
-
-function isTransientTransportError(error: unknown) {
-    if (!(error instanceof Error)) {
-        return false
-    }
-
-    if (error.name === 'JmapTransportTimeoutError') {
-        return true
-    }
-
-    const message = error.message.toLowerCase()
-
-    if (message.startsWith('fastmail jmap')) {
-        // HTTP-status errors from getErrorMessage are not connection issues.
-        return false
-    }
-
-    return (
-        message.includes('network connection was lost') ||
-        message.includes('network request failed') ||
-        message.includes('fetch failed') ||
-        message.includes('could not connect') ||
-        message.includes('connection reset') ||
-        message.includes('connection closed') ||
-        message.includes('software caused connection abort')
-    )
-}
-
-// Wedge recovery: the app keeps one long-lived HTTP/2 connection. It can wedge
-// — every request black-holes for ~20-30s — and retrying on the same dead
-// socket just rides out the stall. iOS pools sockets below the JS layer, so the
-// only way to force a fresh connection is the native socket flush we patched
-// into expo/fetch (resetConnections). When we see a run of transient
-// failures/timeouts, flush so the next request opens a clean socket.
-const WEDGE_TIMEOUT_THRESHOLD = 2
-const WEDGE_FLUSH_COOLDOWN_MS = 8000
-let consecutiveTransportFailures = 0
-let lastConnectionFlushAt = 0
-
-function flushTransportConnections() {
-    try {
-        const expoFetch = requireOptionalNativeModule<{
-            resetConnections?: () => void
-        }>('ExpoFetchModule')
-        expoFetch?.resetConnections?.()
-        observeEvent('jmap.transport.connection-flush', {
-            available: expoFetch?.resetConnections ? true : false,
-        })
-    } catch (error: unknown) {
-        observeError('jmap.transport.connection-flush.failed', error, {})
-    }
-}
-
-function noteTransportOutcome(failedTransiently: boolean) {
-    if (!failedTransiently) {
-        consecutiveTransportFailures = 0
-        return
-    }
-
-    consecutiveTransportFailures += 1
-
-    if (
-        consecutiveTransportFailures >= WEDGE_TIMEOUT_THRESHOLD &&
-        Date.now() - lastConnectionFlushAt > WEDGE_FLUSH_COOLDOWN_MS
-    ) {
-        lastConnectionFlushAt = Date.now()
-        consecutiveTransportFailures = 0
-        flushTransportConnections()
-    }
-}
-
-// All JMAP transport requests flow through this scheduler: identical
-// concurrent reads collapse into a single request, mutations are never
-// deduplicated, and foreground body fetches start before metadata and
-// prefetch traffic when slots are contended.
-const transportScheduler = createRequestScheduler({
-    maxConcurrent: MAX_CONCURRENT_TRANSPORT_REQUESTS,
-    // Pace requests so the app can't fire a burst that trips Fastmail's
-    // rate/abuse protection (which then drops all of the app's requests for
-    // ~30s). Telemetry showed ~7 requests in ~1.2s preceding every stall.
-    minSpacingMs: 350,
-    onEvent: observeEvent,
-})
-
-const mutationJmapMethodPattern = /\/(set|copy|import)$/
 
 // Server state strings recorded from snapshot fetches, used to skip a
 // refresh when nothing changed server-side. A mailbox view only counts as
@@ -363,61 +267,6 @@ function recordMailboxViewStates(states: SyncStateSnapshot, mailboxKey: string) 
 
     mailStateTracker.recordStates(states)
     mailboxesFreshForCurrentState.add(mailboxKey)
-}
-
-function getJmapMethodNames(body: unknown): string[] {
-    if (typeof body !== 'string' || !body.trim().startsWith('{')) {
-        return []
-    }
-
-    try {
-        const parsed = JSON.parse(body) as { methodCalls?: unknown }
-
-        if (!Array.isArray(parsed.methodCalls)) {
-            return []
-        }
-
-        return parsed.methodCalls
-            .map((call) =>
-                Array.isArray(call) && typeof call[0] === 'string' ? call[0] : null
-            )
-            .filter((name): name is string => name !== null)
-    } catch {
-        return []
-    }
-}
-
-function getTransportScheduling(
-    method: 'GET' | 'POST',
-    requestUrl: string,
-    options: TransportRequestOptions,
-    keyScope: string,
-    operation?: string
-): { key?: string; priority: SchedulerPriority } {
-    if (method === 'POST') {
-        const methodNames = getJmapMethodNames(options.body)
-
-        if (methodNames.some((name) => mutationJmapMethodPattern.test(name))) {
-            return { priority: 'mutation' }
-        }
-
-        if (typeof options.body !== 'string') {
-            return { priority: 'metadata' }
-        }
-    }
-
-    const priority: SchedulerPriority =
-        operation === 'message-body'
-            ? 'foreground'
-            : operation === 'keepalive'
-              ? 'prefetch'
-              : 'metadata'
-    const body = method === 'POST' && typeof options.body === 'string' ? options.body : ''
-
-    return {
-        key: `${keyScope}:${method}:${requestUrl}:${body}`,
-        priority,
-    }
 }
 
 export async function createFastmailJmapClient(
@@ -1857,77 +1706,18 @@ export async function probeFastmailMessageBodyRaw({
 }
 
 function createBearerTransport(token: string, operation?: string): Transport {
-    // Scopes dedup keys to this token so a request issued after re-auth
-    // never joins an in-flight request from the previous token.
-    const keyScope = sha256(token).slice(0, 8)
-
+    // Every JMAP request is a plain stock fetch, the same as the direct message
+    // body fetch: no scheduler, no pacing, no dedup, no retry. The old shared
+    // scheduler serialized and paced all traffic (and flushed connections on
+    // failure runs), which is what made mark-as-read and mailbox refresh stall
+    // for seconds behind each other. performRequest bounds each fetch with its
+    // own timeout; a failure surfaces to the caller, which refetches on next use.
     async function request<T>(
         method: 'GET' | 'POST',
         url: string | URL,
         options: TransportRequestOptions = {}
     ): Promise<T> {
-        const scheduling = getTransportScheduling(
-            method,
-            getFastmailRequestUrl(url),
-            options,
-            keyScope,
-            operation
-        )
-
-        const run = () => performRequest<T>(method, url, options)
-        // Read requests (the only ones given a dedup key) get one immediate
-        // retry on timeout or connection loss: a fresh attempt usually lands
-        // on a healthy connection. Mutations keep their own retry handling.
-        const runWithRetry =
-            scheduling.key === undefined
-                ? run
-                : async () => {
-                      try {
-                          return await run()
-                      } catch (error: unknown) {
-                          if (
-                              options.signal?.aborted === true ||
-                              !isTransientTransportError(error)
-                          ) {
-                              throw error
-                          }
-
-                          observeEvent(
-                              'jmap.transport.read-retry',
-                              {
-                                  method,
-                                  operation: operation ?? 'unknown',
-                                  path: getObservabilityPath(getFastmailRequestUrl(url)),
-                              },
-                              'warn'
-                          )
-
-                          return run()
-                      }
-                  }
-
-        // Joined callers share one network request. The shared fetch uses the
-        // first caller's abort signal; if that caller aborts, joiners see the
-        // abort and rely on their own retry handling.
-        return transportScheduler
-            .schedule(runWithRetry, {
-                key: scheduling.key,
-                priority: scheduling.priority,
-                signal: options.signal,
-            })
-            .then(
-                (value) => {
-                    noteTransportOutcome(false)
-                    return value
-                },
-                (error) => {
-                    noteTransportOutcome(
-                        options.signal?.aborted !== true &&
-                            isTransientTransportError(error)
-                    )
-                    throw error
-                }
-            )
+        return performRequest<T>(method, url, options)
     }
 
     async function performRequest<T>(
