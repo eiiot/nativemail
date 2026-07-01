@@ -673,11 +673,104 @@ const DIRECT_SESSION_URL = 'https://api.fastmail.com/jmap/session'
 const DIRECT_BODY_TIMEOUT_MS = 12000
 let cachedDirectSession: { accountId: Id; apiUrl: string; token: string } | null = null
 
+type NativeFetchInit = {
+    method?: string
+    headers?: HeadersInit
+    body?: string | null
+    signal?: AbortSignal
+    responseType?: 'blob' | 'text'
+}
+
+function createFetchAbortError(): Error {
+    const error = new Error('Fetch request was aborted')
+    error.name = 'AbortError'
+    return error
+}
+
+function parseXhrHeaders(raw: string): Headers {
+    const headers = new Headers()
+    for (const line of raw.split('\r\n')) {
+        const separator = line.indexOf(':')
+        if (separator > 0) {
+            headers.append(
+                line.slice(0, separator).trim(),
+                line.slice(separator + 1).trim()
+            )
+        }
+    }
+    return headers
+}
+
+// Sends the request through React Native's built-in networking
+// (XMLHttpRequest -> RCTHTTPRequestHandler -> NSURLSession with RN's default
+// configuration) instead of the global `fetch`, which Expo overrides with its
+// own URLSession client (expo/fetch). That client reuses one pooled connection
+// whose stale-socket recovery intermittently stalls a request for 5-8s on
+// mobile; the official Fastmail app and every other RN app use this stock stack
+// and don't hit it. expo/fetch only replaces `fetch`, never XMLHttpRequest, so
+// this routes around it entirely with no native build. Returns a real Response.
+function nativeFetch(url: string, init: NativeFetchInit = {}): Promise<Response> {
+    const { method = 'GET', headers, body, signal, responseType } = init
+
+    return new Promise<Response>((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(createFetchAbortError())
+            return
+        }
+
+        const xhr = new XMLHttpRequest()
+        xhr.open(method, url)
+
+        if (responseType === 'blob') {
+            xhr.responseType = 'blob'
+        }
+
+        new Headers(headers).forEach((value, key) => {
+            xhr.setRequestHeader(key, value)
+        })
+
+        const onAbort = () => xhr.abort()
+        signal?.addEventListener('abort', onAbort, { once: true })
+        const cleanup = () => signal?.removeEventListener('abort', onAbort)
+
+        xhr.onload = () => {
+            cleanup()
+            // A completed HTTP response always carries a real status; status 0
+            // here means a transport-level failure that slipped past onerror.
+            if (xhr.status === 0) {
+                reject(new TypeError('Network request failed'))
+                return
+            }
+            const payload =
+                responseType === 'blob'
+                    ? (xhr.response as Blob)
+                    : xhr.responseText
+            resolve(
+                new Response(payload, {
+                    headers: parseXhrHeaders(xhr.getAllResponseHeaders()),
+                    status: xhr.status,
+                    statusText: xhr.statusText,
+                })
+            )
+        }
+        xhr.onerror = () => {
+            cleanup()
+            reject(new TypeError('Network request failed'))
+        }
+        xhr.onabort = () => {
+            cleanup()
+            reject(createFetchAbortError())
+        }
+
+        xhr.send(body ?? null)
+    })
+}
+
 async function getDirectJmapSession(token: string, signal?: AbortSignal) {
     if (cachedDirectSession && cachedDirectSession.token === token) {
         return cachedDirectSession
     }
-    const response = await fetch(DIRECT_SESSION_URL, {
+    const response = await nativeFetch(DIRECT_SESSION_URL, {
         headers: { Authorization: `Bearer ${token}` },
         signal,
     })
@@ -728,7 +821,7 @@ export async function fetchJmapMessageBody({
     signal?.addEventListener('abort', onAbort, { once: true })
 
     try {
-        const response = await fetch(apiUrl, {
+        const response = await nativeFetch(apiUrl, {
             method: 'POST',
             headers: {
                 Authorization: `Bearer ${token}`,
@@ -1856,10 +1949,15 @@ function createBearerTransport(token: string, operation?: string): Transport {
 
         try {
             response = await Promise.race([
-                fetch(requestUrl, {
-                    body: method === 'POST' ? options.body : undefined,
+                nativeFetch(requestUrl, {
+                    body:
+                        method === 'POST' && typeof options.body === 'string'
+                            ? options.body
+                            : undefined,
                     headers,
                     method,
+                    responseType:
+                        options.responseType === 'blob' ? 'blob' : 'text',
                     signal: fetchController.signal,
                 }),
                 timeoutPromise,
