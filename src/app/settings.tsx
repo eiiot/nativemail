@@ -26,7 +26,6 @@ import { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Clipboard,
-  KeyboardAvoidingView,
   Platform,
   Pressable,
   ScrollView,
@@ -316,9 +315,7 @@ export default function SettingsScreen() {
         />
       </Stack.Toolbar>
 
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        style={[styles.root, { backgroundColor: colors.background }]}>
+      <View style={[styles.root, { backgroundColor: colors.background }]}>
         <ScrollView
           contentContainerStyle={[
             styles.content,
@@ -607,7 +604,7 @@ export default function SettingsScreen() {
             ) : null}
           </View>
         </ScrollView>
-      </KeyboardAvoidingView>
+      </View>
     </>
   );
 }
