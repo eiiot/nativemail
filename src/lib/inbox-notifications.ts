@@ -13,7 +13,11 @@ import { Platform } from 'react-native';
 const notificationDeviceIdKey = 'notifications.deviceId';
 const notificationRelayUrlKey = 'notifications.relayUrl';
 const defaultNotificationRelayUrl =
-  process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://staging-nativemail-notifications.tuft.host';
+  process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://nativemail-relay.fly.dev';
+const legacyNotificationRelayUrls = new Set([
+  'https://staging-nativemail-notifications.tuft.host',
+  'https://s-nativemail-telemetry.tuft.host',
+]);
 export const inboxMessageNotificationCategoryId = 'nativemailInboxMessage';
 export const archiveInboxNotificationActionId = 'archiveInboxMessage';
 const secureStoreOptions: SecureStore.SecureStoreOptions = {
@@ -122,8 +126,13 @@ export async function archiveInboxNotificationResponse(
 
 export async function getNotificationRelayUrl() {
   const storedUrl = await SecureStore.getItemAsync(notificationRelayUrlKey, secureStoreOptions);
+  const normalizedUrl = normalizeRelayUrl(storedUrl || defaultNotificationRelayUrl);
 
-  return normalizeRelayUrl(storedUrl || defaultNotificationRelayUrl);
+  if (legacyNotificationRelayUrls.has(normalizedUrl)) {
+    return saveNotificationRelayUrl(defaultNotificationRelayUrl);
+  }
+
+  return normalizedUrl;
 }
 
 export async function saveNotificationRelayUrl(url: string) {
