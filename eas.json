@@ -27,5 +27,13 @@
     "production": {
       "autoIncrement": true
     }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "appleId": "eliot.supceo@gmail.com",
+        "ascAppId": "6800177659"
+      }
+    }
   }
 }
