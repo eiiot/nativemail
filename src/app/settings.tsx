@@ -3,6 +3,15 @@ import {
   hasFastmailJmapToken,
   saveFastmailJmapToken,
 } from '@/lib/fastmail-token';
+import { setDebugMode, useDebugMode } from '@/lib/debug-mode';
+import {
+  getNotificationRelayUrl,
+  registerForInboxNotifications,
+  sendInboxNotificationTest,
+  unregisterInboxNotifications,
+} from '@/lib/inbox-notifications';
+import { describeJmapError, diagnoseFastmailJmap } from '@/lib/jmap-client';
+import * as Updates from 'expo-updates';
 import { router } from 'expo-router';
 import { useEffect, useState } from 'react';
 import {
@@ -14,10 +23,11 @@ import {
   Text,
   TextInput,
   View,
+  Switch,
   useColorScheme,
 } from 'react-native';
 
-const UPDATE_LABEL = 'settings-hotfix-2';
+const UPDATE_LABEL = 'settings-restored-1';
 
 export default function SettingsScreen() {
   const dark = useColorScheme() === 'dark';
@@ -26,6 +36,15 @@ export default function SettingsScreen() {
   const [saving, setSaving] = useState(false);
   const [token, setToken] = useState('');
   const [status, setStatus] = useState('');
+  const [diagnostic, setDiagnostic] = useState('');
+  const [testing, setTesting] = useState(false);
+  const [notificationBusy, setNotificationBusy] = useState(false);
+  const [notificationRegistered, setNotificationRegistered] = useState(false);
+  const [relayUrl, setRelayUrl] = useState('');
+  const [notificationStatus, setNotificationStatus] = useState('');
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState('');
+  const debugMode = useDebugMode();
 
   useEffect(() => {
     hasFastmailJmapToken()
@@ -35,6 +54,12 @@ export default function SettingsScreen() {
       })
       .catch(() => setStatus('Secure storage unavailable'))
       .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    getNotificationRelayUrl()
+      .then(setRelayUrl)
+      .catch((error: unknown) => setNotificationStatus(describeJmapError(error)));
   }, []);
 
   const save = async () => {
@@ -64,6 +89,88 @@ export default function SettingsScreen() {
       setStatus('Could not clear token');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const testConnection = async () => {
+    if (!configured || testing) return;
+    setTesting(true);
+    setDiagnostic('Testing Fastmail JMAP connection…');
+    try {
+      const report = await diagnoseFastmailJmap();
+      setDiagnostic(report.steps.map((step) => `${step.status.toUpperCase()} ${step.label}\n${step.detail}`).join('\n\n'));
+    } catch (error) {
+      setDiagnostic(describeJmapError(error, { includeStack: true }));
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const registerNotifications = async () => {
+    if (!configured || !relayUrl.trim() || notificationBusy) return;
+    setNotificationBusy(true);
+    setNotificationStatus('Registering device…');
+    try {
+      const result = await registerForInboxNotifications(relayUrl);
+      setRelayUrl(result.relayUrl);
+      setNotificationRegistered(true);
+      setNotificationStatus(result.status);
+    } catch (error) {
+      setNotificationRegistered(false);
+      setNotificationStatus(describeJmapError(error));
+    } finally {
+      setNotificationBusy(false);
+    }
+  };
+
+  const testNotifications = async () => {
+    if (!relayUrl.trim() || notificationBusy) return;
+    setNotificationBusy(true);
+    setNotificationStatus('Sending test notification…');
+    try {
+      setNotificationStatus(await sendInboxNotificationTest(relayUrl));
+    } catch (error) {
+      setNotificationStatus(describeJmapError(error));
+    } finally {
+      setNotificationBusy(false);
+    }
+  };
+
+  const stopNotifications = async () => {
+    if (!relayUrl.trim() || notificationBusy) return;
+    setNotificationBusy(true);
+    try {
+      setNotificationStatus(await unregisterInboxNotifications(relayUrl));
+      setNotificationRegistered(false);
+    } catch (error) {
+      setNotificationStatus(describeJmapError(error));
+    } finally {
+      setNotificationBusy(false);
+    }
+  };
+
+  const checkForUpdate = async () => {
+    if (updateBusy) return;
+    setUpdateBusy(true);
+    setUpdateStatus('Checking for EAS update…');
+    try {
+      if (!Updates.isEnabled) {
+        setUpdateStatus('EAS Updates are not enabled in this build.');
+        return;
+      }
+      const result = await Updates.checkForUpdateAsync();
+      if (!result.isAvailable) {
+        setUpdateStatus('No update available.');
+        return;
+      }
+      setUpdateStatus('Downloading update…');
+      await Updates.fetchUpdateAsync();
+      setUpdateStatus('Update downloaded. Reloading…');
+      await Updates.reloadAsync();
+    } catch (error) {
+      setUpdateStatus(describeJmapError(error));
+    } finally {
+      setUpdateBusy(false);
     }
   };
 
@@ -114,6 +221,63 @@ export default function SettingsScreen() {
             {loading ? <ActivityIndicator size="small" /> : null}
             <Text style={[styles.status, { color: colors.secondary }]}>{status}</Text>
           </View>
+          <Pressable
+            accessibilityRole="button"
+            disabled={!configured || testing}
+            onPress={testConnection}
+            style={[styles.wideButton, (!configured || testing) && styles.disabled]}>
+            <Text style={[styles.secondaryText, { color: colors.text }]}>{testing ? 'Testing…' : 'Test Connection'}</Text>
+          </Pressable>
+          {diagnostic ? <Text selectable style={[styles.report, { backgroundColor: colors.input, color: colors.text }]}>{diagnostic}</Text> : null}
+        </View>
+
+        <View style={[styles.card, { backgroundColor: colors.card }]}>
+          <Text style={[styles.cardTitle, { color: colors.text }]}>Inbox notifications</Text>
+          <Text style={[styles.subtitle, { color: colors.secondary }]}>Fly push relay for new Inbox mail</Text>
+          <TextInput
+            autoCapitalize="none"
+            autoCorrect={false}
+            onChangeText={setRelayUrl}
+            placeholder="Notification relay URL"
+            placeholderTextColor={colors.secondary}
+            style={[styles.input, { backgroundColor: colors.input, color: colors.text }]}
+            value={relayUrl}
+          />
+          <Pressable
+            accessibilityRole="button"
+            disabled={!configured || !relayUrl.trim() || notificationBusy}
+            onPress={registerNotifications}
+            style={[styles.primaryWideButton, (!configured || !relayUrl.trim() || notificationBusy) && styles.disabled]}>
+            <Text style={styles.primaryText}>{notificationBusy ? 'Working…' : notificationRegistered ? 'Registered' : 'Register Device'}</Text>
+          </Pressable>
+          <View style={styles.actions}>
+            <Pressable accessibilityRole="button" disabled={notificationBusy} onPress={testNotifications} style={styles.flexButton}>
+              <Text style={[styles.secondaryText, { color: colors.text }]}>Send Test</Text>
+            </Pressable>
+            <Pressable accessibilityRole="button" disabled={notificationBusy} onPress={stopNotifications} style={styles.flexButton}>
+              <Text style={[styles.secondaryText, { color: colors.text }]}>Stop</Text>
+            </Pressable>
+          </View>
+          {notificationStatus ? <Text selectable style={[styles.report, { backgroundColor: colors.input, color: colors.text }]}>{notificationStatus}</Text> : null}
+        </View>
+
+        <View style={[styles.card, { backgroundColor: colors.card }]}>
+          <Text style={[styles.cardTitle, { color: colors.text }]}>App updates</Text>
+          <Text style={[styles.subtitle, { color: colors.secondary }]}>Pull the latest EAS update</Text>
+          <Pressable accessibilityRole="button" disabled={updateBusy} onPress={checkForUpdate} style={styles.wideButton}>
+            <Text style={[styles.secondaryText, { color: colors.text }]}>{updateBusy ? 'Checking…' : 'Check for EAS Update'}</Text>
+          </Pressable>
+          <Text selectable style={[styles.report, { backgroundColor: colors.input, color: colors.text }]}>
+            {updateStatus || `channel: ${Updates.channel ?? 'none'}\nruntime: ${Updates.runtimeVersion ?? 'none'}\nupdate: ${Updates.updateId ?? 'embedded'}`}
+          </Text>
+        </View>
+
+        <View style={[styles.card, styles.debugRow, { backgroundColor: colors.card }]}>
+          <View style={styles.debugText}>
+            <Text style={[styles.cardTitle, { color: colors.text }]}>Debug mode</Text>
+            <Text style={[styles.subtitle, { color: colors.secondary }]}>Show render and navigation diagnostics</Text>
+          </View>
+          <Switch accessibilityLabel="Debug mode" onValueChange={setDebugMode} value={debugMode} />
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -128,7 +292,7 @@ const styles = StyleSheet.create({
   closeText: { color: '#111111', fontSize: 36, fontWeight: '300', lineHeight: 39 },
   updateLabel: { fontSize: 12 },
   title: { fontSize: 32, fontWeight: '700', marginBottom: 22, marginTop: 18 },
-  card: { borderRadius: 24, padding: 18 },
+  card: { borderRadius: 24, marginBottom: 14, padding: 18 },
   cardTitle: { fontSize: 17, fontWeight: '600' },
   subtitle: { fontSize: 14, marginBottom: 16, marginTop: 2 },
   input: { borderRadius: 14, fontSize: 15, minHeight: 48, paddingHorizontal: 14, paddingVertical: 12 },
@@ -140,4 +304,10 @@ const styles = StyleSheet.create({
   secondaryText: { fontSize: 15, fontWeight: '600' },
   statusRow: { alignItems: 'center', flexDirection: 'row', gap: 8, marginTop: 16 },
   status: { fontSize: 13 },
+  wideButton: { alignItems: 'center', backgroundColor: 'rgba(118,118,128,0.18)', borderRadius: 14, justifyContent: 'center', marginTop: 12, minHeight: 46 },
+  primaryWideButton: { alignItems: 'center', backgroundColor: '#0a84ff', borderRadius: 14, justifyContent: 'center', marginTop: 12, minHeight: 46 },
+  flexButton: { alignItems: 'center', backgroundColor: 'rgba(118,118,128,0.18)', borderRadius: 14, flex: 1, justifyContent: 'center', minHeight: 46 },
+  report: { borderRadius: 12, fontFamily: 'Menlo', fontSize: 11, lineHeight: 15, marginTop: 12, padding: 12 },
+  debugRow: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
+  debugText: { flex: 1, paddingRight: 12 },
 });
