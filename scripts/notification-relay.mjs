@@ -9,7 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const CORE_CAPABILITY = 'urn:ietf:params:jmap:core';
 const MAIL_CAPABILITY = 'urn:ietf:params:jmap:mail';
-const FASTMAIL_SESSION_URL = 'https://api.fastmail.com/jmap/session';
+const FASTMAIL_SESSION_URL = process.env.FASTMAIL_SESSION_URL ?? 'https://api.fastmail.com/jmap/session';
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EVENT_SOURCE_TYPES = '*';
 const ACTIVE_NOTIFICATION_LIMIT = 200;
@@ -141,6 +141,81 @@ async function route(request, response) {
 
     await appendObservabilityEvents(events);
     sendJson(response, 200, { accepted: events.length, ok: true });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/jmap/message-body') {
+    const startedAt = Date.now();
+    const authorization = request.headers.authorization;
+    if (!authorization?.startsWith('Bearer ') || authorization.length <= 7) {
+      sendJson(response, 401, { error: 'A Fastmail bearer token is required.' });
+      return;
+    }
+
+    const body = await readJson(request);
+    const messageId = getRequiredString(body, 'messageId');
+    const token = authorization.slice(7);
+    const sessionStartedAt = Date.now();
+    const sessionResponse = await fetch(FASTMAIL_SESSION_URL, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!sessionResponse.ok) {
+      sendJson(response, sessionResponse.status, { error: 'Fastmail JMAP session failed.' });
+      return;
+    }
+
+    const session = await sessionResponse.json();
+    const accountId = session.primaryAccounts?.[MAIL_CAPABILITY];
+    if (!accountId || !session.apiUrl) {
+      sendJson(response, 502, { error: 'Fastmail JMAP session is missing mail request details.' });
+      return;
+    }
+
+    const jmapStartedAt = Date.now();
+    const jmapResponse = await fetch(session.apiUrl, {
+      body: JSON.stringify({
+        using: [CORE_CAPABILITY, MAIL_CAPABILITY],
+        methodCalls: [[
+          'Email/get',
+          {
+            accountId,
+            ids: [messageId],
+            properties: ['id', 'blobId', 'bodyStructure', 'bodyValues', 'htmlBody', 'textBody', 'attachments'],
+            bodyProperties: ['partId', 'blobId', 'size', 'name', 'type', 'charset', 'cid', 'disposition'],
+            fetchHTMLBodyValues: true,
+            fetchTextBodyValues: true,
+          },
+          '0',
+        ]],
+      }),
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      method: 'POST',
+    });
+    if (!jmapResponse.ok) {
+      sendJson(response, jmapResponse.status, { error: 'Fastmail Email/get failed.' });
+      return;
+    }
+
+    const result = await jmapResponse.json();
+    const invocation = result.methodResponses?.[0];
+    if (invocation?.[0] === 'error') {
+      sendJson(response, 502, { error: `Fastmail Email/get: ${invocation[1]?.type ?? 'unknown'}` });
+      return;
+    }
+
+    sendJson(response, 200, {
+      email: invocation?.[1]?.list?.[0] ?? null,
+      ok: true,
+      timings: {
+        jmapMs: Date.now() - jmapStartedAt,
+        sessionMs: jmapStartedAt - sessionStartedAt,
+        totalMs: Date.now() - startedAt,
+      },
+    });
     return;
   }
 

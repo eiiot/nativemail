@@ -670,6 +670,9 @@ export async function fetchJmapMessage(
 // keepalive — none of the machinery that was burying (and likely causing) the
 // slowness. The JMAP session (apiUrl + accountId) is fetched once and cached.
 const DIRECT_SESSION_URL = 'https://api.fastmail.com/jmap/session'
+const MESSAGE_BODY_RELAY_URL =
+    process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://nativemail-relay.fly.dev'
+const MESSAGE_BODY_RELAY_TIMEOUT_MS = 5000
 const DIRECT_BODY_TIMEOUT_MS = 12000
 let cachedDirectSession: { accountId: Id; apiUrl: string; token: string } | null = null
 
@@ -799,6 +802,53 @@ function buildMessageBodyFromEmail(email: EmailObject): JmapMessageBody {
     }
 }
 
+async function fetchJmapMessageBodyViaRelay(
+    token: string,
+    messageId: string,
+    signal?: AbortSignal
+): Promise<JmapMessageBody | null> {
+    const startedAt = Date.now()
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), MESSAGE_BODY_RELAY_TIMEOUT_MS)
+    const onAbort = () => controller.abort()
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    try {
+        const response = await nativeFetch(`${MESSAGE_BODY_RELAY_URL}/jmap/message-body`, {
+            method: 'POST',
+            headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ messageId }),
+            signal: controller.signal,
+        })
+        if (!response.ok) {
+            throw new Error(`Message relay failed with HTTP ${response.status}.`)
+        }
+
+        const result = (await response.json()) as {
+            email?: EmailObject | null
+            timings?: { jmapMs?: number; sessionMs?: number; totalMs?: number }
+        }
+        const body = result.email ? buildMessageBodyFromEmail(result.email) : null
+        observeDuration('jmap.message-body.relay.success', startedAt, {
+            hasBody: Boolean(body),
+            html: body?.html?.trim() ? body.html.length : 0,
+            messageId,
+            relayJmapMs: result.timings?.jmapMs,
+            relaySessionMs: result.timings?.sessionMs,
+            relayTotalMs: result.timings?.totalMs,
+            text: body?.text?.trim() ? body.text.length : 0,
+        })
+        return body
+    } finally {
+        clearTimeout(timeout)
+        signal?.removeEventListener('abort', onAbort)
+    }
+}
+
 export async function fetchJmapMessageBody({
     messageId,
     signal,
@@ -811,6 +861,19 @@ export async function fetchJmapMessageBody({
     const token = await getFastmailJmapToken()
     if (!token) {
         throw new FastmailJmapTokenMissingError()
+    }
+
+    try {
+        return await fetchJmapMessageBodyViaRelay(token, messageId, signal)
+    } catch (error: unknown) {
+        if (signal?.aborted) {
+            throw error
+        }
+        observeError('jmap.message-body.relay.failed', error, {
+            durationMs: Date.now() - startedAt,
+            messageId,
+        })
+        observeEvent('jmap.message-body.direct-fallback', { messageId })
     }
 
     const { accountId, apiUrl } = await getDirectJmapSession(token, signal)
