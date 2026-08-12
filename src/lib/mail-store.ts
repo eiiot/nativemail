@@ -18,7 +18,9 @@ type MessagePatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 
 const LOCAL_ACTION_REFRESH_SUPPRESSION_MS = 8000;
 const SLOW_FOREGROUND_BODY_FETCH_MS = 1000;
-const BACKGROUND_MESSAGE_BODY_NETWORK_FETCHES_ENABLED = false;
+// The relay serializes these behind foreground reads and aborts them as soon as
+// the user opens a message, so warming visible rows no longer competes with taps.
+const BACKGROUND_MESSAGE_BODY_NETWORK_FETCHES_ENABLED = true;
 // One attempt — simplest possible: tap email, one direct fetch, show it. No
 // retry storms.
 const FOREGROUND_MESSAGE_BODY_FETCH_MAX_ATTEMPTS = 1;
