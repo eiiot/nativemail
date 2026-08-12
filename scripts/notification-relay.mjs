@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { Buffer } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -29,6 +30,12 @@ const OBSERVABILITY_LOG_PATH =
   process.env.NOTIFICATION_RELAY_OBSERVABILITY_PATH ??
   path.join(homedir(), '.nativemail', 'fastmail-glass', 'observability.jsonl');
 const OBSERVABILITY_EVENT_LIMIT = 100;
+const JMAP_SESSION_CACHE_TTL_MS = 10 * 60 * 1000;
+const JMAP_SESSION_TIMEOUT_MS = 2000;
+const JMAP_BODY_TIMEOUT_MS = 4000;
+
+/** @type {Map<string, { accountId: string; apiUrl: string; expiresAt: number }>} */
+const jmapSessionCache = new Map();
 
 /** @type {Map<string, Subscriber>} */
 const subscribers = new Map();
@@ -156,23 +163,10 @@ async function route(request, response) {
     const messageId = getRequiredString(body, 'messageId');
     const token = authorization.slice(7);
     const sessionStartedAt = Date.now();
-    const sessionResponse = await fetch(FASTMAIL_SESSION_URL, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!sessionResponse.ok) {
-      sendJson(response, sessionResponse.status, { error: 'Fastmail JMAP session failed.' });
-      return;
-    }
-
-    const session = await sessionResponse.json();
-    const accountId = session.primaryAccounts?.[MAIL_CAPABILITY];
-    if (!accountId || !session.apiUrl) {
-      sendJson(response, 502, { error: 'Fastmail JMAP session is missing mail request details.' });
-      return;
-    }
+    const { accountId, apiUrl, cacheHit } = await getCachedJmapSession(token);
 
     const jmapStartedAt = Date.now();
-    const jmapResponse = await fetch(session.apiUrl, {
+    const jmapResponse = await fetchWithTimeout(apiUrl, {
       body: JSON.stringify({
         using: [CORE_CAPABILITY, MAIL_CAPABILITY],
         methodCalls: [[
@@ -194,7 +188,7 @@ async function route(request, response) {
         'Content-Type': 'application/json',
       },
       method: 'POST',
-    });
+    }, JMAP_BODY_TIMEOUT_MS, 'Fastmail Email/get timed out');
     if (!jmapResponse.ok) {
       sendJson(response, jmapResponse.status, { error: 'Fastmail Email/get failed.' });
       return;
@@ -207,14 +201,17 @@ async function route(request, response) {
       return;
     }
 
+    const timings = {
+      jmapMs: Date.now() - jmapStartedAt,
+      sessionCacheHit: cacheHit,
+      sessionMs: jmapStartedAt - sessionStartedAt,
+      totalMs: Date.now() - startedAt,
+    };
+    console.log('[relay] message body success', JSON.stringify({ messageId, ...timings }));
     sendJson(response, 200, {
       email: invocation?.[1]?.list?.[0] ?? null,
       ok: true,
-      timings: {
-        jmapMs: Date.now() - jmapStartedAt,
-        sessionMs: jmapStartedAt - sessionStartedAt,
-        totalMs: Date.now() - startedAt,
-      },
+      timings,
     });
     return;
   }
@@ -333,6 +330,50 @@ async function route(request, response) {
   }
 
   sendJson(response, 404, { error: 'Not found.' });
+}
+
+async function getCachedJmapSession(token) {
+  const cacheKey = createHash('sha256').update(token).digest('hex');
+  const cached = jmapSessionCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { ...cached, cacheHit: true };
+  }
+
+  const sessionResponse = await fetchWithTimeout(FASTMAIL_SESSION_URL, {
+    headers: { Authorization: `Bearer ${token}` },
+  }, JMAP_SESSION_TIMEOUT_MS, 'Fastmail JMAP session timed out');
+  if (!sessionResponse.ok) {
+    throw new Error(`Fastmail JMAP session failed with HTTP ${sessionResponse.status}.`);
+  }
+
+  const session = await sessionResponse.json();
+  const accountId = session.primaryAccounts?.[MAIL_CAPABILITY];
+  if (!accountId || !session.apiUrl) {
+    throw new Error('Fastmail JMAP session is missing mail request details.');
+  }
+
+  const value = {
+    accountId,
+    apiUrl: session.apiUrl,
+    expiresAt: Date.now() + JMAP_SESSION_CACHE_TTL_MS,
+  };
+  jmapSessionCache.set(cacheKey, value);
+  return { ...value, cacheHit: false };
+}
+
+async function fetchWithTimeout(url, options, timeoutMs, message) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error(message)), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(message);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function createSubscriber({ deviceId, expoPushToken, jmapToken }) {

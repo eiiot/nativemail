@@ -18,11 +18,13 @@ afterEach(async () => {
 describe('notification relay message-body proxy', () => {
   it('fetches one email body from Fastmail without persisting the bearer token', async () => {
     const seenAuthorization = [];
+    let sessionRequests = 0;
     const fastmail = createServer(async (request, response) => {
       seenAuthorization.push(request.headers.authorization ?? '');
       response.setHeader('content-type', 'application/json');
 
       if (request.url === '/session') {
+        sessionRequests += 1;
         response.end(JSON.stringify({
           apiUrl: `http://127.0.0.1:${fastmail.address().port}/api`,
           primaryAccounts: { 'urn:ietf:params:jmap:mail': 'account-1' },
@@ -62,7 +64,14 @@ describe('notification relay message-body proxy', () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ email: { id: 'message-1' }, ok: true });
-    expect(seenAuthorization).toEqual(['Bearer secret-token', 'Bearer secret-token']);
+    const secondResponse = await fetch(`http://127.0.0.1:${relayPort}/jmap/message-body`, {
+      body: JSON.stringify({ messageId: 'message-1' }),
+      headers: { authorization: 'Bearer secret-token', 'content-type': 'application/json' },
+      method: 'POST',
+    });
+    expect(secondResponse.status).toBe(200);
+    expect(sessionRequests).toBe(1);
+    expect(seenAuthorization).toEqual(['Bearer secret-token', 'Bearer secret-token', 'Bearer secret-token']);
   });
 });
 

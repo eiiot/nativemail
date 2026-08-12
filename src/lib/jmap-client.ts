@@ -672,7 +672,8 @@ export async function fetchJmapMessage(
 const DIRECT_SESSION_URL = 'https://api.fastmail.com/jmap/session'
 const MESSAGE_BODY_RELAY_URL =
     process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://nativemail-relay.fly.dev'
-const MESSAGE_BODY_RELAY_TIMEOUT_MS = 5000
+const MESSAGE_BODY_RELAY_TIMEOUT_MS = 4500
+const MESSAGE_BODY_HEDGE_DELAY_MS = 500
 const DIRECT_BODY_TIMEOUT_MS = 12000
 let cachedDirectSession: { accountId: Id; apiUrl: string; token: string } | null = null
 
@@ -849,33 +850,12 @@ async function fetchJmapMessageBodyViaRelay(
     }
 }
 
-export async function fetchJmapMessageBody({
-    messageId,
-    signal,
-}: {
-    inlineCidImageData?: boolean
-    messageId: string
+async function fetchJmapMessageBodyDirect(
+    token: string,
+    messageId: string,
     signal?: AbortSignal
-}): Promise<JmapMessageBody | null> {
+): Promise<JmapMessageBody | null> {
     const startedAt = Date.now()
-    const token = await getFastmailJmapToken()
-    if (!token) {
-        throw new FastmailJmapTokenMissingError()
-    }
-
-    try {
-        return await fetchJmapMessageBodyViaRelay(token, messageId, signal)
-    } catch (error: unknown) {
-        if (signal?.aborted) {
-            throw error
-        }
-        observeError('jmap.message-body.relay.failed', error, {
-            durationMs: Date.now() - startedAt,
-            messageId,
-        })
-        observeEvent('jmap.message-body.direct-fallback', { messageId })
-    }
-
     const { accountId, apiUrl } = await getDirectJmapSession(token, signal)
 
     const controller = new AbortController()
@@ -944,6 +924,79 @@ export async function fetchJmapMessageBody({
         clearTimeout(timeout)
         signal?.removeEventListener('abort', onAbort)
     }
+}
+
+export async function fetchJmapMessageBody({
+    messageId,
+    signal,
+}: {
+    inlineCidImageData?: boolean
+    messageId: string
+    signal?: AbortSignal
+}): Promise<JmapMessageBody | null> {
+    const startedAt = Date.now()
+    const token = await getFastmailJmapToken()
+    if (!token) {
+        throw new FastmailJmapTokenMissingError()
+    }
+
+    const relayPromise = fetchJmapMessageBodyViaRelay(token, messageId, signal)
+    const relayBeforeHedge = await Promise.race([
+        relayPromise.then(
+            (body) => ({ body, status: 'success' as const }),
+            (error: unknown) => ({ error, status: 'failed' as const })
+        ),
+        new Promise<{ status: 'hedge' }>((resolve) => {
+            setTimeout(() => resolve({ status: 'hedge' }), MESSAGE_BODY_HEDGE_DELAY_MS)
+        }),
+    ])
+
+    if (relayBeforeHedge.status === 'success') {
+        return relayBeforeHedge.body
+    }
+    if (signal?.aborted) {
+        throw relayBeforeHedge.status === 'failed' ? relayBeforeHedge.error : new Error('Request aborted')
+    }
+
+    observeEvent('jmap.message-body.hedge.start', {
+        messageId,
+        reason: relayBeforeHedge.status === 'failed' ? 'relay-failed' : 'relay-slow',
+    })
+    const directPromise = fetchJmapMessageBodyDirect(token, messageId, signal)
+
+    if (relayBeforeHedge.status === 'failed') {
+        observeError('jmap.message-body.relay.failed', relayBeforeHedge.error, {
+            durationMs: Date.now() - startedAt,
+            messageId,
+        })
+        return directPromise
+    }
+
+    return firstSuccessfulMessageBody([
+        relayPromise.then((body) => ({ body, source: 'relay' as const })),
+        directPromise.then((body) => ({ body, source: 'direct' as const })),
+    ], messageId, startedAt)
+}
+
+async function firstSuccessfulMessageBody(
+    requests: Promise<{ body: JmapMessageBody | null; source: 'direct' | 'relay' }>[],
+    messageId: string,
+    startedAt: number
+) {
+    return new Promise<JmapMessageBody | null>((resolve, reject) => {
+        const errors: unknown[] = []
+        for (const request of requests) {
+            request.then(({ body, source }) => {
+                observeDuration('jmap.message-body.hedge.winner', startedAt, { messageId, source })
+                resolve(body)
+            }).catch((error: unknown) => {
+                errors.push(error)
+                if (errors.length === requests.length) {
+                    reject(errors[errors.length - 1])
+                }
+            })
+        }
+    })
 }
 
 export async function fetchJmapThreadMessages({
