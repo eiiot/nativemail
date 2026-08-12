@@ -151,8 +151,8 @@ const inboxMailboxPageSize = 50;
 const inboxLoadMoreThreshold = 420;
 const inboxBottomLoadRearmOffsetDelta = 240;
 const inboxBodyWarmDelayMs = 650;
-const inboxBodyWarmBatchSize = 1;
-const inboxBodyWarmBatchGapMs = 450;
+const inboxBodyWarmBatchSize = 5;
+const inboxBodyWarmBatchGapMs = 800;
 const inboxCacheWriteDelayMs = 700;
 const inboxDebugDiskBatchSize = 8;
 const inboxDebugDiskBatchGapMs = 120;
@@ -972,7 +972,7 @@ export default function InboxScreen() {
         `start=${cursor} size=${batch.length} rows=${messageIds.length}`,
       );
       void prefetchMessageBodies(batch, {
-        concurrency: 1,
+        concurrency: batch.length,
         limit: batch.length,
         source: 'inbox-body-warm',
       })

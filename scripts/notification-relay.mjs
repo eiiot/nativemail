@@ -38,7 +38,6 @@ const JMAP_PROXY_TIMEOUT_MS = 8000;
 /** @type {Map<string, { accountId: string; apiUrl: string; expiresAt: number }>} */
 const jmapSessionCache = new Map();
 /** @type {Map<string, { activeController?: AbortController; activePriority?: number; running: boolean; tasks: Array<{ priority: number; run: (signal: AbortSignal) => Promise<unknown>; resolve: (value: unknown) => void; reject: (error: unknown) => void }> }>} */
-const jmapQueues = new Map();
 
 /** @type {Map<string, Subscriber>} */
 const subscribers = new Map();
@@ -163,20 +162,27 @@ async function route(request, response) {
     }
 
     const body = await readJson(request);
-    const messageId = getRequiredString(body, 'messageId');
+    const requestedMessageIds = Array.isArray(body.messageIds)
+      ? body.messageIds.filter((value) => typeof value === 'string' && value.length > 0)
+      : [getRequiredString(body, 'messageId')];
+    const messageIds = [...new Set(requestedMessageIds)].slice(0, 20);
+    if (!messageIds.length) {
+      sendJson(response, 400, { error: 'At least one message id is required.' });
+      return;
+    }
     const token = authorization.slice(7);
     const sessionStartedAt = Date.now();
     const { accountId, apiUrl, cacheHit } = await getCachedJmapSession(token);
 
     const jmapStartedAt = Date.now();
-    const jmapResponse = await enqueueJmapRequest(token, 0, (signal) => fetchWithTimeout(apiUrl, {
+    const jmapResponse = await fetchWithTimeout(apiUrl, {
       body: JSON.stringify({
         using: [CORE_CAPABILITY, MAIL_CAPABILITY],
         methodCalls: [[
           'Email/get',
           {
             accountId,
-            ids: [messageId],
+            ids: messageIds,
             properties: ['id', 'blobId', 'bodyStructure', 'bodyValues', 'htmlBody', 'textBody', 'attachments'],
             bodyProperties: ['partId', 'blobId', 'size', 'name', 'type', 'charset', 'cid', 'disposition'],
             fetchHTMLBodyValues: true,
@@ -191,8 +197,7 @@ async function route(request, response) {
         'Content-Type': 'application/json',
       },
       method: 'POST',
-      signal,
-    }, JMAP_BODY_TIMEOUT_MS, 'Fastmail Email/get timed out'));
+    }, JMAP_BODY_TIMEOUT_MS, 'Fastmail Email/get timed out');
     if (!jmapResponse.ok) {
       sendJson(response, jmapResponse.status, { error: 'Fastmail Email/get failed.' });
       return;
@@ -211,9 +216,11 @@ async function route(request, response) {
       sessionMs: jmapStartedAt - sessionStartedAt,
       totalMs: Date.now() - startedAt,
     };
-    console.log('[relay] message body success', JSON.stringify({ messageId, ...timings }));
+    const emails = invocation?.[1]?.list ?? [];
+    console.log('[relay] message body success', JSON.stringify({ messageIds, count: emails.length, ...timings }));
     sendJson(response, 200, {
-      email: invocation?.[1]?.list?.[0] ?? null,
+      email: messageIds.length === 1 ? emails[0] ?? null : undefined,
+      emails,
       ok: true,
       timings,
     });
@@ -236,8 +243,7 @@ async function route(request, response) {
     }
     const method = getOptionalString(proxyRequest, 'method') ?? 'GET';
     const requestBody = getOptionalString(proxyRequest, 'body');
-    const priority = getJmapRequestPriority(requestBody);
-    const upstream = await enqueueJmapRequest(token, priority, (signal) => fetchWithTimeout(target, {
+    const upstream = await fetchWithTimeout(target, {
       body: method === 'GET' ? undefined : requestBody,
       headers: {
         Accept: getOptionalString(proxyRequest, 'accept') ?? 'application/json',
@@ -245,8 +251,7 @@ async function route(request, response) {
         ...(requestBody ? { 'Content-Type': 'application/json' } : {}),
       },
       method,
-      signal,
-    }, JMAP_PROXY_TIMEOUT_MS, 'Fastmail proxy request timed out'));
+    }, JMAP_PROXY_TIMEOUT_MS, 'Fastmail proxy request timed out');
     const payload = Buffer.from(await upstream.arrayBuffer());
     response.statusCode = upstream.status;
     response.setHeader('content-type', upstream.headers.get('content-type') ?? 'application/octet-stream');
@@ -419,50 +424,6 @@ async function fetchWithTimeout(url, options, timeoutMs, message) {
 
 function isAllowedFastmailHostname(hostname) {
   return hostname === 'fastmail.com' || hostname.endsWith('.fastmail.com');
-}
-
-function getJmapRequestPriority(body) {
-  if (!body) return 1;
-  try {
-    const methodCalls = JSON.parse(body).methodCalls ?? [];
-    if (methodCalls.some(([name, args]) => name === 'Email/get' && (args?.fetchHTMLBodyValues || args?.fetchTextBodyValues))) return 0;
-    if (methodCalls.some(([name]) => name === 'Email/set' || name === 'Mailbox/set')) return 1;
-  } catch {}
-  return 2;
-}
-
-function enqueueJmapRequest(token, priority, run) {
-  const key = createHash('sha256').update(token).digest('hex');
-  const queue = jmapQueues.get(key) ?? { running: false, tasks: [] };
-  jmapQueues.set(key, queue);
-  return new Promise((resolve, reject) => {
-    queue.tasks.push({ priority, reject, resolve, run });
-    queue.tasks.sort((left, right) => left.priority - right.priority);
-    if (priority === 0 && (queue.activePriority ?? 0) > 0) {
-      queue.activeController?.abort();
-    }
-    void drainJmapQueue(key, queue);
-  });
-}
-
-async function drainJmapQueue(key, queue) {
-  if (queue.running) return;
-  queue.running = true;
-  while (queue.tasks.length) {
-    const task = queue.tasks.shift();
-    const controller = new AbortController();
-    queue.activeController = controller;
-    queue.activePriority = task.priority;
-    try {
-      task.resolve(await task.run(controller.signal));
-    } catch (error) {
-      task.reject(error);
-    }
-  }
-  queue.running = false;
-  queue.activeController = undefined;
-  queue.activePriority = undefined;
-  if (!queue.tasks.length) jmapQueues.delete(key);
 }
 
 async function createSubscriber({ deviceId, expoPushToken, jmapToken }) {

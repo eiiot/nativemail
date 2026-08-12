@@ -73,7 +73,68 @@ describe('notification relay message-body proxy', () => {
     expect(sessionRequests).toBe(1);
     expect(seenAuthorization).toEqual(['Bearer secret-token', 'Bearer secret-token', 'Bearer secret-token']);
   });
+
+  it('fetches multiple immutable email bodies in one JMAP call', async () => {
+    let requestedIds = [];
+    const fastmail = createServer(async (request, response) => {
+      response.setHeader('content-type', 'application/json');
+      if (request.url === '/session') {
+        response.end(JSON.stringify({
+          apiUrl: `http://127.0.0.1:${fastmail.address().port}/api`,
+          primaryAccounts: { 'urn:ietf:params:jmap:mail': 'account-1' },
+        }));
+        return;
+      }
+      const body = await readRequestJson(request);
+      requestedIds = body.methodCalls[0][1].ids;
+      response.end(JSON.stringify({
+        methodResponses: [['Email/get', { list: requestedIds.map((id) => ({ id, textBody: [], bodyValues: {} })) }, '0']],
+      }));
+    });
+    servers.push(fastmail);
+    await listen(fastmail);
+    const { port } = await startRelay(fastmail);
+
+    const response = await fetch(`http://127.0.0.1:${port}/jmap/message-body`, {
+      body: JSON.stringify({ messageIds: ['message-1', 'message-2'] }),
+      headers: { authorization: 'Bearer secret-token', 'content-type': 'application/json' },
+      method: 'POST',
+    });
+
+    expect(response.status).toBe(200);
+    expect(requestedIds).toEqual(['message-1', 'message-2']);
+    expect(await response.json()).toMatchObject({
+      emails: [{ id: 'message-1' }, { id: 'message-2' }],
+      ok: true,
+    });
+  });
 });
+
+async function readRequestJson(request) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+async function startRelay(fastmail) {
+  const port = await getAvailablePort();
+  const directory = await mkdtemp(path.join(tmpdir(), 'nativemail-relay-test-'));
+  tempDirectories.push(directory);
+  const relay = spawn(process.execPath, ['scripts/notification-relay.mjs'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      FASTMAIL_SESSION_URL: `http://127.0.0.1:${fastmail.address().port}/session`,
+      NOTIFICATION_RELAY_OBSERVABILITY_PATH: path.join(directory, 'observability.jsonl'),
+      NOTIFICATION_RELAY_STORE_PATH: path.join(directory, 'store.json'),
+      PORT: String(port),
+    },
+    stdio: 'ignore',
+  });
+  processes.push(relay);
+  await waitForHealth(port);
+  return { port };
+}
 
 async function listen(server) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));

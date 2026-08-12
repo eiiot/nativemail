@@ -6,6 +6,7 @@ import {
   writeCachedEmailBody,
 } from '@/lib/mail-cache';
 import {
+  fetchJmapMessageBodies,
   fetchJmapMessageBody,
   type JmapMailboxSnapshot,
   type JmapMessageBody,
@@ -741,30 +742,39 @@ export async function prefetchMessageBodies(
         break;
       }
 
-      const messageId = pendingIds[cursor];
-      cursor += 1;
-
-      if (!messageId) {
-        continue;
-      }
+      const batchIds = pendingIds.slice(cursor, cursor + Math.max(1, concurrency));
+      cursor += batchIds.length;
 
       try {
-        const body = await loadMessageBody(messageId, { priority: 'background' });
+        const cachedBodies = await Promise.all(batchIds.map(hydrateMessageBodyFromCache));
+        const missingIds = batchIds.filter((_, index) => !cachedBodies[index]);
+        loaded += batchIds.length - missingIds.length;
 
-        if (body) {
-          loaded += 1;
-        } else {
-          failed += 1;
+        if (!missingIds.length || foregroundMessageBodyFetchCount > 0) {
+          continue;
         }
+
+        const controller = new AbortController();
+        const bodies = await fetchJmapMessageBodies({ messageIds: missingIds, signal: controller.signal });
+        await Promise.all(missingIds.map(async (messageId) => {
+          const body = bodies[messageId];
+          if (!body) {
+            failed += 1;
+            return;
+          }
+          useMailStore.getState().applyMessageBody(messageId, body);
+          await writeCachedEmailBody(messageId, body).catch(() => {});
+          loaded += 1;
+        }));
       } catch {
-        failed += 1;
+        failed += batchIds.length;
       }
     }
   }
 
   await Promise.all(
     Array.from(
-      { length: Math.min(Math.max(1, concurrency), pendingIds.length) },
+      { length: pendingIds.length ? 1 : 0 },
       () => runNext(),
     ),
   );

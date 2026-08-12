@@ -821,11 +821,11 @@ function buildMessageBodyFromEmail(email: EmailObject): JmapMessageBody {
     }
 }
 
-async function fetchJmapMessageBodyViaRelay(
+async function fetchJmapMessageBodiesViaRelay(
     token: string,
-    messageId: string,
+    messageIds: string[],
     signal?: AbortSignal
-): Promise<JmapMessageBody | null> {
+): Promise<Record<string, JmapMessageBody>> {
     const startedAt = Date.now()
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), MESSAGE_BODY_RELAY_TIMEOUT_MS)
@@ -840,7 +840,7 @@ async function fetchJmapMessageBodyViaRelay(
                 Authorization: `Bearer ${token}`,
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ messageId }),
+            body: JSON.stringify({ messageIds }),
             signal: controller.signal,
         })
         if (!response.ok) {
@@ -848,20 +848,20 @@ async function fetchJmapMessageBodyViaRelay(
         }
 
         const result = (await response.json()) as {
-            email?: EmailObject | null
+            emails?: EmailObject[]
             timings?: { jmapMs?: number; sessionMs?: number; totalMs?: number }
         }
-        const body = result.email ? buildMessageBodyFromEmail(result.email) : null
+        const bodies = Object.fromEntries(
+            (result.emails ?? []).map((email) => [email.id, buildMessageBodyFromEmail(email)])
+        )
         observeDuration('jmap.message-body.relay.success', startedAt, {
-            hasBody: Boolean(body),
-            html: body?.html?.trim() ? body.html.length : 0,
-            messageId,
+            count: Object.keys(bodies).length,
+            messageIds: messageIds.join(','),
             relayJmapMs: result.timings?.jmapMs,
             relaySessionMs: result.timings?.sessionMs,
             relayTotalMs: result.timings?.totalMs,
-            text: body?.text?.trim() ? body.text.length : 0,
         })
-        return body
+        return bodies
     } finally {
         clearTimeout(timeout)
         signal?.removeEventListener('abort', onAbort)
@@ -957,7 +957,26 @@ export async function fetchJmapMessageBody({
         throw new FastmailJmapTokenMissingError()
     }
 
-    return fetchJmapMessageBodyViaRelay(token, messageId, signal)
+    const bodies = await fetchJmapMessageBodiesViaRelay(token, [messageId], signal)
+    return bodies[messageId] ?? null
+}
+
+export async function fetchJmapMessageBodies({
+    messageIds,
+    signal,
+}: {
+    messageIds: string[]
+    signal?: AbortSignal
+}): Promise<Record<string, JmapMessageBody>> {
+    const token = await getFastmailJmapToken()
+    if (!token) {
+        throw new FastmailJmapTokenMissingError()
+    }
+
+    const uniqueIds = [...new Set(messageIds)].slice(0, 20)
+    return uniqueIds.length
+        ? fetchJmapMessageBodiesViaRelay(token, uniqueIds, signal)
+        : {}
 }
 
 export async function fetchJmapThreadMessages({
