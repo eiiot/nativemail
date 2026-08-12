@@ -33,9 +33,12 @@ const OBSERVABILITY_EVENT_LIMIT = 100;
 const JMAP_SESSION_CACHE_TTL_MS = 10 * 60 * 1000;
 const JMAP_SESSION_TIMEOUT_MS = 2000;
 const JMAP_BODY_TIMEOUT_MS = 4000;
+const JMAP_PROXY_TIMEOUT_MS = 8000;
 
 /** @type {Map<string, { accountId: string; apiUrl: string; expiresAt: number }>} */
 const jmapSessionCache = new Map();
+/** @type {Map<string, { activeController?: AbortController; activePriority?: number; running: boolean; tasks: Array<{ priority: number; run: (signal: AbortSignal) => Promise<unknown>; resolve: (value: unknown) => void; reject: (error: unknown) => void }> }>} */
+const jmapQueues = new Map();
 
 /** @type {Map<string, Subscriber>} */
 const subscribers = new Map();
@@ -166,7 +169,7 @@ async function route(request, response) {
     const { accountId, apiUrl, cacheHit } = await getCachedJmapSession(token);
 
     const jmapStartedAt = Date.now();
-    const jmapResponse = await fetchWithTimeout(apiUrl, {
+    const jmapResponse = await enqueueJmapRequest(token, 0, (signal) => fetchWithTimeout(apiUrl, {
       body: JSON.stringify({
         using: [CORE_CAPABILITY, MAIL_CAPABILITY],
         methodCalls: [[
@@ -188,7 +191,8 @@ async function route(request, response) {
         'Content-Type': 'application/json',
       },
       method: 'POST',
-    }, JMAP_BODY_TIMEOUT_MS, 'Fastmail Email/get timed out');
+      signal,
+    }, JMAP_BODY_TIMEOUT_MS, 'Fastmail Email/get timed out'));
     if (!jmapResponse.ok) {
       sendJson(response, jmapResponse.status, { error: 'Fastmail Email/get failed.' });
       return;
@@ -213,6 +217,40 @@ async function route(request, response) {
       ok: true,
       timings,
     });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/jmap/proxy') {
+    const authorization = request.headers.authorization;
+    if (!authorization?.startsWith('Bearer ') || authorization.length <= 7) {
+      sendJson(response, 401, { error: 'A Fastmail bearer token is required.' });
+      return;
+    }
+
+    const token = authorization.slice(7);
+    const proxyRequest = await readJson(request);
+    const target = new URL(getRequiredString(proxyRequest, 'url'));
+    if (target.protocol !== 'https:' || !isAllowedFastmailHostname(target.hostname)) {
+      sendJson(response, 400, { error: 'Invalid Fastmail proxy target.' });
+      return;
+    }
+    const method = getOptionalString(proxyRequest, 'method') ?? 'GET';
+    const requestBody = getOptionalString(proxyRequest, 'body');
+    const priority = getJmapRequestPriority(requestBody);
+    const upstream = await enqueueJmapRequest(token, priority, (signal) => fetchWithTimeout(target, {
+      body: method === 'GET' ? undefined : requestBody,
+      headers: {
+        Accept: getOptionalString(proxyRequest, 'accept') ?? 'application/json',
+        Authorization: `Bearer ${token}`,
+        ...(requestBody ? { 'Content-Type': 'application/json' } : {}),
+      },
+      method,
+      signal,
+    }, JMAP_PROXY_TIMEOUT_MS, 'Fastmail proxy request timed out'));
+    const payload = Buffer.from(await upstream.arrayBuffer());
+    response.statusCode = upstream.status;
+    response.setHeader('content-type', upstream.headers.get('content-type') ?? 'application/octet-stream');
+    response.end(payload);
     return;
   }
 
@@ -363,6 +401,8 @@ async function getCachedJmapSession(token) {
 
 async function fetchWithTimeout(url, options, timeoutMs, message) {
   const controller = new AbortController();
+  const forwardAbort = () => controller.abort();
+  options.signal?.addEventListener('abort', forwardAbort, { once: true });
   const timeout = setTimeout(() => controller.abort(new Error(message)), timeoutMs);
   try {
     return await fetch(url, { ...options, signal: controller.signal });
@@ -373,7 +413,56 @@ async function fetchWithTimeout(url, options, timeoutMs, message) {
     throw error;
   } finally {
     clearTimeout(timeout);
+    options.signal?.removeEventListener('abort', forwardAbort);
   }
+}
+
+function isAllowedFastmailHostname(hostname) {
+  return hostname === 'fastmail.com' || hostname.endsWith('.fastmail.com');
+}
+
+function getJmapRequestPriority(body) {
+  if (!body) return 1;
+  try {
+    const methodCalls = JSON.parse(body).methodCalls ?? [];
+    if (methodCalls.some(([name, args]) => name === 'Email/get' && (args?.fetchHTMLBodyValues || args?.fetchTextBodyValues))) return 0;
+    if (methodCalls.some(([name]) => name === 'Email/set' || name === 'Mailbox/set')) return 1;
+  } catch {}
+  return 2;
+}
+
+function enqueueJmapRequest(token, priority, run) {
+  const key = createHash('sha256').update(token).digest('hex');
+  const queue = jmapQueues.get(key) ?? { running: false, tasks: [] };
+  jmapQueues.set(key, queue);
+  return new Promise((resolve, reject) => {
+    queue.tasks.push({ priority, reject, resolve, run });
+    queue.tasks.sort((left, right) => left.priority - right.priority);
+    if (priority === 0 && (queue.activePriority ?? 0) > 0) {
+      queue.activeController?.abort();
+    }
+    void drainJmapQueue(key, queue);
+  });
+}
+
+async function drainJmapQueue(key, queue) {
+  if (queue.running) return;
+  queue.running = true;
+  while (queue.tasks.length) {
+    const task = queue.tasks.shift();
+    const controller = new AbortController();
+    queue.activeController = controller;
+    queue.activePriority = task.priority;
+    try {
+      task.resolve(await task.run(controller.signal));
+    } catch (error) {
+      task.reject(error);
+    }
+  }
+  queue.running = false;
+  queue.activeController = undefined;
+  queue.activePriority = undefined;
+  if (!queue.tasks.length) jmapQueues.delete(key);
 }
 
 async function createSubscriber({ deviceId, expoPushToken, jmapToken }) {

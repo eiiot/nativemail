@@ -715,6 +715,24 @@ function parseXhrHeaders(raw: string): Headers {
 // this routes around it entirely with no native build. Returns a real Response.
 function nativeFetch(url: string, init: NativeFetchInit = {}): Promise<Response> {
     const { method = 'GET', headers, body, signal, responseType } = init
+    const targetUrl = new URL(url)
+    const shouldProxy =
+        targetUrl.protocol === 'https:' &&
+        (targetUrl.hostname === 'fastmail.com' || targetUrl.hostname.endsWith('.fastmail.com'))
+    const requestUrl = shouldProxy ? `${MESSAGE_BODY_RELAY_URL}/jmap/proxy` : url
+    const requestMethod = shouldProxy ? 'POST' : method
+    const requestBody = shouldProxy
+        ? JSON.stringify({
+            accept: new Headers(headers).get('accept'),
+            body: body ?? null,
+            method,
+            url,
+        })
+        : body
+    const requestHeaders = new Headers(headers)
+    if (shouldProxy) {
+        requestHeaders.set('content-type', 'application/json')
+    }
 
     return new Promise<Response>((resolve, reject) => {
         if (signal?.aborted) {
@@ -723,13 +741,13 @@ function nativeFetch(url: string, init: NativeFetchInit = {}): Promise<Response>
         }
 
         const xhr = new XMLHttpRequest()
-        xhr.open(method, url)
+        xhr.open(requestMethod, requestUrl)
 
         if (responseType === 'blob') {
             xhr.responseType = 'blob'
         }
 
-        new Headers(headers).forEach((value, key) => {
+        requestHeaders.forEach((value, key) => {
             xhr.setRequestHeader(key, value)
         })
 
@@ -766,7 +784,7 @@ function nativeFetch(url: string, init: NativeFetchInit = {}): Promise<Response>
             reject(createFetchAbortError())
         }
 
-        xhr.send(body ?? null)
+        xhr.send(requestBody ?? null)
     })
 }
 
@@ -934,69 +952,12 @@ export async function fetchJmapMessageBody({
     messageId: string
     signal?: AbortSignal
 }): Promise<JmapMessageBody | null> {
-    const startedAt = Date.now()
     const token = await getFastmailJmapToken()
     if (!token) {
         throw new FastmailJmapTokenMissingError()
     }
 
-    const relayPromise = fetchJmapMessageBodyViaRelay(token, messageId, signal)
-    const relayBeforeHedge = await Promise.race([
-        relayPromise.then(
-            (body) => ({ body, status: 'success' as const }),
-            (error: unknown) => ({ error, status: 'failed' as const })
-        ),
-        new Promise<{ status: 'hedge' }>((resolve) => {
-            setTimeout(() => resolve({ status: 'hedge' }), MESSAGE_BODY_HEDGE_DELAY_MS)
-        }),
-    ])
-
-    if (relayBeforeHedge.status === 'success') {
-        return relayBeforeHedge.body
-    }
-    if (signal?.aborted) {
-        throw relayBeforeHedge.status === 'failed' ? relayBeforeHedge.error : new Error('Request aborted')
-    }
-
-    observeEvent('jmap.message-body.hedge.start', {
-        messageId,
-        reason: relayBeforeHedge.status === 'failed' ? 'relay-failed' : 'relay-slow',
-    })
-    const directPromise = fetchJmapMessageBodyDirect(token, messageId, signal)
-
-    if (relayBeforeHedge.status === 'failed') {
-        observeError('jmap.message-body.relay.failed', relayBeforeHedge.error, {
-            durationMs: Date.now() - startedAt,
-            messageId,
-        })
-        return directPromise
-    }
-
-    return firstSuccessfulMessageBody([
-        relayPromise.then((body) => ({ body, source: 'relay' as const })),
-        directPromise.then((body) => ({ body, source: 'direct' as const })),
-    ], messageId, startedAt)
-}
-
-async function firstSuccessfulMessageBody(
-    requests: Promise<{ body: JmapMessageBody | null; source: 'direct' | 'relay' }>[],
-    messageId: string,
-    startedAt: number
-) {
-    return new Promise<JmapMessageBody | null>((resolve, reject) => {
-        const errors: unknown[] = []
-        for (const request of requests) {
-            request.then(({ body, source }) => {
-                observeDuration('jmap.message-body.hedge.winner', startedAt, { messageId, source })
-                resolve(body)
-            }).catch((error: unknown) => {
-                errors.push(error)
-                if (errors.length === requests.length) {
-                    reject(errors[errors.length - 1])
-                }
-            })
-        }
-    })
+    return fetchJmapMessageBodyViaRelay(token, messageId, signal)
 }
 
 export async function fetchJmapThreadMessages({
