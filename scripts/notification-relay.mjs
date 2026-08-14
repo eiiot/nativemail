@@ -14,6 +14,8 @@ const FASTMAIL_SESSION_URL = process.env.FASTMAIL_SESSION_URL ?? 'https://api.fa
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EVENT_SOURCE_TYPES = '*';
 const ACTIVE_NOTIFICATION_LIMIT = 200;
+const KNOWN_INBOX_EMAIL_LIMIT = 20000;
+const NEW_EMAIL_CLOCK_SKEW_MS = 2 * 60 * 1000;
 const INBOX_STATE_SYNC_LIMIT = 10;
 const LOCAL_ACTION_SUPPRESSION_MS = 8000;
 const INBOX_MESSAGE_NOTIFICATION_CATEGORY_ID = 'nativemailInboxMessage';
@@ -552,6 +554,7 @@ async function createSubscriber({ deviceId, expoPushToken, jmapToken }) {
     inboxMailboxId: inbox.id,
     jmapToken,
     knownInboxEmailIds: [],
+    registeredAt: new Date().toISOString(),
     mailboxName: inbox.name || 'Inbox',
     status: 'registered',
     username: session.username || 'unknown',
@@ -802,7 +805,11 @@ async function refreshInbox(subscriber, { notify, reason }) {
   const emails = sortEmails(emailResponse?.[1]?.list ?? [], queryIds);
   const inboxStateSignature = getInboxStateSignature(emails, inboxUnreadEmails);
   const knownIds = new Set(subscriber.knownInboxEmailIds);
-  const newEmails = emails.filter((email) => !knownIds.has(email.id) && isUnreadEmail(email));
+  const newEmails = emails.filter((email) =>
+    !knownIds.has(email.id) &&
+    isUnreadEmail(email) &&
+    isReceivedAfterPreviousInboxCheck(email, subscriber)
+  );
   const currentUnreadEmailIds = emails.filter(isUnreadEmail).map((email) => email.id);
   const staleNotificationEmailIds = getStaleNotificationEmailIds(
     activeNotificationEmailIds,
@@ -972,6 +979,12 @@ async function backfillInboxBodies(subscriber) {
     ]]);
     const ids = findMethodResponse(responses, 'Email/query', 'bodyBackfillQuery')?.[1]?.ids ?? [];
     if (!ids.length) break;
+
+    // Backfill establishes the account baseline as well as warming bodies.
+    // Without this, an old unread message entering the top query window looks
+    // indistinguishable from a newly delivered message and triggers a push.
+    subscriber.knownInboxEmailIds = mergeKnownIds(subscriber.knownInboxEmailIds, ids);
+    await saveStore();
 
     for (let index = 0; index < ids.length; index += BODY_CACHE_BATCH_SIZE) {
       const batch = ids.slice(index, index + BODY_CACHE_BATCH_SIZE);
@@ -1240,7 +1253,14 @@ function sortEmails(emails, ids) {
 }
 
 function mergeKnownIds(currentIds, nextIds) {
-  return Array.from(new Set([...nextIds, ...currentIds])).slice(0, 200);
+  return Array.from(new Set([...nextIds, ...currentIds])).slice(0, KNOWN_INBOX_EMAIL_LIMIT);
+}
+
+function isReceivedAfterPreviousInboxCheck(email, subscriber) {
+  const baseline = Date.parse(subscriber.lastInboxCheckedAt ?? subscriber.registeredAt ?? '');
+  const receivedAt = Date.parse(email.receivedAt ?? '');
+  if (!Number.isFinite(baseline) || !Number.isFinite(receivedAt)) return false;
+  return receivedAt >= baseline - NEW_EMAIL_CLOCK_SKEW_MS;
 }
 
 function mergeNotificationIds(currentIds, nextIds) {
