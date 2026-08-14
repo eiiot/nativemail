@@ -71,6 +71,7 @@ const bodyBackfills = new Map();
  *   lastInboxCheckedAt?: string;
  *   lastInboxCheckReason?: string;
  *   lastInboxEmailIds?: string[];
+ *   lastInboxStateMessages?: Array<Record<string, unknown>>;
  *   lastInboxUnreadEmailsSource?: string;
  *   lastInboxStateSignature?: string;
  *   lastInboxStateSyncAt?: string;
@@ -345,6 +346,31 @@ async function route(request, response) {
     sendJson(response, 200, {
       ok: true,
       suppressUntil: new Date(subscriber.localActionSuppressUntil).toISOString(),
+    });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/inbox-state') {
+    const body = await readJson(request);
+    const deviceId = sanitizeDeviceId(getRequiredString(body, 'deviceId'));
+    const expoPushToken = getRequiredString(body, 'expoPushToken');
+    const subscriber = subscribers.get(deviceId);
+
+    if (!subscriber || !safeEqual(expoPushToken, subscriber.expoPushToken)) {
+      sendJson(response, 401, { error: 'Invalid device credentials.' });
+      return;
+    }
+
+    sendJson(response, 200, {
+      accountId: subscriber.accountId,
+      action: 'sync-inbox-state',
+      inboxUnreadEmails: subscriber.lastInboxUnreadEmails ?? null,
+      mailboxId: subscriber.inboxMailboxId,
+      mailboxName: subscriber.mailboxName,
+      messages: subscriber.lastInboxStateMessages ?? [],
+      ok: true,
+      source: 'relay-cache',
+      type: 'sync-inbox-state',
     });
     return;
   }
@@ -939,6 +965,7 @@ async function refreshInbox(subscriber, { notify, reason }) {
   subscriber.lastInboxCheckedAt = new Date().toISOString();
   subscriber.lastInboxCheckReason = reason;
   subscriber.lastInboxEmailIds = queryIds;
+  subscriber.lastInboxStateMessages = emails.map(toInboxStateSyncMessage);
   subscriber.lastNewInboxEmailIds = newEmails.map((email) => email.id);
   subscriber.lastInboxStateSignature = inboxStateSignature;
   subscriber.lastMailboxUnreadEmails = mailboxUnreadEmails;
@@ -1486,6 +1513,14 @@ function requireDiagnosticAuthorization(request, response) {
     timingSafeEqual(expectedBuffer, suppliedBuffer);
   if (!authorized) sendJson(response, 401, { error: 'Unauthorized.' });
   return authorized;
+}
+
+function safeEqual(supplied, expected) {
+  const suppliedBuffer = Buffer.from(supplied);
+  const expectedBuffer = Buffer.from(expected);
+
+  return suppliedBuffer.length === expectedBuffer.length &&
+    timingSafeEqual(suppliedBuffer, expectedBuffer);
 }
 
 function getRequiredString(body, key) {

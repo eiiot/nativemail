@@ -211,6 +211,44 @@ export async function repairInboxNotificationRegistration() {
   return status.registered ? status : registerForInboxNotifications();
 }
 
+export async function fetchInboxStateFromNotificationRelay(signal?: AbortSignal) {
+  if (!Device.isDevice) {
+    return null;
+  }
+
+  const deviceId = await getStoredNotificationDeviceId();
+  const projectId = getExpoProjectId();
+
+  if (!deviceId || !projectId) {
+    return null;
+  }
+
+  const permissions = await Notifications.getPermissionsAsync();
+
+  if (!permissions.granted) {
+    return null;
+  }
+
+  const relayUrl = await getNotificationRelayUrl();
+  const expoPushToken = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+  const response = await fetch(`${relayUrl}/inbox-state`, {
+    body: JSON.stringify({ deviceId, expoPushToken }),
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    method: 'POST',
+    signal,
+  });
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(payload?.error ?? `Inbox state sync failed with HTTP ${response.status}.`);
+  }
+
+  return payload && typeof payload === 'object' ? payload as Record<string, unknown> : null;
+}
+
 export async function sendInboxNotificationTest(relayUrlInput?: string) {
   const relayUrl = relayUrlInput
     ? await saveNotificationRelayUrl(relayUrlInput)

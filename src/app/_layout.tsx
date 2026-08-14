@@ -6,6 +6,7 @@ import {
 } from '@/lib/notification-background-task';
 import {
   archiveInboxNotificationResponse,
+  fetchInboxStateFromNotificationRelay,
   getNotificationMessageRoute,
   isArchiveInboxNotificationResponse,
   registerInboxNotificationCategories,
@@ -112,6 +113,9 @@ export default function RootLayout() {
     const syncNotificationState = (signal?: AbortSignal) => {
       void syncInboxUnreadBadgeCount(signal).catch(() => {});
       void syncPresentedInboxNotifications(signal).catch(() => {});
+      void fetchInboxStateFromNotificationRelay(signal)
+        .then((payload) => handleInboxNotificationPayload(payload))
+        .catch(() => {});
     };
     const handleAppStateChange = (nextState: AppStateStatus) => {
       if (nextState === 'active') {
