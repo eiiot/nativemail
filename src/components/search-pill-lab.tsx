@@ -1,5 +1,5 @@
 import { Button, ControlGroup, Host, HStack, Menu } from '@expo/ui/swift-ui';
-import { buttonBorderShape, buttonStyle, controlSize, glassEffect, labelStyle, tint } from '@expo/ui/swift-ui/modifiers';
+import { buttonBorderShape, buttonStyle, controlSize, fixedSize, glassEffect, labelStyle, tint } from '@expo/ui/swift-ui/modifiers';
 import * as Haptics from 'expo-haptics';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useState } from 'react';
@@ -95,6 +95,7 @@ function NativeToken({ concept, term }: { concept: Concept; term: string }) {
     buttonStyle('plain'),
     buttonBorderShape('capsule'),
     controlSize(concept.size),
+    fixedSize({ horizontal: true, vertical: true }),
     glassEffect({
       glass: {
         variant: 'regular',
