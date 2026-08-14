@@ -64,6 +64,7 @@ import {
   Host,
   Image as SwiftImage,
   List,
+  Menu,
   Namespace,
   RNHostView,
   Rectangle,
@@ -85,6 +86,7 @@ import {
   aspectRatio,
   autocorrectionDisabled,
   background,
+  buttonStyle,
   blur as swiftBlur,
   clipShape,
   cornerRadius,
@@ -128,7 +130,6 @@ import type { SearchBarCommands } from 'react-native-screens';
 import { ComponentProps, PropsWithChildren, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  ActionSheetIOS,
   Clipboard,
   InteractionManager,
   Platform,
@@ -1243,22 +1244,10 @@ export default function InboxScreen() {
   const removeSearchPill = (termIndex: number) => {
     applySearchPillTerms(searchPillTerms.filter((_, index) => index !== termIndex));
   };
-  const chooseSearchPillScope = (termIndex: number) => {
-    const scopeLabels: SearchPillScope[] = ['Anywhere', 'From', 'To', 'Subject', 'Body'];
-    ActionSheetIOS.showActionSheetWithOptions(
-      {
-        cancelButtonIndex: scopeLabels.length,
-        options: [...scopeLabels, 'Cancel'],
-        title: `Search “${searchPillTerms[termIndex]?.value ?? ''}” in`,
-      },
-      (selectedIndex) => {
-        const scope = scopeLabels[selectedIndex];
-        if (!scope) return;
-        applySearchPillTerms(searchPillTerms.map((term, index) =>
-          index === termIndex ? { ...term, scope } : term,
-        ));
-      },
-    );
+  const chooseSearchPillScope = (termIndex: number, scope: SearchPillScope) => {
+    applySearchPillTerms(searchPillTerms.map((term, index) =>
+      index === termIndex ? { ...term, scope } : term,
+    ));
   };
   return (
     <>
@@ -1402,8 +1391,8 @@ export default function InboxScreen() {
             error={searchError}
             loading={searchLoading}
             onRemove={removeSearchPill}
-            onScopePress={chooseSearchPillScope}
-            style={{ bottom: insets.bottom + 62 }}
+            onScopeChange={chooseSearchPillScope}
+            style={{ bottom: insets.bottom + 54 }}
             terms={searchPillTerms}
           />
         )}
@@ -1741,7 +1730,7 @@ function SearchPillBar({
   error,
   loading,
   onRemove,
-  onScopePress,
+  onScopeChange,
   style,
   terms,
 }: {
@@ -1749,7 +1738,7 @@ function SearchPillBar({
   error: string | null;
   loading: boolean;
   onRemove: (index: number) => void;
-  onScopePress: (index: number) => void;
+  onScopeChange: (index: number, scope: SearchPillScope) => void;
   style: ViewStyle;
   terms: SearchPillTerm[];
 }) {
@@ -1762,10 +1751,25 @@ function SearchPillBar({
         showsHorizontalScrollIndicator={false}>
         {terms.map((term, index) => (
           <GlassView glassEffectStyle="regular" isInteractive key={`${term.scope}-${term.value}-${index}`} style={styles.searchPillGlass}>
-            <Pressable onPress={() => onScopePress(index)} style={styles.searchPillScope}>
-              <Text style={[styles.searchPillScopeText, { color: colors.secondaryText }]}>{term.scope}</Text>
-              <SymbolView name="chevron.down" size={11} tintColor={colors.secondaryText} />
-            </Pressable>
+            <Host style={styles.searchPillScopeHost}>
+              <Menu
+                label={term.scope}
+                modifiers={[
+                  buttonStyle('plain'),
+                  frame({ width: 92, height: 36 }),
+                  font({ size: 13, weight: 'semibold' }),
+                  foregroundColor(colors.text),
+                ]}>
+                {(['Anywhere', 'From', 'To', 'Subject', 'Body'] as SearchPillScope[]).map((scope) => (
+                  <SwiftButton
+                    key={scope}
+                    label={scope}
+                    onPress={() => onScopeChange(index, scope)}
+                    systemImage={scope === term.scope ? 'checkmark' : undefined}
+                  />
+                ))}
+              </Menu>
+            </Host>
             <View style={[styles.searchPillDivider, { backgroundColor: colors.separator }]} />
             <Text numberOfLines={1} style={[styles.searchPillValue, { color: colors.text }]}>{term.value}</Text>
             <View style={[styles.searchPillDivider, { backgroundColor: colors.separator }]} />
@@ -2897,18 +2901,9 @@ const styles = StyleSheet.create({
     height: 36,
     overflow: 'hidden',
   },
-  searchPillScope: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    gap: 4,
-    height: '100%',
-    paddingLeft: 11,
-    paddingRight: 8,
-  },
-  searchPillScopeText: {
-    fontFamily: systemFont,
-    fontSize: 13,
-    fontWeight: '600',
+  searchPillScopeHost: {
+    height: 36,
+    width: 92,
   },
   searchPillDivider: {
     height: 20,
