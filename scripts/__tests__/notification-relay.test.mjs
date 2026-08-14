@@ -47,6 +47,7 @@ describe('notification relay message-body proxy', () => {
       env: {
         ...process.env,
         FASTMAIL_SESSION_URL: `http://127.0.0.1:${fastmail.address().port}/session`,
+        NOTIFICATION_RELAY_BODY_CACHE_DIR: path.join(directory, 'body-cache'),
         NOTIFICATION_RELAY_OBSERVABILITY_PATH: path.join(directory, 'observability.jsonl'),
         NOTIFICATION_RELAY_STORE_PATH: path.join(directory, 'store.json'),
         PORT: String(relayPort),
@@ -70,8 +71,9 @@ describe('notification relay message-body proxy', () => {
       method: 'POST',
     });
     expect(secondResponse.status).toBe(200);
+    expect(await secondResponse.json()).toMatchObject({ cache: { hits: 1, misses: 0 } });
     expect(sessionRequests).toBe(1);
-    expect(seenAuthorization).toEqual(['Bearer secret-token', 'Bearer secret-token', 'Bearer secret-token']);
+    expect(seenAuthorization).toEqual(['Bearer secret-token', 'Bearer secret-token']);
   });
 
   it('fetches multiple immutable email bodies in one JMAP call', async () => {
@@ -125,6 +127,7 @@ async function startRelay(fastmail) {
     env: {
       ...process.env,
       FASTMAIL_SESSION_URL: `http://127.0.0.1:${fastmail.address().port}/session`,
+      NOTIFICATION_RELAY_BODY_CACHE_DIR: path.join(directory, 'body-cache'),
       NOTIFICATION_RELAY_OBSERVABILITY_PATH: path.join(directory, 'observability.jsonl'),
       NOTIFICATION_RELAY_STORE_PATH: path.join(directory, 'store.json'),
       PORT: String(port),

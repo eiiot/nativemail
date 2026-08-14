@@ -3,7 +3,7 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -29,11 +29,17 @@ const LEGACY_STORE_PATH = path.join(process.cwd(), '.nativemail', 'notification-
 const OBSERVABILITY_LOG_PATH =
   process.env.NOTIFICATION_RELAY_OBSERVABILITY_PATH ??
   path.join(homedir(), '.nativemail', 'fastmail-glass', 'observability.jsonl');
+const BODY_CACHE_DIR =
+  process.env.NOTIFICATION_RELAY_BODY_CACHE_DIR ??
+  path.join(path.dirname(STORE_PATH), 'body-cache');
 const OBSERVABILITY_EVENT_LIMIT = 100;
 const JMAP_SESSION_CACHE_TTL_MS = 10 * 60 * 1000;
 const JMAP_SESSION_TIMEOUT_MS = 2000;
 const JMAP_BODY_TIMEOUT_MS = 4000;
 const JMAP_PROXY_TIMEOUT_MS = 8000;
+const BODY_CACHE_BATCH_SIZE = 10;
+const BODY_BACKFILL_QUERY_LIMIT = 100;
+const BODY_BACKFILL_BATCH_DELAY_MS = 150;
 
 /** @type {Map<string, { accountId: string; apiUrl: string; expiresAt: number }>} */
 const jmapSessionCache = new Map();
@@ -41,6 +47,7 @@ const jmapSessionCache = new Map();
 
 /** @type {Map<string, Subscriber>} */
 const subscribers = new Map();
+const bodyBackfills = new Map();
 
 /**
  * @typedef {{
@@ -171,6 +178,21 @@ async function route(request, response) {
       return;
     }
     const token = authorization.slice(7);
+    const cachedEmails = await readCachedEmails(token, messageIds);
+    const missingMessageIds = messageIds.filter((messageId) => !cachedEmails.has(messageId));
+
+    if (!missingMessageIds.length) {
+      const emails = messageIds.map((messageId) => cachedEmails.get(messageId)).filter(Boolean);
+      sendJson(response, 200, {
+        cache: { hits: emails.length, misses: 0 },
+        email: messageIds.length === 1 ? emails[0] ?? null : undefined,
+        emails,
+        ok: true,
+        timings: { jmapMs: 0, sessionCacheHit: true, sessionMs: 0, totalMs: Date.now() - startedAt },
+      });
+      return;
+    }
+
     const sessionStartedAt = Date.now();
     const { accountId, apiUrl, cacheHit } = await getCachedJmapSession(token);
 
@@ -182,7 +204,7 @@ async function route(request, response) {
           'Email/get',
           {
             accountId,
-            ids: messageIds,
+            ids: missingMessageIds,
             properties: ['id', 'blobId', 'bodyStructure', 'bodyValues', 'htmlBody', 'textBody', 'attachments'],
             bodyProperties: ['partId', 'blobId', 'size', 'name', 'type', 'charset', 'cid', 'disposition'],
             fetchHTMLBodyValues: true,
@@ -216,9 +238,13 @@ async function route(request, response) {
       sessionMs: jmapStartedAt - sessionStartedAt,
       totalMs: Date.now() - startedAt,
     };
-    const emails = invocation?.[1]?.list ?? [];
-    console.log('[relay] message body success', JSON.stringify({ messageIds, count: emails.length, ...timings }));
+    const fetchedEmails = invocation?.[1]?.list ?? [];
+    await Promise.all(fetchedEmails.map((email) => writeCachedEmail(token, email)));
+    for (const email of fetchedEmails) cachedEmails.set(email.id, email);
+    const emails = messageIds.map((messageId) => cachedEmails.get(messageId)).filter(Boolean);
+    console.log('[relay] message body success', JSON.stringify({ messageIds, count: emails.length, cacheHits: messageIds.length - missingMessageIds.length, ...timings }));
     sendJson(response, 200, {
+      cache: { hits: messageIds.length - missingMessageIds.length, misses: missingMessageIds.length },
       email: messageIds.length === 1 ? emails[0] ?? null : undefined,
       emails,
       ok: true,
@@ -404,6 +430,70 @@ async function getCachedJmapSession(token) {
   return { ...value, cacheHit: false };
 }
 
+function getBodyCachePath(token, messageId) {
+  const accountKey = createHash('sha256').update(token).digest('hex');
+  const messageKey = createHash('sha256').update(messageId).digest('hex');
+  return path.join(BODY_CACHE_DIR, accountKey.slice(0, 2), accountKey, `${messageKey}.json`);
+}
+
+async function readCachedEmails(token, messageIds) {
+  const entries = await Promise.all(messageIds.map(async (messageId) => {
+    try {
+      const email = JSON.parse(await readFile(getBodyCachePath(token, messageId), 'utf8'));
+      return email?.id === messageId ? [messageId, email] : null;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') console.warn('[relay] body cache read failed', messageId, describeError(error));
+      return null;
+    }
+  }));
+  return new Map(entries.filter(Boolean));
+}
+
+async function writeCachedEmail(token, email) {
+  if (!email?.id) return;
+  const cachePath = getBodyCachePath(token, email.id);
+  const temporaryPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
+  await mkdir(path.dirname(cachePath), { recursive: true });
+  await writeFile(temporaryPath, JSON.stringify(email));
+  await rename(temporaryPath, cachePath);
+}
+
+async function fetchAndCacheBodies({ accountId, apiUrl, messageIds, token }) {
+  const uniqueIds = [...new Set(messageIds)].filter(Boolean);
+  if (!uniqueIds.length) return [];
+  const cached = await readCachedEmails(token, uniqueIds);
+  const missingIds = uniqueIds.filter((messageId) => !cached.has(messageId));
+  if (!missingIds.length) return uniqueIds.map((messageId) => cached.get(messageId)).filter(Boolean);
+
+  const response = await fetchWithTimeout(apiUrl, {
+    body: JSON.stringify({
+      using: [CORE_CAPABILITY, MAIL_CAPABILITY],
+      methodCalls: [['Email/get', {
+        accountId,
+        ids: missingIds,
+        properties: ['id', 'blobId', 'bodyStructure', 'bodyValues', 'htmlBody', 'textBody', 'attachments'],
+        bodyProperties: ['partId', 'blobId', 'size', 'name', 'type', 'charset', 'cid', 'disposition'],
+        fetchHTMLBodyValues: true,
+        fetchTextBodyValues: true,
+      }, 'cacheBodies']],
+    }),
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    method: 'POST',
+  }, JMAP_PROXY_TIMEOUT_MS, 'Fastmail body cache fill timed out');
+  if (!response.ok) throw new Error(`Fastmail body cache fill failed with HTTP ${response.status}.`);
+  const payload = await response.json();
+  const invocation = payload.methodResponses?.[0];
+  if (invocation?.[0] === 'error') throw new Error(`Fastmail body cache fill: ${invocation[1]?.type ?? 'unknown'}`);
+  const emails = invocation?.[1]?.list ?? [];
+  await Promise.all(emails.map((email) => writeCachedEmail(token, email)));
+  for (const email of emails) cached.set(email.id, email);
+  return uniqueIds.map((messageId) => cached.get(messageId)).filter(Boolean);
+}
+
 async function fetchWithTimeout(url, options, timeoutMs, message) {
   const controller = new AbortController();
   const forwardAbort = () => controller.abort();
@@ -497,6 +587,8 @@ async function startSubscriber(subscriber, { rehydrate }) {
     subscriber.status = 'polling; no JMAP eventSourceUrl';
     await saveStore();
   }
+
+  scheduleBodyBackfill(subscriber);
 }
 
 function startPolling(subscriber) {
@@ -741,6 +833,22 @@ async function refreshInbox(subscriber, { notify, reason }) {
   subscriber.status = `inbox checked (${reason}) at ${subscriber.lastInboxCheckedAt}`;
   await saveStore();
 
+  if (newEmails.length) {
+    try {
+      await fetchAndCacheBodies({
+        accountId: subscriber.accountId,
+        apiUrl: subscriber.apiUrl,
+        messageIds: newEmails.map((email) => email.id),
+        token: subscriber.jmapToken,
+      });
+      subscriber.lastBodyCacheArrivalAt = new Date().toISOString();
+    } catch (error) {
+      subscriber.lastBodyCacheError = describeError(error);
+      console.warn('[relay] arrival body cache failed', subscriber.deviceId, error);
+    }
+    await saveStore();
+  }
+
   let dismissed = 0;
   let badgeSynced = false;
   let stateSynced = false;
@@ -825,6 +933,75 @@ async function refreshInbox(subscriber, { notify, reason }) {
     notified,
     stateSynced,
   };
+}
+
+function scheduleBodyBackfill(subscriber) {
+  const key = createHash('sha256').update(subscriber.jmapToken).digest('hex');
+  if (bodyBackfills.has(key)) return;
+  const task = delay(500)
+    .then(() => backfillInboxBodies(subscriber))
+    .catch((error) => {
+      subscriber.lastBodyCacheError = describeError(error);
+      console.error('[relay] body backfill failed', subscriber.deviceId, error);
+      return saveStore();
+    })
+    .finally(() => bodyBackfills.delete(key));
+  bodyBackfills.set(key, task);
+}
+
+async function backfillInboxBodies(subscriber) {
+  let position = 0;
+  let cached = 0;
+  let failed = 0;
+  subscriber.bodyCacheStatus = 'backfilling';
+  subscriber.bodyCacheStartedAt = new Date().toISOString();
+  await saveStore();
+
+  while (true) {
+    const responses = await jmapRequest(subscriber.apiUrl, subscriber.jmapToken, [[
+      'Email/query',
+      {
+        accountId: subscriber.accountId,
+        collapseThreads: false,
+        filter: { inMailbox: subscriber.inboxMailboxId },
+        limit: BODY_BACKFILL_QUERY_LIMIT,
+        position,
+        sort: [{ property: 'receivedAt', isAscending: false }],
+      },
+      'bodyBackfillQuery',
+    ]]);
+    const ids = findMethodResponse(responses, 'Email/query', 'bodyBackfillQuery')?.[1]?.ids ?? [];
+    if (!ids.length) break;
+
+    for (let index = 0; index < ids.length; index += BODY_CACHE_BATCH_SIZE) {
+      const batch = ids.slice(index, index + BODY_CACHE_BATCH_SIZE);
+      try {
+        const emails = await fetchAndCacheBodies({
+          accountId: subscriber.accountId,
+          apiUrl: subscriber.apiUrl,
+          messageIds: batch,
+          token: subscriber.jmapToken,
+        });
+        cached += emails.length;
+      } catch (error) {
+        failed += batch.length;
+        subscriber.lastBodyCacheError = describeError(error);
+      }
+      subscriber.bodyCacheCached = cached;
+      subscriber.bodyCacheFailed = failed;
+      subscriber.bodyCacheScanned = position + index + batch.length;
+      await saveStore();
+      await delay(BODY_BACKFILL_BATCH_DELAY_MS);
+    }
+
+    position += ids.length;
+    if (ids.length < BODY_BACKFILL_QUERY_LIMIT) break;
+  }
+
+  subscriber.bodyCacheCompletedAt = new Date().toISOString();
+  subscriber.bodyCacheStatus = failed ? 'complete-with-errors' : 'complete';
+  await saveStore();
+  console.log('[relay] body backfill complete', JSON.stringify({ deviceId: subscriber.deviceId, cached, failed }));
 }
 
 async function sendInboxNotification(subscriber, email, inboxUnreadEmails) {
@@ -1223,6 +1400,12 @@ function toPublicSubscriber(subscriber, options = {}) {
     pollingMs: subscriber.pollTimer ? FALLBACK_POLL_MS : null,
     status: subscriber.status,
     username: subscriber.username,
+    bodyCacheStatus: subscriber.bodyCacheStatus ?? 'not-started',
+    bodyCacheScanned: subscriber.bodyCacheScanned ?? 0,
+    bodyCacheCached: subscriber.bodyCacheCached ?? 0,
+    bodyCacheFailed: subscriber.bodyCacheFailed ?? 0,
+    bodyCacheCompletedAt: subscriber.bodyCacheCompletedAt ?? null,
+    lastBodyCacheArrivalAt: subscriber.lastBodyCacheArrivalAt ?? null,
   };
 
   if (options.includeDebug) {
@@ -1236,6 +1419,7 @@ function toPublicSubscriber(subscriber, options = {}) {
     publicSubscriber.lastNotificationDismissalEmailIds = subscriber.lastNotificationDismissalEmailIds ?? [];
     publicSubscriber.lastNotificationTitle = subscriber.lastNotificationTitle ?? null;
     publicSubscriber.lastLocalActionMessageIds = subscriber.lastLocalActionMessageIds ?? [];
+    publicSubscriber.lastBodyCacheError = subscriber.lastBodyCacheError ?? null;
   }
 
   return publicSubscriber;

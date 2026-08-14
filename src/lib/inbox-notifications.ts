@@ -199,6 +199,18 @@ export async function registerForInboxNotifications(
   };
 }
 
+export async function repairInboxNotificationRegistration() {
+  if (!Device.isDevice || !(await getStoredNotificationDeviceId())) {
+    return null;
+  }
+  const permissions = await Notifications.getPermissionsAsync();
+  if (!permissions.granted || !(await getFastmailJmapToken())) {
+    return null;
+  }
+  const status = await getInboxNotificationRegistrationStatus();
+  return status.registered ? status : registerForInboxNotifications();
+}
+
 export async function sendInboxNotificationTest(relayUrlInput?: string) {
   const relayUrl = relayUrlInput
     ? await saveNotificationRelayUrl(relayUrlInput)

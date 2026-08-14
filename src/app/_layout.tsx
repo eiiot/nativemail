@@ -9,6 +9,7 @@ import {
   getNotificationMessageRoute,
   isArchiveInboxNotificationResponse,
   registerInboxNotificationCategories,
+  repairInboxNotificationRegistration,
   syncInboxUnreadBadgeCount,
   syncPresentedInboxNotifications,
 } from '@/lib/inbox-notifications';
@@ -93,6 +94,7 @@ export default function RootLayout() {
   }, []);
   useEffect(() => {
     void registerInboxNotificationCategories().catch(() => {});
+    void repairInboxNotificationRegistration().catch(() => {});
   }, []);
   useEffect(() => {
     const subscription = Notifications.addNotificationReceivedListener((notification) => {
