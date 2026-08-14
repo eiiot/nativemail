@@ -124,10 +124,12 @@ import {
 import * as Haptics from 'expo-haptics';
 import { Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
+import type { SearchBarCommands } from 'react-native-screens';
 import { ComponentProps, PropsWithChildren, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
-  Clipboard,
   ActivityIndicator,
+  ActionSheetIOS,
+  Clipboard,
   InteractionManager,
   Platform,
   Pressable,
@@ -209,6 +211,7 @@ export default function InboxScreen() {
   const pendingDestructiveSwipeMessageIdsRef = useRef(new Set<string>());
   const pendingMessageNavigationKeyRef = useRef<string | null>(null);
   const pendingMessageNavigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchBarRef = useRef<SearchBarCommands | null>(null);
   const pullRefreshInFlightRef = useRef<Promise<void> | null>(null);
   const loadMoreInFlightRef = useRef<Promise<void> | null>(null);
   const loadMoreInboxMessagesRef = useRef<() => boolean>(() => false);
@@ -244,6 +247,7 @@ export default function InboxScreen() {
   const mailboxMessages = liveMessages ?? [];
   const normalizedSearchQuery = searchQuery.trim();
   const searchActive = normalizedSearchQuery.length > 0;
+  const searchPillTerms = getSearchPillTerms(searchQuery);
   const sourceMessages = searchActive && searchSnapshot ? searchSnapshot.messages : mailboxMessages;
   const visibleMessages = searchActive && !searchSnapshot
     ? getSearchFilteredMessages(mailboxMessages, searchQuery)
@@ -1231,6 +1235,31 @@ export default function InboxScreen() {
     const text = (eventOrText as { nativeEvent?: { text?: string } })?.nativeEvent?.text;
     setSearchQuery(text ?? '');
   };
+  const applySearchPillTerms = (terms: SearchPillTerm[]) => {
+    const nextQuery = serializeSearchPillTerms(terms);
+    searchBarRef.current?.setText(nextQuery);
+    setSearchQuery(nextQuery);
+  };
+  const removeSearchPill = (termIndex: number) => {
+    applySearchPillTerms(searchPillTerms.filter((_, index) => index !== termIndex));
+  };
+  const chooseSearchPillScope = (termIndex: number) => {
+    const scopeLabels: SearchPillScope[] = ['Anywhere', 'From', 'To', 'Subject', 'Body'];
+    ActionSheetIOS.showActionSheetWithOptions(
+      {
+        cancelButtonIndex: scopeLabels.length,
+        options: [...scopeLabels, 'Cancel'],
+        title: `Search “${searchPillTerms[termIndex]?.value ?? ''}” in`,
+      },
+      (selectedIndex) => {
+        const scope = scopeLabels[selectedIndex];
+        if (!scope) return;
+        applySearchPillTerms(searchPillTerms.map((term, index) =>
+          index === termIndex ? { ...term, scope } : term,
+        ));
+      },
+    );
+  };
   return (
     <>
       <Stack.Header
@@ -1262,6 +1291,7 @@ export default function InboxScreen() {
         </Stack.Toolbar.Button>
       </Stack.Toolbar>
       <Stack.SearchBar
+        ref={searchBarRef}
         allowToolbarIntegration
         hideNavigationBar={false}
         obscureBackground={false}
@@ -1327,24 +1357,6 @@ export default function InboxScreen() {
                 />
               </RNHostView>
             </HStack>
-            {searchActive && (
-              <HStack
-                key="search-status"
-                modifiers={[
-                  listRowInsets({ top: 4, leading: 16, bottom: 8, trailing: 16 }),
-                  listRowBackground(colors.background),
-                  listRowSeparator('hidden'),
-                ]}>
-                <RNHostView matchContents>
-                  <SearchStatusPanel
-                    colors={colors}
-                    error={searchError}
-                    loading={searchLoading}
-                    resultCount={searchSnapshot?.total ?? searchSnapshot?.messages.length ?? null}
-                  />
-                </RNHostView>
-              </HStack>
-            )}
             <List.ForEach key="mailbox-messages">
               {renderedMessages.map((item) => {
                 const avatarSourceUrl = getMessageAvatarSourceUrl(item);
@@ -1384,6 +1396,17 @@ export default function InboxScreen() {
             </HStack>
           </List>
         </Host>
+        {searchActive && (
+          <SearchPillBar
+            colors={colors}
+            error={searchError}
+            loading={searchLoading}
+            onRemove={removeSearchPill}
+            onScopePress={chooseSearchPillScope}
+            style={{ bottom: insets.bottom + 62 }}
+            terms={searchPillTerms}
+          />
+        )}
         <View
           pointerEvents="none"
           style={[
@@ -1509,6 +1532,46 @@ function getSearchFilteredMessages(messages: Message[], searchQuery: string) {
     message.subject.toLowerCase().includes(query) ||
     message.preview.toLowerCase().includes(query)
   );
+}
+
+type SearchPillScope = 'Anywhere' | 'From' | 'To' | 'Cc' | 'Bcc' | 'Subject' | 'Body' | 'After' | 'Before' | 'Has' | 'Is';
+type SearchPillTerm = { scope: SearchPillScope; value: string };
+
+const searchScopeByOperator: Record<string, SearchPillScope> = {
+  after: 'After',
+  bcc: 'Bcc',
+  before: 'Before',
+  body: 'Body',
+  cc: 'Cc',
+  from: 'From',
+  has: 'Has',
+  is: 'Is',
+  subject: 'Subject',
+  to: 'To',
+};
+
+function getSearchPillTerms(value: string): SearchPillTerm[] {
+  const terms: SearchPillTerm[] = [];
+  const tokenPattern = /([a-z]+):(?:"([^"]*)"|(\S+))|"([^"]*)"|(\S+)/gi;
+
+  for (const match of value.matchAll(tokenPattern)) {
+    const operator = (match[1] ?? '').toLowerCase();
+    const scopedValue = match[2] ?? match[3] ?? '';
+    const anywhereValue = match[4] ?? match[5] ?? '';
+    terms.push({
+      scope: searchScopeByOperator[operator] ?? 'Anywhere',
+      value: scopedValue || anywhereValue || `${operator}:`,
+    });
+  }
+
+  return terms;
+}
+
+function serializeSearchPillTerms(terms: SearchPillTerm[]) {
+  return terms.map((term) => {
+    const value = /\s/.test(term.value) ? `"${term.value.replace(/"/g, '\\"')}"` : term.value;
+    return term.scope === 'Anywhere' ? value : `${term.scope.toLowerCase()}:${value}`;
+  }).join(' ');
 }
 
 function getAvatarSourceKey(messages: Message[]) {
@@ -1673,35 +1736,53 @@ function formatDebugRecordKeys(record: Record<string, true> | undefined) {
   return keys.length ? keys.join(',') : 'none';
 }
 
-function SearchStatusPanel({
+function SearchPillBar({
   colors,
   error,
   loading,
-  resultCount,
+  onRemove,
+  onScopePress,
+  style,
+  terms,
 }: {
   colors: ColorSet;
   error: string | null;
   loading: boolean;
-  resultCount: number | null;
+  onRemove: (index: number) => void;
+  onScopePress: (index: number) => void;
+  style: ViewStyle;
+  terms: SearchPillTerm[];
 }) {
-  const status = error
-    ? 'Search unavailable — showing cached matches'
-    : loading
-      ? 'Searching all mail…'
-      : resultCount === null
-        ? 'Search all mail'
-        : `${resultCount} ${resultCount === 1 ? 'result' : 'results'} across all mail`;
-
   return (
-    <GlassView style={styles.searchStatusGlass} glassEffectStyle="regular">
-      <View style={styles.searchStatusRow}>
-        {loading ? <ActivityIndicator color={tint} size="small" /> : <SymbolView name="sparkle.magnifyingglass" size={16} tintColor={tint} />}
-        <View style={styles.searchStatusCopy}>
-          <Text style={[styles.searchStatusTitle, { color: colors.text }]}>{status}</Text>
-          <Text style={[styles.searchStatusHint, { color: colors.secondaryText }]}>from: · to: · subject: · after: · before: · has:attachment · is:unread</Text>
-        </View>
-      </View>
-    </GlassView>
+    <View pointerEvents="box-none" style={[styles.searchPillOverlay, style]}>
+      <ScrollView
+        contentContainerStyle={styles.searchPillContent}
+        horizontal
+        keyboardShouldPersistTaps="always"
+        showsHorizontalScrollIndicator={false}>
+        {terms.map((term, index) => (
+          <GlassView glassEffectStyle="regular" key={`${term.scope}-${term.value}-${index}`} style={styles.searchPillGlass}>
+            <Pressable onPress={() => onScopePress(index)} style={styles.searchPillScope}>
+              <Text style={[styles.searchPillScopeText, { color: colors.secondaryText }]}>{term.scope}</Text>
+              <SymbolView name="chevron.down" size={11} tintColor={colors.secondaryText} />
+            </Pressable>
+            <View style={[styles.searchPillDivider, { backgroundColor: colors.separator }]} />
+            <Text numberOfLines={1} style={[styles.searchPillValue, { color: colors.text }]}>{term.value}</Text>
+            <View style={[styles.searchPillDivider, { backgroundColor: colors.separator }]} />
+            <Pressable hitSlop={8} onPress={() => onRemove(index)} style={styles.searchPillRemove}>
+              <SymbolView name="xmark" size={12} tintColor={colors.secondaryText} />
+            </Pressable>
+          </GlassView>
+        ))}
+        {(loading || error) && (
+          <GlassView glassEffectStyle="regular" style={styles.searchPillActivity}>
+            {loading
+              ? <ActivityIndicator color={tint} size="small" />
+              : <SymbolView name="exclamationmark" size={13} tintColor="#FF453A" />}
+          </GlassView>
+        )}
+      </ScrollView>
+    </View>
   );
 }
 
@@ -2798,30 +2879,59 @@ const styles = StyleSheet.create({
   inboxListHost: {
     flex: 1,
   },
-  searchStatusGlass: {
-    borderRadius: 18,
-    overflow: 'hidden',
-    paddingHorizontal: 14,
-    paddingVertical: 11,
+  searchPillOverlay: {
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    zIndex: 20,
   },
-  searchStatusRow: {
+  searchPillContent: {
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 4,
+  },
+  searchPillGlass: {
+    alignItems: 'center',
+    borderRadius: 17,
+    flexDirection: 'row',
+    height: 42,
+    overflow: 'hidden',
+  },
+  searchPillScope: {
     alignItems: 'center',
     flexDirection: 'row',
-    gap: 10,
+    gap: 5,
+    height: '100%',
+    paddingLeft: 13,
+    paddingRight: 10,
   },
-  searchStatusCopy: {
-    flex: 1,
-    gap: 2,
-  },
-  searchStatusTitle: {
+  searchPillScopeText: {
     fontFamily: systemFont,
     fontSize: 14,
     fontWeight: '600',
   },
-  searchStatusHint: {
+  searchPillDivider: {
+    height: 24,
+    width: StyleSheet.hairlineWidth,
+  },
+  searchPillValue: {
     fontFamily: systemFont,
-    fontSize: 11,
-    lineHeight: 15,
+    fontSize: 15,
+    maxWidth: 150,
+    paddingHorizontal: 12,
+  },
+  searchPillRemove: {
+    alignItems: 'center',
+    height: '100%',
+    justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
+  searchPillActivity: {
+    alignItems: 'center',
+    borderRadius: 21,
+    height: 42,
+    justifyContent: 'center',
+    width: 42,
   },
   headerBackdrop: {
     left: 0,

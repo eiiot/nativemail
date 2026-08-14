@@ -1,8 +1,9 @@
-import type { EmailFilterCondition } from 'jmap-kit'
+import type { EmailFilterCondition, FilterOperator } from 'jmap-kit'
 
-export function parseJmapSearchQuery(value: string): EmailFilterCondition {
-  const filter: EmailFilterCondition = {}
-  const freeText: string[] = []
+export type JmapSearchFilter = EmailFilterCondition | FilterOperator<EmailFilterCondition>
+
+export function parseJmapSearchQuery(value: string): JmapSearchFilter {
+  const conditions: EmailFilterCondition[] = []
   const tokenPattern = /([a-z]+):(?:"([^"]*)"|(\S+))|"([^"]*)"|(\S+)/gi
 
   for (const match of value.matchAll(tokenPattern)) {
@@ -11,28 +12,28 @@ export function parseJmapSearchQuery(value: string): EmailFilterCondition {
     const token = match[4] ?? match[5] ?? ''
 
     if (operand && ['from', 'to', 'cc', 'bcc', 'subject', 'body'].includes(key)) {
-      ;(filter as Record<string, unknown>)[key] = operand
+      conditions.push({ [key]: operand })
     } else if (operand && key === 'before') {
       const date = parseSearchDate(operand, false)
-      if (date) filter.before = date
+      if (date) conditions.push({ before: date })
     } else if (operand && key === 'after') {
       const date = parseSearchDate(operand, true)
-      if (date) filter.after = date
+      if (date) conditions.push({ after: date })
     } else if (key === 'has' && operand.toLowerCase() === 'attachment') {
-      filter.hasAttachment = true
+      conditions.push({ hasAttachment: true })
     } else if (key === 'is' && operand.toLowerCase() === 'unread') {
-      filter.notKeyword = '$seen'
+      conditions.push({ notKeyword: '$seen' })
     } else if (key === 'is' && operand.toLowerCase() === 'read') {
-      filter.hasKeyword = '$seen'
+      conditions.push({ hasKeyword: '$seen' })
     } else if (key === 'is' && ['starred', 'flagged'].includes(operand.toLowerCase())) {
-      filter.hasKeyword = '$flagged'
+      conditions.push({ hasKeyword: '$flagged' })
     } else {
-      freeText.push(key ? `${key}:${operand}` : token)
+      conditions.push({ text: key ? `${key}:${operand}` : token })
     }
   }
 
-  if (freeText.length) filter.text = freeText.join(' ')
-  return filter
+  if (conditions.length <= 1) return conditions[0] ?? {}
+  return { conditions, operator: 'AND' }
 }
 
 function parseSearchDate(value: string, startOfDay: boolean) {

@@ -7,7 +7,7 @@ import {
 import { getFastmailJmapToken } from '@/lib/fastmail-token'
 import type { Message, MessageAttachment } from '@/lib/mock-mail'
 import { observeDuration, observeError, observeEvent } from '@/lib/observability'
-import { parseJmapSearchQuery } from '@/lib/search-query'
+import { parseJmapSearchQuery, type JmapSearchFilter } from '@/lib/search-query'
 import {
     createStateTracker,
     type SyncStateSnapshot,
@@ -22,7 +22,6 @@ import {
     isErrorInvocation,
     type EmailAddress,
     type EmailBodyPart,
-    type EmailFilterCondition,
     type EmailObject,
     type Id,
     type MailboxObject,
@@ -665,10 +664,13 @@ export async function fetchJmapSearchSnapshot({
         const excludedMailboxIds = mailboxes
             .filter((mailbox) => mailbox.role === 'trash' || mailbox.role === 'junk')
             .map((mailbox) => mailbox.id)
-        const filter = parseJmapSearchQuery(query)
+        let filter = parseJmapSearchQuery(query)
 
         if (excludedMailboxIds.length) {
-            filter.inMailboxOtherThan = excludedMailboxIds
+            const mailboxCondition = { inMailboxOtherThan: excludedMailboxIds }
+            filter = 'operator' in filter
+                ? { conditions: [...filter.conditions, mailboxCondition], operator: 'AND' }
+                : { conditions: [filter, mailboxCondition], operator: 'AND' }
         }
 
         const page = await getSearchSnapshotBatch(
@@ -680,15 +682,8 @@ export async function fetchJmapSearchSnapshot({
             limit,
             signal,
         )
-        const threads = await buildThreadMap(
-            client,
-            accountId,
-            page.threads,
-            page.messages,
-            mailboxes,
-            signal,
-        )
-        const messages = applyThreadCountsToMessages(page.messages, threads)
+        const threads: Record<string, JmapThread> = {}
+        const messages = page.messages
         const snapshot: JmapMailboxSnapshot = {
             accountId,
             mailbox: null,
@@ -2521,8 +2516,8 @@ async function getMailboxSnapshotBatch(
 ) {
     const query = Email.request.query({
         accountId,
-        calculateTotal: true,
-        collapseThreads: true,
+        calculateTotal: false,
+        collapseThreads: false,
         filter: { inMailbox: mailboxId },
         limit,
         position,
@@ -2604,7 +2599,7 @@ async function getMailboxSnapshotBatch(
 async function getSearchSnapshotBatch(
     client: JMAPClient,
     accountId: Id,
-    filter: EmailFilterCondition,
+    filter: JmapSearchFilter,
     mailboxes: JmapMailbox[],
     position: number,
     limit: number,
@@ -2629,15 +2624,9 @@ async function getSearchSnapshotBatch(
         .createRequestBuilder()
         .add(query)
         .add(emailGet)
-        .add(Thread.request.get({
-            accountId,
-            ids: emailGet.createReference('/list/*/threadId'),
-            properties: threadProperties,
-        }))
         .send(signal)
     let emailIds: Id[] = []
     let emails: EmailObject[] = []
-    let threadObjects: ThreadObject[] = []
     let responsePosition = position
     let total: number | null = null
 
@@ -2651,13 +2640,12 @@ async function getSearchSnapshotBatch(
             total = (invocation.getArgument('total') as number | undefined) ?? null
         }
         if (invocation.name === 'Email/get') emails = invocation.getArgument('list') as EmailObject[]
-        if (invocation.name === 'Thread/get') threadObjects = invocation.getArgument('list') as ThreadObject[]
     }
 
     return {
         messages: sortEmailsByQuery(emails, emailIds).map((email) => mapEmailToMessage(email, mailboxes)),
         position: responsePosition,
-        threads: threadObjects,
+        threads: [],
         total,
     }
 }
