@@ -1,5 +1,5 @@
-import { Button, ControlGroup, Host, HStack, Menu } from '@expo/ui/swift-ui';
-import { buttonBorderShape, buttonStyle, controlSize, fixedSize, glassEffect, labelStyle, tint } from '@expo/ui/swift-ui/modifiers';
+import { Button, ControlGroup, Host, Menu } from '@expo/ui/swift-ui';
+import { buttonBorderShape, buttonStyle, controlSize, frame, glassEffect, labelStyle, tint } from '@expo/ui/swift-ui/modifiers';
 import * as Haptics from 'expo-haptics';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useState } from 'react';
@@ -81,21 +81,20 @@ function ConceptCanvas({ concept, dark }: { concept: Concept; dark: boolean }) {
       <View style={[styles.glow, styles.glowOne]} />
       <View style={[styles.glow, styles.glowTwo]} />
       <Host colorScheme={dark ? 'dark' : 'light'} style={styles.host}>
-        <HStack spacing={8}>
-          <NativeToken concept={concept} term="claude" />
-          <NativeToken concept={concept} term="code" />
-        </HStack>
+        <NativeToken concept={concept} term="hello" />
       </Host>
     </View>
   );
 }
 
 function NativeToken({ concept, term }: { concept: Concept; term: string }) {
+  const tokenWidth = concept.scopeLabel === 'All' ? 176 : 224;
+  const tokenHeight = concept.size === 'mini' ? 30 : concept.size === 'regular' ? 44 : 36;
   const groupModifiers = [
     buttonStyle('plain'),
     buttonBorderShape('capsule'),
     controlSize(concept.size),
-    fixedSize({ horizontal: true, vertical: true }),
+    frame({ width: tokenWidth, height: tokenHeight }),
     glassEffect({
       glass: {
         variant: 'regular',
