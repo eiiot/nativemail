@@ -1761,7 +1761,7 @@ function SearchPillBar({
         keyboardShouldPersistTaps="always"
         showsHorizontalScrollIndicator={false}>
         {terms.map((term, index) => (
-          <GlassView glassEffectStyle="regular" key={`${term.scope}-${term.value}-${index}`} style={styles.searchPillGlass}>
+          <GlassView glassEffectStyle="regular" isInteractive key={`${term.scope}-${term.value}-${index}`} style={styles.searchPillGlass}>
             <Pressable onPress={() => onScopePress(index)} style={styles.searchPillScope}>
               <Text style={[styles.searchPillScopeText, { color: colors.secondaryText }]}>{term.scope}</Text>
               <SymbolView name="chevron.down" size={11} tintColor={colors.secondaryText} />
@@ -2892,46 +2892,47 @@ const styles = StyleSheet.create({
   },
   searchPillGlass: {
     alignItems: 'center',
-    borderRadius: 17,
+    borderRadius: 999,
     flexDirection: 'row',
-    height: 42,
+    height: 36,
     overflow: 'hidden',
   },
   searchPillScope: {
     alignItems: 'center',
     flexDirection: 'row',
-    gap: 5,
+    gap: 4,
     height: '100%',
-    paddingLeft: 13,
-    paddingRight: 10,
+    paddingLeft: 11,
+    paddingRight: 8,
   },
   searchPillScopeText: {
     fontFamily: systemFont,
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '600',
   },
   searchPillDivider: {
-    height: 24,
+    height: 20,
     width: StyleSheet.hairlineWidth,
   },
   searchPillValue: {
     fontFamily: systemFont,
-    fontSize: 15,
-    maxWidth: 150,
-    paddingHorizontal: 12,
+    fontSize: 13,
+    fontWeight: '600',
+    maxWidth: 132,
+    paddingHorizontal: 9,
   },
   searchPillRemove: {
     alignItems: 'center',
     height: '100%',
     justifyContent: 'center',
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
   },
   searchPillActivity: {
     alignItems: 'center',
-    borderRadius: 21,
-    height: 42,
+    borderRadius: 999,
+    height: 36,
     justifyContent: 'center',
-    width: 42,
+    width: 36,
   },
   headerBackdrop: {
     left: 0,

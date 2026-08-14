@@ -155,7 +155,7 @@ const styles = StyleSheet.create({
   row: { alignItems: 'center', flexDirection: 'row', gap: 8 },
   cluster: { alignItems: 'center', flexDirection: 'row', gap: 4 },
   pill: { alignItems: 'center', borderRadius: 18, flexDirection: 'row', height: 46, overflow: 'hidden' },
-  compactPill: { borderRadius: 15, height: 36 },
+  compactPill: { borderRadius: 999, height: 36 },
   scope: { alignItems: 'center', flexDirection: 'row', gap: 3, paddingHorizontal: 10 },
   compactScope: { paddingHorizontal: 8 },
   pillIcon: { color: '#fff', fontSize: 18, fontWeight: '600' },
