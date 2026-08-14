@@ -6,6 +6,7 @@ import {
   writeCachedEmailBody,
 } from '@/lib/mail-cache';
 import {
+  fetchJmapMessageBodies,
   fetchJmapMessageBody,
   type JmapMailboxSnapshot,
   type JmapMessageBody,
@@ -18,7 +19,9 @@ type MessagePatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
 
 const LOCAL_ACTION_REFRESH_SUPPRESSION_MS = 8000;
 const SLOW_FOREGROUND_BODY_FETCH_MS = 1000;
-const BACKGROUND_MESSAGE_BODY_NETWORK_FETCHES_ENABLED = false;
+// The relay serializes these behind foreground reads and aborts them as soon as
+// the user opens a message, so warming visible rows no longer competes with taps.
+const BACKGROUND_MESSAGE_BODY_NETWORK_FETCHES_ENABLED = true;
 // One attempt — simplest possible: tap email, one direct fetch, show it. No
 // retry storms.
 const FOREGROUND_MESSAGE_BODY_FETCH_MAX_ATTEMPTS = 1;
@@ -506,7 +509,7 @@ export async function loadMessageBody(
   if (!refresh) {
     const cachedOrMemoryBody = await hydrateMessageBodyFromCache(messageId);
 
-    if (cachedOrMemoryBody) {
+    if (cachedOrMemoryBody && !hasUnresolvedCidImage(cachedOrMemoryBody)) {
       observeDuration('mail.body.load.cache-hit', startedAt, {
         html: cachedOrMemoryBody.html?.trim() ? cachedOrMemoryBody.html.length : 0,
         messageId,
@@ -515,6 +518,13 @@ export async function loadMessageBody(
         text: cachedOrMemoryBody.text?.trim() ? cachedOrMemoryBody.text.length : 0,
       });
       return cachedOrMemoryBody;
+    }
+
+    if (cachedOrMemoryBody) {
+      observeEvent('mail.body.load.cache-stale-cid', {
+        messageId,
+        priority,
+      });
     }
   }
 
@@ -698,6 +708,10 @@ export async function loadMessageBody(
   return fetchPromise;
 }
 
+function hasUnresolvedCidImage(body: JmapMessageBody) {
+  return /\bcid:/i.test(body.html ?? '');
+}
+
 export async function prefetchMessageBodies(
   messageIds: string[],
   {
@@ -739,30 +753,39 @@ export async function prefetchMessageBodies(
         break;
       }
 
-      const messageId = pendingIds[cursor];
-      cursor += 1;
-
-      if (!messageId) {
-        continue;
-      }
+      const batchIds = pendingIds.slice(cursor, cursor + Math.max(1, concurrency));
+      cursor += batchIds.length;
 
       try {
-        const body = await loadMessageBody(messageId, { priority: 'background' });
+        const cachedBodies = await Promise.all(batchIds.map(hydrateMessageBodyFromCache));
+        const missingIds = batchIds.filter((_, index) => !cachedBodies[index]);
+        loaded += batchIds.length - missingIds.length;
 
-        if (body) {
-          loaded += 1;
-        } else {
-          failed += 1;
+        if (!missingIds.length || foregroundMessageBodyFetchCount > 0) {
+          continue;
         }
+
+        const controller = new AbortController();
+        const bodies = await fetchJmapMessageBodies({ messageIds: missingIds, signal: controller.signal });
+        await Promise.all(missingIds.map(async (messageId) => {
+          const body = bodies[messageId];
+          if (!body) {
+            failed += 1;
+            return;
+          }
+          useMailStore.getState().applyMessageBody(messageId, body);
+          await writeCachedEmailBody(messageId, body).catch(() => {});
+          loaded += 1;
+        }));
       } catch {
-        failed += 1;
+        failed += batchIds.length;
       }
     }
   }
 
   await Promise.all(
     Array.from(
-      { length: Math.min(Math.max(1, concurrency), pendingIds.length) },
+      { length: pendingIds.length ? 1 : 0 },
       () => runNext(),
     ),
   );

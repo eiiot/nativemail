@@ -31,6 +31,7 @@ import { useDebugMode } from '@/lib/debug-mode';
 import {
   describeJmapError,
   fetchJmapMailboxSnapshot,
+  fetchJmapSearchSnapshot,
   hasJmapMailboxViewChanged,
   type JmapMailboxSnapshot,
 } from '@/lib/jmap-client';
@@ -123,8 +124,11 @@ import {
 import * as Haptics from 'expo-haptics';
 import { Stack, router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
+import type { SearchBarCommands } from 'react-native-screens';
 import { ComponentProps, PropsWithChildren, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
+  ActionSheetIOS,
   Clipboard,
   InteractionManager,
   Platform,
@@ -151,8 +155,8 @@ const inboxMailboxPageSize = 50;
 const inboxLoadMoreThreshold = 420;
 const inboxBottomLoadRearmOffsetDelta = 240;
 const inboxBodyWarmDelayMs = 650;
-const inboxBodyWarmBatchSize = 1;
-const inboxBodyWarmBatchGapMs = 450;
+const inboxBodyWarmBatchSize = 5;
+const inboxBodyWarmBatchGapMs = 800;
 const inboxCacheWriteDelayMs = 700;
 const inboxDebugDiskBatchSize = 8;
 const inboxDebugDiskBatchGapMs = 120;
@@ -207,6 +211,7 @@ export default function InboxScreen() {
   const pendingDestructiveSwipeMessageIdsRef = useRef(new Set<string>());
   const pendingMessageNavigationKeyRef = useRef<string | null>(null);
   const pendingMessageNavigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchBarRef = useRef<SearchBarCommands | null>(null);
   const pullRefreshInFlightRef = useRef<Promise<void> | null>(null);
   const loadMoreInFlightRef = useRef<Promise<void> | null>(null);
   const loadMoreInboxMessagesRef = useRef<() => boolean>(() => false);
@@ -229,6 +234,9 @@ export default function InboxScreen() {
   const [scrollY, setScrollY] = useState(0);
   const [listScrollPhase, setListScrollPhase] = useState<ScrollPhase>('idle');
   const [searchQuery, setSearchQuery] = useState('');
+  const [searchSnapshot, setSearchSnapshot] = useState<JmapMailboxSnapshot | null>(null);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [avatarFileUriBySourceUrl, setAvatarFileUriBySourceUrl] = useState<Record<string, string>>({});
   const [contactAvatarUriByEmail, setContactAvatarUriByEmail] = useState<Record<string, string>>({});
   const [bodyDiskStateById, setBodyDiskStateById] = useState<Record<string, boolean | undefined>>({});
@@ -236,8 +244,14 @@ export default function InboxScreen() {
   const [screenFocused, setScreenFocused] = useState(false);
   const [backgroundBodyWarmPaused, setBackgroundBodyWarmPaused] = useState(false);
   const activeMailboxName = liveMailboxName ?? mailboxName ?? 'Inbox';
-  const sourceMessages = liveMessages ?? [];
-  const visibleMessages = getSearchFilteredMessages(sourceMessages, searchQuery);
+  const mailboxMessages = liveMessages ?? [];
+  const normalizedSearchQuery = searchQuery.trim();
+  const searchActive = normalizedSearchQuery.length > 0;
+  const searchPillTerms = getSearchPillTerms(searchQuery);
+  const sourceMessages = searchActive && searchSnapshot ? searchSnapshot.messages : mailboxMessages;
+  const visibleMessages = searchActive && !searchSnapshot
+    ? getSearchFilteredMessages(mailboxMessages, searchQuery)
+    : sourceMessages;
   const renderedMessages = visibleMessages.slice(0, rowRenderLimit);
   const bodyDebugMessageIds = renderedMessages.map((message) => message.id);
   const bodyDebugKey = bodyDebugMessageIds.join('\n');
@@ -275,6 +289,54 @@ export default function InboxScreen() {
     }, [clearPendingMessageNavigation]),
   );
   useEffect(() => clearPendingMessageNavigation, [clearPendingMessageNavigation]);
+  useEffect(() => {
+    if (normalizedSearchQuery.length < 2) {
+      setSearchSnapshot(null);
+      setSearchLoading(false);
+      setSearchError(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    setSearchSnapshot(null);
+    const timer = setTimeout(() => {
+      const startedAt = Date.now();
+      setSearchLoading(true);
+      setSearchError(null);
+      observeEvent('inbox.search.start', { queryLength: normalizedSearchQuery.length });
+
+      void fetchJmapSearchSnapshot({
+        limit: inboxMailboxPageSize,
+        query: normalizedSearchQuery,
+        signal: controller.signal,
+      })
+        .then((result) => {
+          setSearchSnapshot(result);
+          setRowRenderLimit(initialInboxRowRenderLimit);
+          observeDuration('inbox.search.success', startedAt, {
+            messages: result.messages.length,
+            queryLength: normalizedSearchQuery.length,
+            total: result.total ?? -1,
+          });
+        })
+        .catch((error: unknown) => {
+          if (!(error instanceof Error && error.name === 'AbortError')) {
+            setSearchError(describeJmapError(error));
+            observeError('inbox.search.failed', error, {
+              queryLength: normalizedSearchQuery.length,
+            });
+          }
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setSearchLoading(false);
+        });
+    }, 300);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [normalizedSearchQuery]);
   const hiddenRowCount = Math.max(0, visibleMessages.length - renderedMessages.length);
   const messageRouteSource = liveMessages ? 'jmap' : 'mock';
   const navTitleVisible = scrollY >= titleRevealStart;
@@ -707,8 +769,35 @@ export default function InboxScreen() {
       return true;
     }
 
-    if (searchQuery.trim()) {
-      return false;
+    if (normalizedSearchQuery) {
+      const currentSearch = searchSnapshot;
+      const nextPosition = currentSearch?.messages.length ?? 0;
+      const hasMoreSearchResults = Boolean(
+        currentSearch &&
+        (currentSearch.total === null || currentSearch.total === undefined || nextPosition < currentSearch.total),
+      );
+
+      if (!currentSearch || !hasMoreSearchResults || loadMoreInFlightRef.current) return false;
+
+      const loadMore = fetchJmapSearchSnapshot({
+        limit: inboxMailboxPageSize,
+        position: nextPosition,
+        query: normalizedSearchQuery,
+      })
+        .then((page) => {
+          setSearchSnapshot((current) => current ? mergeMailboxPageIntoSnapshot(current, page) : page);
+          setRowRenderLimit((current) => current + inboxRenderPageSize);
+        })
+        .catch((error: unknown) => {
+          setSearchError(describeJmapError(error));
+          observeError('inbox.search.load-more.failed', error, { position: nextPosition });
+        })
+        .finally(() => {
+          loadMoreInFlightRef.current = null;
+        });
+
+      loadMoreInFlightRef.current = loadMore;
+      return true;
     }
 
     const currentSnapshot = selectMailboxSnapshot(useMailStore.getState(), mailboxId);
@@ -781,7 +870,8 @@ export default function InboxScreen() {
     mailboxId,
     refreshMailboxFromServer,
     rowRenderLimit,
-    searchQuery,
+    normalizedSearchQuery,
+    searchSnapshot,
     updateHasMoreMessages,
     visibleMessages.length,
   ]);
@@ -972,7 +1062,7 @@ export default function InboxScreen() {
         `start=${cursor} size=${batch.length} rows=${messageIds.length}`,
       );
       void prefetchMessageBodies(batch, {
-        concurrency: 1,
+        concurrency: batch.length,
         limit: batch.length,
         source: 'inbox-body-warm',
       })
@@ -1145,6 +1235,31 @@ export default function InboxScreen() {
     const text = (eventOrText as { nativeEvent?: { text?: string } })?.nativeEvent?.text;
     setSearchQuery(text ?? '');
   };
+  const applySearchPillTerms = (terms: SearchPillTerm[]) => {
+    const nextQuery = serializeSearchPillTerms(terms);
+    searchBarRef.current?.setText(nextQuery);
+    setSearchQuery(nextQuery);
+  };
+  const removeSearchPill = (termIndex: number) => {
+    applySearchPillTerms(searchPillTerms.filter((_, index) => index !== termIndex));
+  };
+  const chooseSearchPillScope = (termIndex: number) => {
+    const scopeLabels: SearchPillScope[] = ['Anywhere', 'From', 'To', 'Subject', 'Body'];
+    ActionSheetIOS.showActionSheetWithOptions(
+      {
+        cancelButtonIndex: scopeLabels.length,
+        options: [...scopeLabels, 'Cancel'],
+        title: `Search “${searchPillTerms[termIndex]?.value ?? ''}” in`,
+      },
+      (selectedIndex) => {
+        const scope = scopeLabels[selectedIndex];
+        if (!scope) return;
+        applySearchPillTerms(searchPillTerms.map((term, index) =>
+          index === termIndex ? { ...term, scope } : term,
+        ));
+      },
+    );
+  };
   return (
     <>
       <Stack.Header
@@ -1176,6 +1291,7 @@ export default function InboxScreen() {
         </Stack.Toolbar.Button>
       </Stack.Toolbar>
       <Stack.SearchBar
+        ref={searchBarRef}
         allowToolbarIntegration
         hideNavigationBar={false}
         obscureBackground={false}
@@ -1280,6 +1396,17 @@ export default function InboxScreen() {
             </HStack>
           </List>
         </Host>
+        {searchActive && (
+          <SearchPillBar
+            colors={colors}
+            error={searchError}
+            loading={searchLoading}
+            onRemove={removeSearchPill}
+            onScopePress={chooseSearchPillScope}
+            style={{ bottom: insets.bottom + 62 }}
+            terms={searchPillTerms}
+          />
+        )}
         <View
           pointerEvents="none"
           style={[
@@ -1405,6 +1532,46 @@ function getSearchFilteredMessages(messages: Message[], searchQuery: string) {
     message.subject.toLowerCase().includes(query) ||
     message.preview.toLowerCase().includes(query)
   );
+}
+
+type SearchPillScope = 'Anywhere' | 'From' | 'To' | 'Cc' | 'Bcc' | 'Subject' | 'Body' | 'After' | 'Before' | 'Has' | 'Is';
+type SearchPillTerm = { scope: SearchPillScope; value: string };
+
+const searchScopeByOperator: Record<string, SearchPillScope> = {
+  after: 'After',
+  bcc: 'Bcc',
+  before: 'Before',
+  body: 'Body',
+  cc: 'Cc',
+  from: 'From',
+  has: 'Has',
+  is: 'Is',
+  subject: 'Subject',
+  to: 'To',
+};
+
+function getSearchPillTerms(value: string): SearchPillTerm[] {
+  const terms: SearchPillTerm[] = [];
+  const tokenPattern = /([a-z]+):(?:"([^"]*)"|(\S+))|"([^"]*)"|(\S+)/gi;
+
+  for (const match of value.matchAll(tokenPattern)) {
+    const operator = (match[1] ?? '').toLowerCase();
+    const scopedValue = match[2] ?? match[3] ?? '';
+    const anywhereValue = match[4] ?? match[5] ?? '';
+    terms.push({
+      scope: searchScopeByOperator[operator] ?? 'Anywhere',
+      value: scopedValue || anywhereValue || `${operator}:`,
+    });
+  }
+
+  return terms;
+}
+
+function serializeSearchPillTerms(terms: SearchPillTerm[]) {
+  return terms.map((term) => {
+    const value = /\s/.test(term.value) ? `"${term.value.replace(/"/g, '\\"')}"` : term.value;
+    return term.scope === 'Anywhere' ? value : `${term.scope.toLowerCase()}:${value}`;
+  }).join(' ');
 }
 
 function getAvatarSourceKey(messages: Message[]) {
@@ -1567,6 +1734,56 @@ function formatDebugRecordKeys(record: Record<string, true> | undefined) {
   const keys = Object.keys(record ?? {});
 
   return keys.length ? keys.join(',') : 'none';
+}
+
+function SearchPillBar({
+  colors,
+  error,
+  loading,
+  onRemove,
+  onScopePress,
+  style,
+  terms,
+}: {
+  colors: ColorSet;
+  error: string | null;
+  loading: boolean;
+  onRemove: (index: number) => void;
+  onScopePress: (index: number) => void;
+  style: ViewStyle;
+  terms: SearchPillTerm[];
+}) {
+  return (
+    <View pointerEvents="box-none" style={[styles.searchPillOverlay, style]}>
+      <ScrollView
+        contentContainerStyle={styles.searchPillContent}
+        horizontal
+        keyboardShouldPersistTaps="always"
+        showsHorizontalScrollIndicator={false}>
+        {terms.map((term, index) => (
+          <GlassView glassEffectStyle="regular" isInteractive key={`${term.scope}-${term.value}-${index}`} style={styles.searchPillGlass}>
+            <Pressable onPress={() => onScopePress(index)} style={styles.searchPillScope}>
+              <Text style={[styles.searchPillScopeText, { color: colors.secondaryText }]}>{term.scope}</Text>
+              <SymbolView name="chevron.down" size={11} tintColor={colors.secondaryText} />
+            </Pressable>
+            <View style={[styles.searchPillDivider, { backgroundColor: colors.separator }]} />
+            <Text numberOfLines={1} style={[styles.searchPillValue, { color: colors.text }]}>{term.value}</Text>
+            <View style={[styles.searchPillDivider, { backgroundColor: colors.separator }]} />
+            <Pressable hitSlop={8} onPress={() => onRemove(index)} style={styles.searchPillRemove}>
+              <SymbolView name="xmark" size={12} tintColor={colors.secondaryText} />
+            </Pressable>
+          </GlassView>
+        ))}
+        {(loading || error) && (
+          <GlassView glassEffectStyle="regular" style={styles.searchPillActivity}>
+            {loading
+              ? <ActivityIndicator color={tint} size="small" />
+              : <SymbolView name="exclamationmark" size={13} tintColor="#FF453A" />}
+          </GlassView>
+        )}
+      </ScrollView>
+    </View>
+  );
 }
 
 function InboxListHeader({
@@ -2661,6 +2878,61 @@ const styles = StyleSheet.create({
   },
   inboxListHost: {
     flex: 1,
+  },
+  searchPillOverlay: {
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    zIndex: 20,
+  },
+  searchPillContent: {
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 4,
+  },
+  searchPillGlass: {
+    alignItems: 'center',
+    borderRadius: 999,
+    flexDirection: 'row',
+    height: 36,
+    overflow: 'hidden',
+  },
+  searchPillScope: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 4,
+    height: '100%',
+    paddingLeft: 11,
+    paddingRight: 8,
+  },
+  searchPillScopeText: {
+    fontFamily: systemFont,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  searchPillDivider: {
+    height: 20,
+    width: StyleSheet.hairlineWidth,
+  },
+  searchPillValue: {
+    fontFamily: systemFont,
+    fontSize: 13,
+    fontWeight: '600',
+    maxWidth: 132,
+    paddingHorizontal: 9,
+  },
+  searchPillRemove: {
+    alignItems: 'center',
+    height: '100%',
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+  },
+  searchPillActivity: {
+    alignItems: 'center',
+    borderRadius: 999,
+    height: 36,
+    justifyContent: 'center',
+    width: 36,
   },
   headerBackdrop: {
     left: 0,

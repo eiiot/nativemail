@@ -13,7 +13,11 @@ import { Platform } from 'react-native';
 const notificationDeviceIdKey = 'notifications.deviceId';
 const notificationRelayUrlKey = 'notifications.relayUrl';
 const defaultNotificationRelayUrl =
-  process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://staging-nativemail-notifications.tuft.host';
+  process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://nativemail-relay.fly.dev';
+const legacyNotificationRelayUrls = new Set([
+  'https://staging-nativemail-notifications.tuft.host',
+  'https://s-nativemail-telemetry.tuft.host',
+]);
 export const inboxMessageNotificationCategoryId = 'nativemailInboxMessage';
 export const archiveInboxNotificationActionId = 'archiveInboxMessage';
 const secureStoreOptions: SecureStore.SecureStoreOptions = {
@@ -122,8 +126,13 @@ export async function archiveInboxNotificationResponse(
 
 export async function getNotificationRelayUrl() {
   const storedUrl = await SecureStore.getItemAsync(notificationRelayUrlKey, secureStoreOptions);
+  const normalizedUrl = normalizeRelayUrl(storedUrl || defaultNotificationRelayUrl);
 
-  return normalizeRelayUrl(storedUrl || defaultNotificationRelayUrl);
+  if (legacyNotificationRelayUrls.has(normalizedUrl)) {
+    return saveNotificationRelayUrl(defaultNotificationRelayUrl);
+  }
+
+  return normalizedUrl;
 }
 
 export async function saveNotificationRelayUrl(url: string) {
@@ -188,6 +197,56 @@ export async function registerForInboxNotifications(
     relayUrl,
     status: formatRelaySubscriberStatus(payload?.subscriber),
   };
+}
+
+export async function repairInboxNotificationRegistration() {
+  if (!Device.isDevice || !(await getStoredNotificationDeviceId())) {
+    return null;
+  }
+  const permissions = await Notifications.getPermissionsAsync();
+  if (!permissions.granted || !(await getFastmailJmapToken())) {
+    return null;
+  }
+  const status = await getInboxNotificationRegistrationStatus();
+  return status.registered ? status : registerForInboxNotifications();
+}
+
+export async function fetchInboxStateFromNotificationRelay(signal?: AbortSignal) {
+  if (!Device.isDevice) {
+    return null;
+  }
+
+  const deviceId = await getStoredNotificationDeviceId();
+  const projectId = getExpoProjectId();
+
+  if (!deviceId || !projectId) {
+    return null;
+  }
+
+  const permissions = await Notifications.getPermissionsAsync();
+
+  if (!permissions.granted) {
+    return null;
+  }
+
+  const relayUrl = await getNotificationRelayUrl();
+  const expoPushToken = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+  const response = await fetch(`${relayUrl}/inbox-state`, {
+    body: JSON.stringify({ deviceId, expoPushToken }),
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    method: 'POST',
+    signal,
+  });
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(payload?.error ?? `Inbox state sync failed with HTTP ${response.status}.`);
+  }
+
+  return payload && typeof payload === 'object' ? payload as Record<string, unknown> : null;
 }
 
 export async function sendInboxNotificationTest(relayUrlInput?: string) {

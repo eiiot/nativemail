@@ -6,9 +6,11 @@ import {
 } from '@/lib/notification-background-task';
 import {
   archiveInboxNotificationResponse,
+  fetchInboxStateFromNotificationRelay,
   getNotificationMessageRoute,
   isArchiveInboxNotificationResponse,
   registerInboxNotificationCategories,
+  repairInboxNotificationRegistration,
   syncInboxUnreadBadgeCount,
   syncPresentedInboxNotifications,
 } from '@/lib/inbox-notifications';
@@ -93,6 +95,7 @@ export default function RootLayout() {
   }, []);
   useEffect(() => {
     void registerInboxNotificationCategories().catch(() => {});
+    void repairInboxNotificationRegistration().catch(() => {});
   }, []);
   useEffect(() => {
     const subscription = Notifications.addNotificationReceivedListener((notification) => {
@@ -110,6 +113,9 @@ export default function RootLayout() {
     const syncNotificationState = (signal?: AbortSignal) => {
       void syncInboxUnreadBadgeCount(signal).catch(() => {});
       void syncPresentedInboxNotifications(signal).catch(() => {});
+      void fetchInboxStateFromNotificationRelay(signal)
+        .then((payload) => handleInboxNotificationPayload(payload))
+        .catch(() => {});
     };
     const handleAppStateChange = (nextState: AppStateStatus) => {
       if (nextState === 'active') {
@@ -162,6 +168,7 @@ export default function RootLayout() {
             <Stack.Screen name="folders" options={{ animation: 'slide_from_left' }} />
             <Stack.Screen name="index" />
             <Stack.Screen name="message/[id]" />
+            <Stack.Screen name="search-pill-lab" />
             <Stack.Screen
               name="settings"
               options={{

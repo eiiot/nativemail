@@ -7,6 +7,7 @@ import {
 import { getFastmailJmapToken } from '@/lib/fastmail-token'
 import type { Message, MessageAttachment } from '@/lib/mock-mail'
 import { observeDuration, observeError, observeEvent } from '@/lib/observability'
+import { parseJmapSearchQuery, type JmapSearchFilter } from '@/lib/search-query'
 import {
     createStateTracker,
     type SyncStateSnapshot,
@@ -126,6 +127,7 @@ export type JmapMailboxSnapshot = {
     total?: number | null
     username: string
 }
+
 
 export type JmapThread = {
     emailIds: Id[]
@@ -643,6 +645,75 @@ export async function fetchJmapMailboxSnapshot({
     }
 }
 
+export async function fetchJmapSearchSnapshot({
+    limit = DEFAULT_MESSAGE_LIMIT,
+    position = 0,
+    query,
+    signal,
+}: {
+    limit?: number
+    position?: number
+    query: string
+    signal?: AbortSignal
+}): Promise<JmapMailboxSnapshot> {
+    const startedAt = Date.now()
+    const { accountId, client } = await createFastmailJmapClient(signal)
+
+    try {
+        const mailboxes = await getMailboxes(client, accountId, signal)
+        const excludedMailboxIds = mailboxes
+            .filter((mailbox) => mailbox.role === 'trash' || mailbox.role === 'junk')
+            .map((mailbox) => mailbox.id)
+        let filter = parseJmapSearchQuery(query)
+
+        if (excludedMailboxIds.length) {
+            const mailboxCondition = { inMailboxOtherThan: excludedMailboxIds }
+            filter = 'operator' in filter
+                ? { conditions: [...filter.conditions, mailboxCondition], operator: 'AND' }
+                : { conditions: [filter, mailboxCondition], operator: 'AND' }
+        }
+
+        const page = await getSearchSnapshotBatch(
+            client,
+            accountId,
+            filter,
+            mailboxes,
+            position,
+            limit,
+            signal,
+        )
+        const threads: Record<string, JmapThread> = {}
+        const messages = page.messages
+        const snapshot: JmapMailboxSnapshot = {
+            accountId,
+            mailbox: null,
+            mailboxes,
+            messages,
+            position: page.position,
+            threads,
+            total: page.total,
+            username: client.username,
+        }
+
+        observeDuration('jmap.search.success', startedAt, {
+            messages: messages.length,
+            position: page.position,
+            queryLength: query.length,
+            total: page.total ?? -1,
+        })
+        return snapshot
+    } catch (error: unknown) {
+        if (error instanceof Error && error.name === 'AbortError') {
+            observeEvent('jmap.search.canceled', { queryLength: query.length })
+        } else {
+            observeError('jmap.search.failed', error, { queryLength: query.length })
+        }
+        throw error
+    } finally {
+        await releaseFastmailJmapClient(client)
+    }
+}
+
 export async function fetchJmapMessage(
     messageId: string,
     signal?: AbortSignal
@@ -670,6 +741,10 @@ export async function fetchJmapMessage(
 // keepalive — none of the machinery that was burying (and likely causing) the
 // slowness. The JMAP session (apiUrl + accountId) is fetched once and cached.
 const DIRECT_SESSION_URL = 'https://api.fastmail.com/jmap/session'
+const MESSAGE_BODY_RELAY_URL =
+    process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://nativemail-relay.fly.dev'
+const MESSAGE_BODY_RELAY_TIMEOUT_MS = 4500
+const MESSAGE_BODY_HEDGE_DELAY_MS = 500
 const DIRECT_BODY_TIMEOUT_MS = 12000
 let cachedDirectSession: { accountId: Id; apiUrl: string; token: string } | null = null
 
@@ -711,6 +786,24 @@ function parseXhrHeaders(raw: string): Headers {
 // this routes around it entirely with no native build. Returns a real Response.
 function nativeFetch(url: string, init: NativeFetchInit = {}): Promise<Response> {
     const { method = 'GET', headers, body, signal, responseType } = init
+    const targetUrl = new URL(url)
+    const shouldProxy =
+        targetUrl.protocol === 'https:' &&
+        (targetUrl.hostname === 'fastmail.com' || targetUrl.hostname.endsWith('.fastmail.com'))
+    const requestUrl = shouldProxy ? `${MESSAGE_BODY_RELAY_URL}/jmap/proxy` : url
+    const requestMethod = shouldProxy ? 'POST' : method
+    const requestBody = shouldProxy
+        ? JSON.stringify({
+            accept: new Headers(headers).get('accept'),
+            body: body ?? null,
+            method,
+            url,
+        })
+        : body
+    const requestHeaders = new Headers(headers)
+    if (shouldProxy) {
+        requestHeaders.set('content-type', 'application/json')
+    }
 
     return new Promise<Response>((resolve, reject) => {
         if (signal?.aborted) {
@@ -719,13 +812,13 @@ function nativeFetch(url: string, init: NativeFetchInit = {}): Promise<Response>
         }
 
         const xhr = new XMLHttpRequest()
-        xhr.open(method, url)
+        xhr.open(requestMethod, requestUrl)
 
         if (responseType === 'blob') {
             xhr.responseType = 'blob'
         }
 
-        new Headers(headers).forEach((value, key) => {
+        requestHeaders.forEach((value, key) => {
             xhr.setRequestHeader(key, value)
         })
 
@@ -762,7 +855,7 @@ function nativeFetch(url: string, init: NativeFetchInit = {}): Promise<Response>
             reject(createFetchAbortError())
         }
 
-        xhr.send(body ?? null)
+        xhr.send(requestBody ?? null)
     })
 }
 
@@ -799,20 +892,59 @@ function buildMessageBodyFromEmail(email: EmailObject): JmapMessageBody {
     }
 }
 
-export async function fetchJmapMessageBody({
-    messageId,
-    signal,
-}: {
-    inlineCidImageData?: boolean
-    messageId: string
+async function fetchJmapMessageBodiesViaRelay(
+    token: string,
+    messageIds: string[],
     signal?: AbortSignal
-}): Promise<JmapMessageBody | null> {
+): Promise<Record<string, JmapMessageBody>> {
     const startedAt = Date.now()
-    const token = await getFastmailJmapToken()
-    if (!token) {
-        throw new FastmailJmapTokenMissingError()
-    }
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), MESSAGE_BODY_RELAY_TIMEOUT_MS)
+    const onAbort = () => controller.abort()
+    signal?.addEventListener('abort', onAbort, { once: true })
 
+    try {
+        const response = await nativeFetch(`${MESSAGE_BODY_RELAY_URL}/jmap/message-body`, {
+            method: 'POST',
+            headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ messageIds }),
+            signal: controller.signal,
+        })
+        if (!response.ok) {
+            throw new Error(`Message relay failed with HTTP ${response.status}.`)
+        }
+
+        const result = (await response.json()) as {
+            emails?: EmailObject[]
+            timings?: { jmapMs?: number; sessionMs?: number; totalMs?: number }
+        }
+        const bodies = Object.fromEntries(
+            (result.emails ?? []).map((email) => [email.id, buildMessageBodyFromEmail(email)])
+        )
+        observeDuration('jmap.message-body.relay.success', startedAt, {
+            count: Object.keys(bodies).length,
+            messageIds: messageIds.join(','),
+            relayJmapMs: result.timings?.jmapMs,
+            relaySessionMs: result.timings?.sessionMs,
+            relayTotalMs: result.timings?.totalMs,
+        })
+        return bodies
+    } finally {
+        clearTimeout(timeout)
+        signal?.removeEventListener('abort', onAbort)
+    }
+}
+
+async function fetchJmapMessageBodyDirect(
+    token: string,
+    messageId: string,
+    signal?: AbortSignal
+): Promise<JmapMessageBody | null> {
+    const startedAt = Date.now()
     const { accountId, apiUrl } = await getDirectJmapSession(token, signal)
 
     const controller = new AbortController()
@@ -881,6 +1013,41 @@ export async function fetchJmapMessageBody({
         clearTimeout(timeout)
         signal?.removeEventListener('abort', onAbort)
     }
+}
+
+export async function fetchJmapMessageBody({
+    messageId,
+    signal,
+}: {
+    inlineCidImageData?: boolean
+    messageId: string
+    signal?: AbortSignal
+}): Promise<JmapMessageBody | null> {
+    const token = await getFastmailJmapToken()
+    if (!token) {
+        throw new FastmailJmapTokenMissingError()
+    }
+
+    const bodies = await fetchJmapMessageBodiesViaRelay(token, [messageId], signal)
+    return bodies[messageId] ?? null
+}
+
+export async function fetchJmapMessageBodies({
+    messageIds,
+    signal,
+}: {
+    messageIds: string[]
+    signal?: AbortSignal
+}): Promise<Record<string, JmapMessageBody>> {
+    const token = await getFastmailJmapToken()
+    if (!token) {
+        throw new FastmailJmapTokenMissingError()
+    }
+
+    const uniqueIds = [...new Set(messageIds)].slice(0, 20)
+    return uniqueIds.length
+        ? fetchJmapMessageBodiesViaRelay(token, uniqueIds, signal)
+        : {}
 }
 
 export async function fetchJmapThreadMessages({
@@ -2349,8 +2516,8 @@ async function getMailboxSnapshotBatch(
 ) {
     const query = Email.request.query({
         accountId,
-        calculateTotal: true,
-        collapseThreads: true,
+        calculateTotal: false,
+        collapseThreads: false,
         filter: { inMailbox: mailboxId },
         limit,
         position,
@@ -2425,6 +2592,60 @@ async function getMailboxSnapshotBatch(
         position: responsePosition,
         states: getInvocationStates(response.methodResponses),
         threads: threadObjects,
+        total,
+    }
+}
+
+async function getSearchSnapshotBatch(
+    client: JMAPClient,
+    accountId: Id,
+    filter: JmapSearchFilter,
+    mailboxes: JmapMailbox[],
+    position: number,
+    limit: number,
+    signal?: AbortSignal,
+) {
+    const query = Email.request.query({
+        accountId,
+        calculateTotal: true,
+        collapseThreads: true,
+        filter,
+        limit,
+        position,
+        sort: [{ property: 'receivedAt', isAscending: false }],
+    })
+    const emailGet = Email.request.get({
+        accountId,
+        bodyProperties: emailBodyPartProperties,
+        ids: query.createReference('/ids'),
+        properties: emailSummaryProperties,
+    })
+    const response = await client
+        .createRequestBuilder()
+        .add(query)
+        .add(emailGet)
+        .send(signal)
+    let emailIds: Id[] = []
+    let emails: EmailObject[] = []
+    let responsePosition = position
+    let total: number | null = null
+
+    for (const invocation of response.methodResponses) {
+        if (isErrorInvocation(invocation)) {
+            throw new Error(`JMAP ${invocation.type}: ${JSON.stringify(invocation.arguments)}`)
+        }
+        if (invocation.name === 'Email/query') {
+            emailIds = invocation.getArgument('ids') as Id[]
+            responsePosition = (invocation.getArgument('position') as number | undefined) ?? position
+            total = (invocation.getArgument('total') as number | undefined) ?? null
+        }
+        if (invocation.name === 'Email/get') emails = invocation.getArgument('list') as EmailObject[]
+    }
+
+    return {
+        messages: sortEmailsByQuery(emails, emailIds).map((email) => mapEmailToMessage(email, mailboxes)),
+        position: responsePosition,
+        threads: [],
         total,
     }
 }

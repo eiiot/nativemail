@@ -557,7 +557,7 @@ export default function MessageScreen() {
       });
 
     appendReadDebugEvent(`body fetch start id=${messageId}`);
-    const bodyLoadPromise = loadMessageBody(messageId, { refresh: true });
+    const bodyLoadPromise = loadMessageBody(messageId);
 
     bodyLoadPromiseRef.current = bodyLoadPromise;
     void bodyLoadPromise
@@ -602,7 +602,7 @@ export default function MessageScreen() {
 
     for (const threadMessageId of messageIds) {
       void hydrateMessageBodyFromCache(threadMessageId).catch(() => {});
-      void loadMessageBody(threadMessageId, { priority: 'background', refresh: true }).catch(() => {});
+      void loadMessageBody(threadMessageId, { priority: 'background' }).catch(() => {});
     }
   }, [expandedThreadMessageKey, expandedThreadMessageIds, messageId, source]);
   useEffect(() => {

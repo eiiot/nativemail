@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 
 import { Buffer } from 'node:buffer';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const CORE_CAPABILITY = 'urn:ietf:params:jmap:core';
 const MAIL_CAPABILITY = 'urn:ietf:params:jmap:mail';
-const FASTMAIL_SESSION_URL = 'https://api.fastmail.com/jmap/session';
+const FASTMAIL_SESSION_URL = process.env.FASTMAIL_SESSION_URL ?? 'https://api.fastmail.com/jmap/session';
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EVENT_SOURCE_TYPES = '*';
 const ACTIVE_NOTIFICATION_LIMIT = 200;
+const KNOWN_INBOX_EMAIL_LIMIT = 20000;
+const NEW_EMAIL_CLOCK_SKEW_MS = 2 * 60 * 1000;
 const INBOX_STATE_SYNC_LIMIT = 10;
 const LOCAL_ACTION_SUPPRESSION_MS = 8000;
 const INBOX_MESSAGE_NOTIFICATION_CATEGORY_ID = 'nativemailInboxMessage';
@@ -28,10 +31,28 @@ const LEGACY_STORE_PATH = path.join(process.cwd(), '.nativemail', 'notification-
 const OBSERVABILITY_LOG_PATH =
   process.env.NOTIFICATION_RELAY_OBSERVABILITY_PATH ??
   path.join(homedir(), '.nativemail', 'fastmail-glass', 'observability.jsonl');
+const BODY_CACHE_DIR =
+  process.env.NOTIFICATION_RELAY_BODY_CACHE_DIR ??
+  path.join(path.dirname(STORE_PATH), 'body-cache');
 const OBSERVABILITY_EVENT_LIMIT = 100;
+const JMAP_SESSION_CACHE_TTL_MS = 10 * 60 * 1000;
+const JMAP_SESSION_TIMEOUT_MS = 2000;
+const JMAP_BODY_TIMEOUT_MS = 4000;
+const JMAP_PROXY_TIMEOUT_MS = 8000;
+const DIAGNOSTIC_TOKEN = process.env.NOTIFICATION_RELAY_DIAGNOSTIC_TOKEN ?? '';
+const BODY_CACHE_BATCH_SIZE = 10;
+const BODY_BACKFILL_QUERY_LIMIT = 100;
+const BODY_BACKFILL_BATCH_DELAY_MS = 150;
+const CID_CACHE_VERSION = 1;
+const MAX_INLINE_CID_IMAGE_BYTES = 2 * 1024 * 1024;
+
+/** @type {Map<string, { accountId: string; apiUrl: string; expiresAt: number }>} */
+const jmapSessionCache = new Map();
+/** @type {Map<string, { activeController?: AbortController; activePriority?: number; running: boolean; tasks: Array<{ priority: number; run: (signal: AbortSignal) => Promise<unknown>; resolve: (value: unknown) => void; reject: (error: unknown) => void }> }>} */
 
 /** @type {Map<string, Subscriber>} */
 const subscribers = new Map();
+const bodyBackfills = new Map();
 
 /**
  * @typedef {{
@@ -50,6 +71,7 @@ const subscribers = new Map();
  *   lastInboxCheckedAt?: string;
  *   lastInboxCheckReason?: string;
  *   lastInboxEmailIds?: string[];
+ *   lastInboxStateMessages?: Array<Record<string, unknown>>;
  *   lastInboxUnreadEmailsSource?: string;
  *   lastInboxStateSignature?: string;
  *   lastInboxStateSyncAt?: string;
@@ -97,6 +119,12 @@ async function route(request, response) {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? `localhost:${PORT}`}`);
 
   if (request.method === 'GET' && url.pathname === '/health') {
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname === '/health/details') {
+    if (!requireDiagnosticAuthorization(request, response)) return;
     sendJson(response, 200, {
       ok: true,
       subscriberCount: subscribers.size,
@@ -106,6 +134,7 @@ async function route(request, response) {
   }
 
   if (request.method === 'GET' && url.pathname.startsWith('/debug/')) {
+    if (!requireDiagnosticAuthorization(request, response)) return;
     const deviceId = sanitizeDeviceId(decodeURIComponent(url.pathname.slice('/debug/'.length)));
     const subscriber = subscribers.get(deviceId);
 
@@ -118,6 +147,7 @@ async function route(request, response) {
   }
 
   if (request.method === 'GET' && url.pathname === '/observability') {
+    if (!requireDiagnosticAuthorization(request, response)) return;
     const limit = Math.min(
       OBSERVABILITY_EVENT_LIMIT,
       Math.max(1, Number.parseInt(url.searchParams.get('limit') ?? '50', 10) || 50)
@@ -141,6 +171,140 @@ async function route(request, response) {
 
     await appendObservabilityEvents(events);
     sendJson(response, 200, { accepted: events.length, ok: true });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/jmap/message-body') {
+    const startedAt = Date.now();
+    const authorization = request.headers.authorization;
+    if (!authorization?.startsWith('Bearer ') || authorization.length <= 7) {
+      sendJson(response, 401, { error: 'A Fastmail bearer token is required.' });
+      return;
+    }
+
+    const body = await readJson(request);
+    const requestedMessageIds = Array.isArray(body.messageIds)
+      ? body.messageIds.filter((value) => typeof value === 'string' && value.length > 0)
+      : [getRequiredString(body, 'messageId')];
+    const messageIds = [...new Set(requestedMessageIds)].slice(0, 20);
+    if (!messageIds.length) {
+      sendJson(response, 400, { error: 'At least one message id is required.' });
+      return;
+    }
+    const token = authorization.slice(7);
+    const cachedEmails = await readCachedEmails(token, messageIds);
+    const missingMessageIds = messageIds.filter((messageId) => !cachedEmails.has(messageId));
+    const staleCidMessageIds = messageIds.filter((messageId) => needsCidMaterialization(cachedEmails.get(messageId)));
+
+    if (!missingMessageIds.length && !staleCidMessageIds.length) {
+      const emails = messageIds.map((messageId) => cachedEmails.get(messageId)).filter(Boolean);
+      sendJson(response, 200, {
+        cache: { hits: emails.length, misses: 0 },
+        email: messageIds.length === 1 ? emails[0] ?? null : undefined,
+        emails,
+        ok: true,
+        timings: { jmapMs: 0, sessionCacheHit: true, sessionMs: 0, totalMs: Date.now() - startedAt },
+      });
+      return;
+    }
+
+    const sessionStartedAt = Date.now();
+    const { accountId, apiUrl, cacheHit, downloadUrl } = await getCachedJmapSession(token);
+
+    const jmapStartedAt = Date.now();
+    const jmapResponse = await fetchWithTimeout(apiUrl, {
+      body: JSON.stringify({
+        using: [CORE_CAPABILITY, MAIL_CAPABILITY],
+        methodCalls: [[
+          'Email/get',
+          {
+            accountId,
+            ids: missingMessageIds,
+            properties: ['id', 'blobId', 'bodyStructure', 'bodyValues', 'htmlBody', 'textBody', 'attachments'],
+            bodyProperties: ['partId', 'blobId', 'size', 'name', 'type', 'charset', 'cid', 'disposition'],
+            fetchHTMLBodyValues: true,
+            fetchTextBodyValues: true,
+          },
+          '0',
+        ]],
+      }),
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      method: 'POST',
+    }, JMAP_BODY_TIMEOUT_MS, 'Fastmail Email/get timed out');
+    if (!jmapResponse.ok) {
+      sendJson(response, jmapResponse.status, { error: 'Fastmail Email/get failed.' });
+      return;
+    }
+
+    const result = await jmapResponse.json();
+    const invocation = result.methodResponses?.[0];
+    if (invocation?.[0] === 'error') {
+      sendJson(response, 502, { error: `Fastmail Email/get: ${invocation[1]?.type ?? 'unknown'}` });
+      return;
+    }
+
+    const timings = {
+      jmapMs: Date.now() - jmapStartedAt,
+      sessionCacheHit: cacheHit,
+      sessionMs: jmapStartedAt - sessionStartedAt,
+      totalMs: Date.now() - startedAt,
+    };
+    const fetchedEmails = invocation?.[1]?.list ?? [];
+    for (const email of fetchedEmails) cachedEmails.set(email.id, email);
+    await Promise.all(
+      [...new Set([...missingMessageIds, ...staleCidMessageIds])].map(async (messageId) => {
+        const email = cachedEmails.get(messageId);
+        if (!email) return;
+        const materialized = await materializeCidImages({ accountId, downloadUrl, email, token });
+        cachedEmails.set(messageId, materialized);
+        await writeCachedEmail(token, materialized);
+      })
+    );
+    const emails = messageIds.map((messageId) => cachedEmails.get(messageId)).filter(Boolean);
+    console.log('[relay] message body success', JSON.stringify({ messageIds, count: emails.length, cacheHits: messageIds.length - missingMessageIds.length, ...timings }));
+    sendJson(response, 200, {
+      cache: { hits: messageIds.length - missingMessageIds.length, misses: missingMessageIds.length },
+      email: messageIds.length === 1 ? emails[0] ?? null : undefined,
+      emails,
+      ok: true,
+      timings,
+    });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/jmap/proxy') {
+    const authorization = request.headers.authorization;
+    if (!authorization?.startsWith('Bearer ') || authorization.length <= 7) {
+      sendJson(response, 401, { error: 'A Fastmail bearer token is required.' });
+      return;
+    }
+
+    const token = authorization.slice(7);
+    const proxyRequest = await readJson(request);
+    const target = new URL(getRequiredString(proxyRequest, 'url'));
+    if (target.protocol !== 'https:' || !isAllowedFastmailHostname(target.hostname)) {
+      sendJson(response, 400, { error: 'Invalid Fastmail proxy target.' });
+      return;
+    }
+    const method = getOptionalString(proxyRequest, 'method') ?? 'GET';
+    const requestBody = getOptionalString(proxyRequest, 'body');
+    const upstream = await fetchWithTimeout(target, {
+      body: method === 'GET' ? undefined : requestBody,
+      headers: {
+        Accept: getOptionalString(proxyRequest, 'accept') ?? 'application/json',
+        Authorization: `Bearer ${token}`,
+        ...(requestBody ? { 'Content-Type': 'application/json' } : {}),
+      },
+      method,
+    }, JMAP_PROXY_TIMEOUT_MS, 'Fastmail proxy request timed out');
+    const payload = Buffer.from(await upstream.arrayBuffer());
+    response.statusCode = upstream.status;
+    response.setHeader('content-type', upstream.headers.get('content-type') ?? 'application/octet-stream');
+    response.end(payload);
     return;
   }
 
@@ -182,6 +346,31 @@ async function route(request, response) {
     sendJson(response, 200, {
       ok: true,
       suppressUntil: new Date(subscriber.localActionSuppressUntil).toISOString(),
+    });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/inbox-state') {
+    const body = await readJson(request);
+    const deviceId = sanitizeDeviceId(getRequiredString(body, 'deviceId'));
+    const expoPushToken = getRequiredString(body, 'expoPushToken');
+    const subscriber = subscribers.get(deviceId);
+
+    if (!subscriber || !safeEqual(expoPushToken, subscriber.expoPushToken)) {
+      sendJson(response, 401, { error: 'Invalid device credentials.' });
+      return;
+    }
+
+    sendJson(response, 200, {
+      accountId: subscriber.accountId,
+      action: 'sync-inbox-state',
+      inboxUnreadEmails: subscriber.lastInboxUnreadEmails ?? null,
+      mailboxId: subscriber.inboxMailboxId,
+      mailboxName: subscriber.mailboxName,
+      messages: subscriber.lastInboxStateMessages ?? [],
+      ok: true,
+      source: 'relay-cache',
+      type: 'sync-inbox-state',
     });
     return;
   }
@@ -260,6 +449,207 @@ async function route(request, response) {
   sendJson(response, 404, { error: 'Not found.' });
 }
 
+async function getCachedJmapSession(token) {
+  const cacheKey = createHash('sha256').update(token).digest('hex');
+  const cached = jmapSessionCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { ...cached, cacheHit: true };
+  }
+
+  const sessionResponse = await fetchWithTimeout(FASTMAIL_SESSION_URL, {
+    headers: { Authorization: `Bearer ${token}` },
+  }, JMAP_SESSION_TIMEOUT_MS, 'Fastmail JMAP session timed out');
+  if (!sessionResponse.ok) {
+    throw new Error(`Fastmail JMAP session failed with HTTP ${sessionResponse.status}.`);
+  }
+
+  const session = await sessionResponse.json();
+  const accountId = session.primaryAccounts?.[MAIL_CAPABILITY];
+  if (!accountId || !session.apiUrl) {
+    throw new Error('Fastmail JMAP session is missing mail request details.');
+  }
+
+  const value = {
+    accountId,
+    apiUrl: session.apiUrl,
+    downloadUrl: session.downloadUrl,
+    expiresAt: Date.now() + JMAP_SESSION_CACHE_TTL_MS,
+  };
+  jmapSessionCache.set(cacheKey, value);
+  return { ...value, cacheHit: false };
+}
+
+function getBodyCachePath(token, messageId) {
+  const accountKey = createHash('sha256').update(token).digest('hex');
+  const messageKey = createHash('sha256').update(messageId).digest('hex');
+  return path.join(BODY_CACHE_DIR, accountKey.slice(0, 2), accountKey, `${messageKey}.json`);
+}
+
+async function readCachedEmails(token, messageIds) {
+  const entries = await Promise.all(messageIds.map(async (messageId) => {
+    try {
+      const email = JSON.parse(await readFile(getBodyCachePath(token, messageId), 'utf8'));
+      return email?.id === messageId ? [messageId, email] : null;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') console.warn('[relay] body cache read failed', messageId, describeError(error));
+      return null;
+    }
+  }));
+  return new Map(entries.filter(Boolean));
+}
+
+async function writeCachedEmail(token, email) {
+  if (!email?.id) return;
+  const cachePath = getBodyCachePath(token, email.id);
+  const temporaryPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
+  await mkdir(path.dirname(cachePath), { recursive: true });
+  await writeFile(temporaryPath, JSON.stringify(email));
+  await rename(temporaryPath, cachePath);
+}
+
+function needsCidMaterialization(email) {
+  if (!email || email._nativemailCidCacheVersion === CID_CACHE_VERSION) return false;
+  return Object.values(email.bodyValues ?? {}).some((bodyValue) => /\bcid:/i.test(bodyValue?.value ?? ''));
+}
+
+async function materializeCidImages({ accountId, downloadUrl, email, token }) {
+  if (!needsCidMaterialization(email) || !downloadUrl) return email;
+  const parts = [...flattenCachedBodyParts(email.bodyStructure), ...(email.htmlBody ?? []), ...(email.attachments ?? [])];
+  const imageByCid = new Map();
+  for (const part of parts) {
+    const cid = normalizeCachedCid(part?.cid);
+    if (
+      cid &&
+      part?.blobId &&
+      part?.type?.toLowerCase().startsWith('image/') &&
+      (part.size ?? 0) <= MAX_INLINE_CID_IMAGE_BYTES
+    ) {
+      imageByCid.set(cid, part);
+    }
+  }
+
+  const referencedCids = new Set();
+  for (const bodyValue of Object.values(email.bodyValues ?? {})) {
+    for (const match of (bodyValue?.value ?? '').matchAll(/\bcid:([^"')\s>]+)/gi)) {
+      referencedCids.add(normalizeCachedCid(match[1]));
+    }
+  }
+  const dataByCid = new Map();
+  await Promise.all([...referencedCids].map(async (cid) => {
+    const part = imageByCid.get(cid);
+    if (!part) return;
+    const type = part.type || 'application/octet-stream';
+    const url = expandEventSourceUrl(downloadUrl, {
+      accept: type,
+      accountId,
+      blobId: part.blobId,
+      name: part.name || `${part.partId || 'inline-image'}.bin`,
+      type,
+    });
+    try {
+      const response = await fetchWithTimeout(url, {
+        headers: { Authorization: `Bearer ${token}` },
+      }, JMAP_BODY_TIMEOUT_MS, 'Fastmail inline image download timed out');
+      if (!response.ok) throw new Error(`Fastmail inline image download failed with HTTP ${response.status}.`);
+      const bytes = Buffer.from(await response.arrayBuffer());
+      if (bytes.length > MAX_INLINE_CID_IMAGE_BYTES) return;
+      dataByCid.set(cid, `data:${type};base64,${bytes.toString('base64')}`);
+    } catch (error) {
+      console.warn('[relay] inline CID image skipped', email.id, cid, describeError(error));
+    }
+  }));
+
+  const bodyValues = Object.fromEntries(Object.entries(email.bodyValues ?? {}).map(([partId, bodyValue]) => [
+    partId,
+    {
+      ...bodyValue,
+      value: (bodyValue?.value ?? '').replace(/\bcid:([^"')\s>]+)/gi, (match, cid) =>
+        dataByCid.get(normalizeCachedCid(cid)) ?? match
+      ),
+    },
+  ]));
+  const hasUnresolvedCid = Object.values(bodyValues).some((bodyValue) => /\bcid:/i.test(bodyValue?.value ?? ''));
+  return {
+    ...email,
+    ...(hasUnresolvedCid ? {} : { _nativemailCidCacheVersion: CID_CACHE_VERSION }),
+    bodyValues,
+  };
+}
+
+function flattenCachedBodyParts(part) {
+  if (!part) return [];
+  return [part, ...(part.subParts ?? []).flatMap(flattenCachedBodyParts)];
+}
+
+function normalizeCachedCid(value) {
+  return String(value ?? '').replace(/^cid:/i, '').replace(/^<|>$/g, '').trim().toLowerCase();
+}
+
+async function fetchAndCacheBodies({ accountId, apiUrl, downloadUrl, messageIds, token }) {
+  const uniqueIds = [...new Set(messageIds)].filter(Boolean);
+  if (!uniqueIds.length) return [];
+  const cached = await readCachedEmails(token, uniqueIds);
+  const missingIds = uniqueIds.filter((messageId) => !cached.has(messageId));
+  const staleCidIds = uniqueIds.filter((messageId) => needsCidMaterialization(cached.get(messageId)));
+  if (!missingIds.length && !staleCidIds.length) return uniqueIds.map((messageId) => cached.get(messageId)).filter(Boolean);
+
+  const response = await fetchWithTimeout(apiUrl, {
+    body: JSON.stringify({
+      using: [CORE_CAPABILITY, MAIL_CAPABILITY],
+      methodCalls: [['Email/get', {
+        accountId,
+        ids: missingIds,
+        properties: ['id', 'blobId', 'bodyStructure', 'bodyValues', 'htmlBody', 'textBody', 'attachments'],
+        bodyProperties: ['partId', 'blobId', 'size', 'name', 'type', 'charset', 'cid', 'disposition'],
+        fetchHTMLBodyValues: true,
+        fetchTextBodyValues: true,
+      }, 'cacheBodies']],
+    }),
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    method: 'POST',
+  }, JMAP_PROXY_TIMEOUT_MS, 'Fastmail body cache fill timed out');
+  if (!response.ok) throw new Error(`Fastmail body cache fill failed with HTTP ${response.status}.`);
+  const payload = await response.json();
+  const invocation = payload.methodResponses?.[0];
+  if (invocation?.[0] === 'error') throw new Error(`Fastmail body cache fill: ${invocation[1]?.type ?? 'unknown'}`);
+  const emails = invocation?.[1]?.list ?? [];
+  for (const email of emails) cached.set(email.id, email);
+  await Promise.all([...new Set([...missingIds, ...staleCidIds])].map(async (messageId) => {
+    const email = cached.get(messageId);
+    if (!email) return;
+    const materialized = await materializeCidImages({ accountId, downloadUrl, email, token });
+    cached.set(messageId, materialized);
+    await writeCachedEmail(token, materialized);
+  }));
+  return uniqueIds.map((messageId) => cached.get(messageId)).filter(Boolean);
+}
+
+async function fetchWithTimeout(url, options, timeoutMs, message) {
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort();
+  options.signal?.addEventListener('abort', forwardAbort, { once: true });
+  const timeout = setTimeout(() => controller.abort(new Error(message)), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(message);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    options.signal?.removeEventListener('abort', forwardAbort);
+  }
+}
+
+function isAllowedFastmailHostname(hostname) {
+  return hostname === 'fastmail.com' || hostname.endsWith('.fastmail.com');
+}
+
 async function createSubscriber({ deviceId, expoPushToken, jmapToken }) {
   const session = await discoverJmapSession(jmapToken);
   const accountId = session.primaryAccounts?.[MAIL_CAPABILITY];
@@ -290,12 +680,14 @@ async function createSubscriber({ deviceId, expoPushToken, jmapToken }) {
     accountId,
     activeNotificationEmailIds: [],
     apiUrl: session.apiUrl,
+    downloadUrl: session.downloadUrl,
     deviceId,
     eventSourceUrl: session.eventSourceUrl,
     expoPushToken,
     inboxMailboxId: inbox.id,
     jmapToken,
     knownInboxEmailIds: [],
+    registeredAt: new Date().toISOString(),
     mailboxName: inbox.name || 'Inbox',
     status: 'registered',
     username: session.username || 'unknown',
@@ -313,6 +705,7 @@ async function startSubscriber(subscriber, { rehydrate }) {
     try {
       const session = await discoverJmapSession(subscriber.jmapToken);
       subscriber.apiUrl = session.apiUrl;
+      subscriber.downloadUrl = session.downloadUrl;
       subscriber.eventSourceUrl = session.eventSourceUrl;
       subscriber.status = 'rehydrated';
       await refreshInbox(subscriber, { notify: false, reason: 'rehydrate' });
@@ -331,6 +724,8 @@ async function startSubscriber(subscriber, { rehydrate }) {
     subscriber.status = 'polling; no JMAP eventSourceUrl';
     await saveStore();
   }
+
+  scheduleBodyBackfill(subscriber);
 }
 
 function startPolling(subscriber) {
@@ -544,7 +939,11 @@ async function refreshInbox(subscriber, { notify, reason }) {
   const emails = sortEmails(emailResponse?.[1]?.list ?? [], queryIds);
   const inboxStateSignature = getInboxStateSignature(emails, inboxUnreadEmails);
   const knownIds = new Set(subscriber.knownInboxEmailIds);
-  const newEmails = emails.filter((email) => !knownIds.has(email.id) && isUnreadEmail(email));
+  const newEmails = emails.filter((email) =>
+    !knownIds.has(email.id) &&
+    isUnreadEmail(email) &&
+    isReceivedAfterPreviousInboxCheck(email, subscriber)
+  );
   const currentUnreadEmailIds = emails.filter(isUnreadEmail).map((email) => email.id);
   const staleNotificationEmailIds = getStaleNotificationEmailIds(
     activeNotificationEmailIds,
@@ -566,6 +965,7 @@ async function refreshInbox(subscriber, { notify, reason }) {
   subscriber.lastInboxCheckedAt = new Date().toISOString();
   subscriber.lastInboxCheckReason = reason;
   subscriber.lastInboxEmailIds = queryIds;
+  subscriber.lastInboxStateMessages = emails.map(toInboxStateSyncMessage);
   subscriber.lastNewInboxEmailIds = newEmails.map((email) => email.id);
   subscriber.lastInboxStateSignature = inboxStateSignature;
   subscriber.lastMailboxUnreadEmails = mailboxUnreadEmails;
@@ -574,6 +974,23 @@ async function refreshInbox(subscriber, { notify, reason }) {
   subscriber.lastNotificationDismissalEmailIds = staleNotificationEmailIds;
   subscriber.status = `inbox checked (${reason}) at ${subscriber.lastInboxCheckedAt}`;
   await saveStore();
+
+  if (newEmails.length) {
+    try {
+      await fetchAndCacheBodies({
+        accountId: subscriber.accountId,
+        apiUrl: subscriber.apiUrl,
+        downloadUrl: subscriber.downloadUrl,
+        messageIds: newEmails.map((email) => email.id),
+        token: subscriber.jmapToken,
+      });
+      subscriber.lastBodyCacheArrivalAt = new Date().toISOString();
+    } catch (error) {
+      subscriber.lastBodyCacheError = describeError(error);
+      console.warn('[relay] arrival body cache failed', subscriber.deviceId, error);
+    }
+    await saveStore();
+  }
 
   let dismissed = 0;
   let badgeSynced = false;
@@ -659,6 +1076,82 @@ async function refreshInbox(subscriber, { notify, reason }) {
     notified,
     stateSynced,
   };
+}
+
+function scheduleBodyBackfill(subscriber) {
+  const key = createHash('sha256').update(subscriber.jmapToken).digest('hex');
+  if (bodyBackfills.has(key)) return;
+  const task = delay(500)
+    .then(() => backfillInboxBodies(subscriber))
+    .catch((error) => {
+      subscriber.lastBodyCacheError = describeError(error);
+      console.error('[relay] body backfill failed', subscriber.deviceId, error);
+      return saveStore();
+    })
+    .finally(() => bodyBackfills.delete(key));
+  bodyBackfills.set(key, task);
+}
+
+async function backfillInboxBodies(subscriber) {
+  let position = 0;
+  let cached = 0;
+  let failed = 0;
+  subscriber.bodyCacheStatus = 'backfilling';
+  subscriber.bodyCacheStartedAt = new Date().toISOString();
+  await saveStore();
+
+  while (true) {
+    const responses = await jmapRequest(subscriber.apiUrl, subscriber.jmapToken, [[
+      'Email/query',
+      {
+        accountId: subscriber.accountId,
+        collapseThreads: false,
+        filter: { inMailbox: subscriber.inboxMailboxId },
+        limit: BODY_BACKFILL_QUERY_LIMIT,
+        position,
+        sort: [{ property: 'receivedAt', isAscending: false }],
+      },
+      'bodyBackfillQuery',
+    ]]);
+    const ids = findMethodResponse(responses, 'Email/query', 'bodyBackfillQuery')?.[1]?.ids ?? [];
+    if (!ids.length) break;
+
+    // Backfill establishes the account baseline as well as warming bodies.
+    // Without this, an old unread message entering the top query window looks
+    // indistinguishable from a newly delivered message and triggers a push.
+    subscriber.knownInboxEmailIds = mergeKnownIds(subscriber.knownInboxEmailIds, ids);
+    await saveStore();
+
+    for (let index = 0; index < ids.length; index += BODY_CACHE_BATCH_SIZE) {
+      const batch = ids.slice(index, index + BODY_CACHE_BATCH_SIZE);
+      try {
+        const emails = await fetchAndCacheBodies({
+          accountId: subscriber.accountId,
+          apiUrl: subscriber.apiUrl,
+          downloadUrl: subscriber.downloadUrl,
+          messageIds: batch,
+          token: subscriber.jmapToken,
+        });
+        cached += emails.length;
+      } catch (error) {
+        failed += batch.length;
+        subscriber.lastBodyCacheError = describeError(error);
+      }
+      subscriber.bodyCacheCached = cached;
+      subscriber.bodyCacheFailed = failed;
+      subscriber.bodyCacheScanned = position + index + batch.length;
+      await saveStore();
+      await delay(BODY_BACKFILL_BATCH_DELAY_MS);
+    }
+
+    position += ids.length;
+    if (ids.length < BODY_BACKFILL_QUERY_LIMIT) break;
+  }
+
+  subscriber.bodyCacheCompletedAt = new Date().toISOString();
+  subscriber.bodyCacheStatus = failed ? 'complete-with-errors' : 'complete';
+  await saveStore();
+  console.log('[relay] body backfill complete', JSON.stringify({ deviceId: subscriber.deviceId, cached, failed }));
 }
 
 async function sendInboxNotification(subscriber, email, inboxUnreadEmails) {
@@ -897,7 +1390,14 @@ function sortEmails(emails, ids) {
 }
 
 function mergeKnownIds(currentIds, nextIds) {
-  return Array.from(new Set([...nextIds, ...currentIds])).slice(0, 200);
+  return Array.from(new Set([...nextIds, ...currentIds])).slice(0, KNOWN_INBOX_EMAIL_LIMIT);
+}
+
+function isReceivedAfterPreviousInboxCheck(email, subscriber) {
+  const baseline = Date.parse(subscriber.lastInboxCheckedAt ?? subscriber.registeredAt ?? '');
+  const receivedAt = Date.parse(email.receivedAt ?? '');
+  if (!Number.isFinite(baseline) || !Number.isFinite(receivedAt)) return false;
+  return receivedAt >= baseline - NEW_EMAIL_CLOCK_SKEW_MS;
 }
 
 function mergeNotificationIds(currentIds, nextIds) {
@@ -1001,6 +1501,28 @@ function sendJson(response, status, payload) {
   response.end(JSON.stringify(payload, null, 2));
 }
 
+function requireDiagnosticAuthorization(request, response) {
+  if (!DIAGNOSTIC_TOKEN) {
+    sendJson(response, 503, { error: 'Diagnostic access is not configured.' });
+    return false;
+  }
+  const supplied = request.headers.authorization?.replace(/^Bearer\s+/i, '') ?? '';
+  const expectedBuffer = Buffer.from(DIAGNOSTIC_TOKEN);
+  const suppliedBuffer = Buffer.from(supplied);
+  const authorized = expectedBuffer.length === suppliedBuffer.length &&
+    timingSafeEqual(expectedBuffer, suppliedBuffer);
+  if (!authorized) sendJson(response, 401, { error: 'Unauthorized.' });
+  return authorized;
+}
+
+function safeEqual(supplied, expected) {
+  const suppliedBuffer = Buffer.from(supplied);
+  const expectedBuffer = Buffer.from(expected);
+
+  return suppliedBuffer.length === expectedBuffer.length &&
+    timingSafeEqual(suppliedBuffer, expectedBuffer);
+}
+
 function getRequiredString(body, key) {
   const value = body?.[key];
 
@@ -1057,6 +1579,12 @@ function toPublicSubscriber(subscriber, options = {}) {
     pollingMs: subscriber.pollTimer ? FALLBACK_POLL_MS : null,
     status: subscriber.status,
     username: subscriber.username,
+    bodyCacheStatus: subscriber.bodyCacheStatus ?? 'not-started',
+    bodyCacheScanned: subscriber.bodyCacheScanned ?? 0,
+    bodyCacheCached: subscriber.bodyCacheCached ?? 0,
+    bodyCacheFailed: subscriber.bodyCacheFailed ?? 0,
+    bodyCacheCompletedAt: subscriber.bodyCacheCompletedAt ?? null,
+    lastBodyCacheArrivalAt: subscriber.lastBodyCacheArrivalAt ?? null,
   };
 
   if (options.includeDebug) {
@@ -1070,6 +1598,7 @@ function toPublicSubscriber(subscriber, options = {}) {
     publicSubscriber.lastNotificationDismissalEmailIds = subscriber.lastNotificationDismissalEmailIds ?? [];
     publicSubscriber.lastNotificationTitle = subscriber.lastNotificationTitle ?? null;
     publicSubscriber.lastLocalActionMessageIds = subscriber.lastLocalActionMessageIds ?? [];
+    publicSubscriber.lastBodyCacheError = subscriber.lastBodyCacheError ?? null;
   }
 
   return publicSubscriber;

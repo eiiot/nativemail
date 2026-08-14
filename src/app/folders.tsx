@@ -165,41 +165,43 @@ export default function FoldersScreen() {
   );
   useEffect(() => clearPendingMailboxNavigation, [clearPendingMailboxNavigation]);
 
-  useEffect(() => {
-    const controller = new AbortController();
+  useFocusEffect(
+    useCallback(() => {
+      const controller = new AbortController();
 
-    Promise.resolve().then(() => {
-      if (!controller.signal.aborted) {
-        setJmapLoading(true);
-        setJmapStatus('');
-      }
-    });
-
-    fetchJmapMailboxes(controller.signal)
-      .then((mailboxes) => {
-        setLiveSections(getFolderSections(mailboxes));
-        void setInboxUnreadBadgeCount(getInboxUnreadCountFromMailboxes(mailboxes)).catch(() => {});
-      })
-      .catch((error: unknown) => {
-        if (controller.signal.aborted) {
-          return;
-        }
-
-        setLiveSections(null);
-        setJmapStatus(error instanceof Error && error.name === 'FastmailJmapTokenMissingError'
-          ? ''
-          : `Using mock folders: ${describeJmapError(error)}`);
-      })
-      .finally(() => {
+      Promise.resolve().then(() => {
         if (!controller.signal.aborted) {
-          setJmapLoading(false);
+          setJmapLoading(true);
+          setJmapStatus('');
         }
       });
 
-    return () => {
-      controller.abort();
-    };
-  }, []);
+      fetchJmapMailboxes(controller.signal)
+        .then((mailboxes) => {
+          setLiveSections(getFolderSections(mailboxes));
+          void setInboxUnreadBadgeCount(getInboxUnreadCountFromMailboxes(mailboxes)).catch(() => {});
+        })
+        .catch((error: unknown) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+
+          setLiveSections(null);
+          setJmapStatus(error instanceof Error && error.name === 'FastmailJmapTokenMissingError'
+            ? ''
+            : `Using mock folders: ${describeJmapError(error)}`);
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) {
+            setJmapLoading(false);
+          }
+        });
+
+      return () => {
+        controller.abort();
+      };
+    }, []),
+  );
   useEffect(() => {
     if (returnMailboxId || returnMailboxRole) {
       return;

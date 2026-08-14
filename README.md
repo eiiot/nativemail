@@ -114,3 +114,26 @@ npm run notifications:relay
 
 It is used for notification delivery and lightweight observability during
 development.
+
+### Fly.io deployment
+
+The relay can run as a single always-on Fly Machine with its JSON store and
+observability log on a persistent volume:
+
+```bash
+fly volumes create nativemail_data --region sjc --size 1
+fly deploy
+```
+
+The Fly configuration deliberately runs one Machine. The relay keeps active
+subscriber connections in memory and writes a single JSON store, so it is not
+safe to scale horizontally without replacing that storage model.
+
+Point app builds and updates at the deployed relay with:
+
+```bash
+EXPO_PUBLIC_NOTIFICATION_RELAY_URL=https://nativemail-relay.fly.dev
+```
+
+The Fly deployment is also the app's default relay. The environment variable
+remains available for local or staging overrides.
