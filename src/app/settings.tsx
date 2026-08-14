@@ -189,6 +189,17 @@ export default function SettingsScreen() {
         </View>
 
         <Text style={[styles.title, { color: colors.text }]}>Settings</Text>
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => router.push('/search-pill-lab' as never)}
+          style={({ pressed }) => [styles.card, styles.labRow, { backgroundColor: colors.card, opacity: pressed ? 0.72 : 1 }]}>
+          <View style={styles.labIcon}><Text style={styles.labIconText}>⌕</Text></View>
+          <View style={styles.labCopy}>
+            <Text style={[styles.cardTitle, { color: colors.text }]}>Search Pill Lab</Text>
+            <Text style={[styles.labSubtitle, { color: colors.secondary }]}>Compare 10 Liquid Glass designs</Text>
+          </View>
+          <Text style={[styles.labChevron, { color: colors.secondary }]}>›</Text>
+        </Pressable>
         <View style={[styles.card, { backgroundColor: colors.card }]}>
           <Text style={[styles.cardTitle, { color: colors.text }]}>Fastmail API</Text>
           <Text style={[styles.subtitle, { color: colors.secondary }]}>JMAP token</Text>
@@ -310,4 +321,10 @@ const styles = StyleSheet.create({
   report: { borderRadius: 12, fontFamily: 'Menlo', fontSize: 11, lineHeight: 15, marginTop: 12, padding: 12 },
   debugRow: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
   debugText: { flex: 1, paddingRight: 12 },
+  labRow: { alignItems: 'center', flexDirection: 'row', gap: 12 },
+  labIcon: { alignItems: 'center', backgroundColor: '#0a84ff', borderRadius: 12, height: 38, justifyContent: 'center', width: 38 },
+  labIconText: { color: '#ffffff', fontSize: 22, fontWeight: '600' },
+  labCopy: { flex: 1, gap: 2 },
+  labSubtitle: { fontSize: 13 },
+  labChevron: { fontSize: 28, fontWeight: '300' },
 });

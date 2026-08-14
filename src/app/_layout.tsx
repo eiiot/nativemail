@@ -168,6 +168,7 @@ export default function RootLayout() {
             <Stack.Screen name="folders" options={{ animation: 'slide_from_left' }} />
             <Stack.Screen name="index" />
             <Stack.Screen name="message/[id]" />
+            <Stack.Screen name="search-pill-lab" />
             <Stack.Screen
               name="settings"
               options={{
