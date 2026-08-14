@@ -1753,13 +1753,18 @@ function SearchPillBar({
           <GlassView glassEffectStyle="regular" isInteractive key={`${term.scope}-${term.value}-${index}`} style={styles.searchPillGlass}>
             <Host style={styles.searchPillScopeHost}>
               <Menu
-                label={term.scope}
-                modifiers={[
-                  buttonStyle('plain'),
-                  frame({ width: 92, height: 36 }),
-                  font({ size: 13, weight: 'semibold' }),
-                  foregroundColor(colors.text),
-                ]}>
+                label={(
+                  <HStack
+                    alignment="center"
+                    spacing={4}
+                    modifiers={[frame({ width: 92, height: 36 })]}>
+                    <SwiftText modifiers={[font({ size: 13, weight: 'regular' }), foregroundColor(colors.text)]}>
+                      {term.scope}
+                    </SwiftText>
+                    <SwiftImage systemName="chevron.down" color={colors.text} size={10} />
+                  </HStack>
+                )}
+                modifiers={[buttonStyle('plain')]}>
                 {(['Anywhere', 'From', 'To', 'Subject', 'Body'] as SearchPillScope[]).map((scope) => (
                   <SwiftButton
                     key={scope}
@@ -1774,7 +1779,7 @@ function SearchPillBar({
             <Text numberOfLines={1} style={[styles.searchPillValue, { color: colors.text }]}>{term.value}</Text>
             <View style={[styles.searchPillDivider, { backgroundColor: colors.separator }]} />
             <Pressable hitSlop={8} onPress={() => onRemove(index)} style={styles.searchPillRemove}>
-              <SymbolView name="xmark" size={12} tintColor={colors.secondaryText} />
+              <SymbolView name="xmark" size={12} tintColor={colors.secondaryText} weight="regular" />
             </Pressable>
           </GlassView>
         ))}
@@ -2906,13 +2911,13 @@ const styles = StyleSheet.create({
     width: 92,
   },
   searchPillDivider: {
-    height: 20,
-    width: StyleSheet.hairlineWidth,
+    height: 22,
+    width: 1,
   },
   searchPillValue: {
     fontFamily: systemFont,
     fontSize: 13,
-    fontWeight: '600',
+    fontWeight: '400',
     maxWidth: 132,
     paddingHorizontal: 9,
   },
