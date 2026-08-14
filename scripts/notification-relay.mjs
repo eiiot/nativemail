@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { Buffer } from 'node:buffer';
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -39,6 +39,7 @@ const JMAP_SESSION_CACHE_TTL_MS = 10 * 60 * 1000;
 const JMAP_SESSION_TIMEOUT_MS = 2000;
 const JMAP_BODY_TIMEOUT_MS = 4000;
 const JMAP_PROXY_TIMEOUT_MS = 8000;
+const DIAGNOSTIC_TOKEN = process.env.NOTIFICATION_RELAY_DIAGNOSTIC_TOKEN ?? '';
 const BODY_CACHE_BATCH_SIZE = 10;
 const BODY_BACKFILL_QUERY_LIMIT = 100;
 const BODY_BACKFILL_BATCH_DELAY_MS = 150;
@@ -115,6 +116,12 @@ async function route(request, response) {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? `localhost:${PORT}`}`);
 
   if (request.method === 'GET' && url.pathname === '/health') {
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (request.method === 'GET' && url.pathname === '/health/details') {
+    if (!requireDiagnosticAuthorization(request, response)) return;
     sendJson(response, 200, {
       ok: true,
       subscriberCount: subscribers.size,
@@ -124,6 +131,7 @@ async function route(request, response) {
   }
 
   if (request.method === 'GET' && url.pathname.startsWith('/debug/')) {
+    if (!requireDiagnosticAuthorization(request, response)) return;
     const deviceId = sanitizeDeviceId(decodeURIComponent(url.pathname.slice('/debug/'.length)));
     const subscriber = subscribers.get(deviceId);
 
@@ -136,6 +144,7 @@ async function route(request, response) {
   }
 
   if (request.method === 'GET' && url.pathname === '/observability') {
+    if (!requireDiagnosticAuthorization(request, response)) return;
     const limit = Math.min(
       OBSERVABILITY_EVENT_LIMIT,
       Math.max(1, Number.parseInt(url.searchParams.get('limit') ?? '50', 10) || 50)
@@ -1362,6 +1371,20 @@ function sendJson(response, status, payload) {
     'Content-Type': 'application/json; charset=utf-8',
   });
   response.end(JSON.stringify(payload, null, 2));
+}
+
+function requireDiagnosticAuthorization(request, response) {
+  if (!DIAGNOSTIC_TOKEN) {
+    sendJson(response, 503, { error: 'Diagnostic access is not configured.' });
+    return false;
+  }
+  const supplied = request.headers.authorization?.replace(/^Bearer\s+/i, '') ?? '';
+  const expectedBuffer = Buffer.from(DIAGNOSTIC_TOKEN);
+  const suppliedBuffer = Buffer.from(supplied);
+  const authorized = expectedBuffer.length === suppliedBuffer.length &&
+    timingSafeEqual(expectedBuffer, suppliedBuffer);
+  if (!authorized) sendJson(response, 401, { error: 'Unauthorized.' });
+  return authorized;
 }
 
 function getRequiredString(body, key) {

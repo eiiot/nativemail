@@ -16,6 +16,23 @@ afterEach(async () => {
 });
 
 describe('notification relay message-body proxy', () => {
+  it('keeps liveness public while protecting diagnostic data', async () => {
+    const fastmail = createServer((_request, response) => response.end('{}'));
+    servers.push(fastmail);
+    await listen(fastmail);
+    const { port } = await startRelay(fastmail);
+
+    expect(await (await fetch(`http://127.0.0.1:${port}/health`)).json()).toEqual({ ok: true });
+    expect((await fetch(`http://127.0.0.1:${port}/health/details`)).status).toBe(401);
+    expect((await fetch(`http://127.0.0.1:${port}/observability`)).status).toBe(401);
+    expect((await fetch(`http://127.0.0.1:${port}/debug/device-1`)).status).toBe(401);
+    const authorized = await fetch(`http://127.0.0.1:${port}/health/details`, {
+      headers: { authorization: 'Bearer test-diagnostic-token' },
+    });
+    expect(authorized.status).toBe(200);
+    expect(await authorized.json()).toMatchObject({ ok: true, subscriberCount: 0 });
+  });
+
   it('fetches one email body from Fastmail without persisting the bearer token', async () => {
     const seenAuthorization = [];
     let sessionRequests = 0;
@@ -47,6 +64,7 @@ describe('notification relay message-body proxy', () => {
       env: {
         ...process.env,
         FASTMAIL_SESSION_URL: `http://127.0.0.1:${fastmail.address().port}/session`,
+        NOTIFICATION_RELAY_DIAGNOSTIC_TOKEN: 'test-diagnostic-token',
         NOTIFICATION_RELAY_BODY_CACHE_DIR: path.join(directory, 'body-cache'),
         NOTIFICATION_RELAY_OBSERVABILITY_PATH: path.join(directory, 'observability.jsonl'),
         NOTIFICATION_RELAY_STORE_PATH: path.join(directory, 'store.json'),
@@ -127,6 +145,7 @@ async function startRelay(fastmail) {
     env: {
       ...process.env,
       FASTMAIL_SESSION_URL: `http://127.0.0.1:${fastmail.address().port}/session`,
+      NOTIFICATION_RELAY_DIAGNOSTIC_TOKEN: 'test-diagnostic-token',
       NOTIFICATION_RELAY_BODY_CACHE_DIR: path.join(directory, 'body-cache'),
       NOTIFICATION_RELAY_OBSERVABILITY_PATH: path.join(directory, 'observability.jsonl'),
       NOTIFICATION_RELAY_STORE_PATH: path.join(directory, 'store.json'),
