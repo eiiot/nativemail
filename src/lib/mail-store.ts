@@ -509,7 +509,7 @@ export async function loadMessageBody(
   if (!refresh) {
     const cachedOrMemoryBody = await hydrateMessageBodyFromCache(messageId);
 
-    if (cachedOrMemoryBody) {
+    if (cachedOrMemoryBody && !hasUnresolvedCidImage(cachedOrMemoryBody)) {
       observeDuration('mail.body.load.cache-hit', startedAt, {
         html: cachedOrMemoryBody.html?.trim() ? cachedOrMemoryBody.html.length : 0,
         messageId,
@@ -518,6 +518,13 @@ export async function loadMessageBody(
         text: cachedOrMemoryBody.text?.trim() ? cachedOrMemoryBody.text.length : 0,
       });
       return cachedOrMemoryBody;
+    }
+
+    if (cachedOrMemoryBody) {
+      observeEvent('mail.body.load.cache-stale-cid', {
+        messageId,
+        priority,
+      });
     }
   }
 
@@ -699,6 +706,10 @@ export async function loadMessageBody(
   });
 
   return fetchPromise;
+}
+
+function hasUnresolvedCidImage(body: JmapMessageBody) {
+  return /\bcid:/i.test(body.html ?? '');
 }
 
 export async function prefetchMessageBodies(

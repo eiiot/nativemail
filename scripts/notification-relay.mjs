@@ -43,6 +43,8 @@ const DIAGNOSTIC_TOKEN = process.env.NOTIFICATION_RELAY_DIAGNOSTIC_TOKEN ?? '';
 const BODY_CACHE_BATCH_SIZE = 10;
 const BODY_BACKFILL_QUERY_LIMIT = 100;
 const BODY_BACKFILL_BATCH_DELAY_MS = 150;
+const CID_CACHE_VERSION = 1;
+const MAX_INLINE_CID_IMAGE_BYTES = 2 * 1024 * 1024;
 
 /** @type {Map<string, { accountId: string; apiUrl: string; expiresAt: number }>} */
 const jmapSessionCache = new Map();
@@ -191,8 +193,9 @@ async function route(request, response) {
     const token = authorization.slice(7);
     const cachedEmails = await readCachedEmails(token, messageIds);
     const missingMessageIds = messageIds.filter((messageId) => !cachedEmails.has(messageId));
+    const staleCidMessageIds = messageIds.filter((messageId) => needsCidMaterialization(cachedEmails.get(messageId)));
 
-    if (!missingMessageIds.length) {
+    if (!missingMessageIds.length && !staleCidMessageIds.length) {
       const emails = messageIds.map((messageId) => cachedEmails.get(messageId)).filter(Boolean);
       sendJson(response, 200, {
         cache: { hits: emails.length, misses: 0 },
@@ -205,7 +208,7 @@ async function route(request, response) {
     }
 
     const sessionStartedAt = Date.now();
-    const { accountId, apiUrl, cacheHit } = await getCachedJmapSession(token);
+    const { accountId, apiUrl, cacheHit, downloadUrl } = await getCachedJmapSession(token);
 
     const jmapStartedAt = Date.now();
     const jmapResponse = await fetchWithTimeout(apiUrl, {
@@ -250,8 +253,16 @@ async function route(request, response) {
       totalMs: Date.now() - startedAt,
     };
     const fetchedEmails = invocation?.[1]?.list ?? [];
-    await Promise.all(fetchedEmails.map((email) => writeCachedEmail(token, email)));
     for (const email of fetchedEmails) cachedEmails.set(email.id, email);
+    await Promise.all(
+      [...new Set([...missingMessageIds, ...staleCidMessageIds])].map(async (messageId) => {
+        const email = cachedEmails.get(messageId);
+        if (!email) return;
+        const materialized = await materializeCidImages({ accountId, downloadUrl, email, token });
+        cachedEmails.set(messageId, materialized);
+        await writeCachedEmail(token, materialized);
+      })
+    );
     const emails = messageIds.map((messageId) => cachedEmails.get(messageId)).filter(Boolean);
     console.log('[relay] message body success', JSON.stringify({ messageIds, count: emails.length, cacheHits: messageIds.length - missingMessageIds.length, ...timings }));
     sendJson(response, 200, {
@@ -435,6 +446,7 @@ async function getCachedJmapSession(token) {
   const value = {
     accountId,
     apiUrl: session.apiUrl,
+    downloadUrl: session.downloadUrl,
     expiresAt: Date.now() + JMAP_SESSION_CACHE_TTL_MS,
   };
   jmapSessionCache.set(cacheKey, value);
@@ -469,12 +481,91 @@ async function writeCachedEmail(token, email) {
   await rename(temporaryPath, cachePath);
 }
 
-async function fetchAndCacheBodies({ accountId, apiUrl, messageIds, token }) {
+function needsCidMaterialization(email) {
+  if (!email || email._nativemailCidCacheVersion === CID_CACHE_VERSION) return false;
+  return Object.values(email.bodyValues ?? {}).some((bodyValue) => /\bcid:/i.test(bodyValue?.value ?? ''));
+}
+
+async function materializeCidImages({ accountId, downloadUrl, email, token }) {
+  if (!needsCidMaterialization(email) || !downloadUrl) return email;
+  const parts = [...flattenCachedBodyParts(email.bodyStructure), ...(email.htmlBody ?? []), ...(email.attachments ?? [])];
+  const imageByCid = new Map();
+  for (const part of parts) {
+    const cid = normalizeCachedCid(part?.cid);
+    if (
+      cid &&
+      part?.blobId &&
+      part?.type?.toLowerCase().startsWith('image/') &&
+      (part.size ?? 0) <= MAX_INLINE_CID_IMAGE_BYTES
+    ) {
+      imageByCid.set(cid, part);
+    }
+  }
+
+  const referencedCids = new Set();
+  for (const bodyValue of Object.values(email.bodyValues ?? {})) {
+    for (const match of (bodyValue?.value ?? '').matchAll(/\bcid:([^"')\s>]+)/gi)) {
+      referencedCids.add(normalizeCachedCid(match[1]));
+    }
+  }
+  const dataByCid = new Map();
+  await Promise.all([...referencedCids].map(async (cid) => {
+    const part = imageByCid.get(cid);
+    if (!part) return;
+    const type = part.type || 'application/octet-stream';
+    const url = expandEventSourceUrl(downloadUrl, {
+      accept: type,
+      accountId,
+      blobId: part.blobId,
+      name: part.name || `${part.partId || 'inline-image'}.bin`,
+      type,
+    });
+    try {
+      const response = await fetchWithTimeout(url, {
+        headers: { Authorization: `Bearer ${token}` },
+      }, JMAP_BODY_TIMEOUT_MS, 'Fastmail inline image download timed out');
+      if (!response.ok) throw new Error(`Fastmail inline image download failed with HTTP ${response.status}.`);
+      const bytes = Buffer.from(await response.arrayBuffer());
+      if (bytes.length > MAX_INLINE_CID_IMAGE_BYTES) return;
+      dataByCid.set(cid, `data:${type};base64,${bytes.toString('base64')}`);
+    } catch (error) {
+      console.warn('[relay] inline CID image skipped', email.id, cid, describeError(error));
+    }
+  }));
+
+  const bodyValues = Object.fromEntries(Object.entries(email.bodyValues ?? {}).map(([partId, bodyValue]) => [
+    partId,
+    {
+      ...bodyValue,
+      value: (bodyValue?.value ?? '').replace(/\bcid:([^"')\s>]+)/gi, (match, cid) =>
+        dataByCid.get(normalizeCachedCid(cid)) ?? match
+      ),
+    },
+  ]));
+  const hasUnresolvedCid = Object.values(bodyValues).some((bodyValue) => /\bcid:/i.test(bodyValue?.value ?? ''));
+  return {
+    ...email,
+    ...(hasUnresolvedCid ? {} : { _nativemailCidCacheVersion: CID_CACHE_VERSION }),
+    bodyValues,
+  };
+}
+
+function flattenCachedBodyParts(part) {
+  if (!part) return [];
+  return [part, ...(part.subParts ?? []).flatMap(flattenCachedBodyParts)];
+}
+
+function normalizeCachedCid(value) {
+  return String(value ?? '').replace(/^cid:/i, '').replace(/^<|>$/g, '').trim().toLowerCase();
+}
+
+async function fetchAndCacheBodies({ accountId, apiUrl, downloadUrl, messageIds, token }) {
   const uniqueIds = [...new Set(messageIds)].filter(Boolean);
   if (!uniqueIds.length) return [];
   const cached = await readCachedEmails(token, uniqueIds);
   const missingIds = uniqueIds.filter((messageId) => !cached.has(messageId));
-  if (!missingIds.length) return uniqueIds.map((messageId) => cached.get(messageId)).filter(Boolean);
+  const staleCidIds = uniqueIds.filter((messageId) => needsCidMaterialization(cached.get(messageId)));
+  if (!missingIds.length && !staleCidIds.length) return uniqueIds.map((messageId) => cached.get(messageId)).filter(Boolean);
 
   const response = await fetchWithTimeout(apiUrl, {
     body: JSON.stringify({
@@ -500,8 +591,14 @@ async function fetchAndCacheBodies({ accountId, apiUrl, messageIds, token }) {
   const invocation = payload.methodResponses?.[0];
   if (invocation?.[0] === 'error') throw new Error(`Fastmail body cache fill: ${invocation[1]?.type ?? 'unknown'}`);
   const emails = invocation?.[1]?.list ?? [];
-  await Promise.all(emails.map((email) => writeCachedEmail(token, email)));
   for (const email of emails) cached.set(email.id, email);
+  await Promise.all([...new Set([...missingIds, ...staleCidIds])].map(async (messageId) => {
+    const email = cached.get(messageId);
+    if (!email) return;
+    const materialized = await materializeCidImages({ accountId, downloadUrl, email, token });
+    cached.set(messageId, materialized);
+    await writeCachedEmail(token, materialized);
+  }));
   return uniqueIds.map((messageId) => cached.get(messageId)).filter(Boolean);
 }
 
@@ -557,6 +654,7 @@ async function createSubscriber({ deviceId, expoPushToken, jmapToken }) {
     accountId,
     activeNotificationEmailIds: [],
     apiUrl: session.apiUrl,
+    downloadUrl: session.downloadUrl,
     deviceId,
     eventSourceUrl: session.eventSourceUrl,
     expoPushToken,
@@ -581,6 +679,7 @@ async function startSubscriber(subscriber, { rehydrate }) {
     try {
       const session = await discoverJmapSession(subscriber.jmapToken);
       subscriber.apiUrl = session.apiUrl;
+      subscriber.downloadUrl = session.downloadUrl;
       subscriber.eventSourceUrl = session.eventSourceUrl;
       subscriber.status = 'rehydrated';
       await refreshInbox(subscriber, { notify: false, reason: 'rehydrate' });
@@ -854,6 +953,7 @@ async function refreshInbox(subscriber, { notify, reason }) {
       await fetchAndCacheBodies({
         accountId: subscriber.accountId,
         apiUrl: subscriber.apiUrl,
+        downloadUrl: subscriber.downloadUrl,
         messageIds: newEmails.map((email) => email.id),
         token: subscriber.jmapToken,
       });
@@ -1001,6 +1101,7 @@ async function backfillInboxBodies(subscriber) {
         const emails = await fetchAndCacheBodies({
           accountId: subscriber.accountId,
           apiUrl: subscriber.apiUrl,
+          downloadUrl: subscriber.downloadUrl,
           messageIds: batch,
           token: subscriber.jmapToken,
         });

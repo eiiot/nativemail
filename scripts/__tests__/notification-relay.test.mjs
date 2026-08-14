@@ -128,6 +128,56 @@ describe('notification relay message-body proxy', () => {
       ok: true,
     });
   });
+
+  it('downloads CID images and persists self-contained HTML', async () => {
+    let imageRequests = 0;
+    const fastmail = createServer(async (request, response) => {
+      if (request.url === '/session') {
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({
+          apiUrl: `http://127.0.0.1:${fastmail.address().port}/api`,
+          downloadUrl: `http://127.0.0.1:${fastmail.address().port}/download/{accountId}/{blobId}/{name}{?accept}`,
+          primaryAccounts: { 'urn:ietf:params:jmap:mail': 'account-1' },
+        }));
+        return;
+      }
+      if (request.url?.startsWith('/download/')) {
+        imageRequests += 1;
+        expect(request.headers.authorization).toBe('Bearer secret-token');
+        response.setHeader('content-type', 'image/png');
+        response.end('logo');
+        return;
+      }
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        methodResponses: [['Email/get', { list: [{
+          id: 'message-with-logo',
+          bodyValues: { html: { value: '<p><img src="cid:AHP_logo.png"></p>' } },
+          htmlBody: [
+            { partId: 'html', type: 'text/html' },
+            { partId: 'logo', blobId: 'blob-logo', cid: 'AHP_logo.png', name: 'AHP_logo.png', size: 4, type: 'image/png', disposition: 'inline' },
+          ],
+          textBody: [],
+          attachments: [],
+        }] }, '0']],
+      }));
+    });
+    servers.push(fastmail);
+    await listen(fastmail);
+    const { port } = await startRelay(fastmail);
+    const requestBody = {
+      body: JSON.stringify({ messageId: 'message-with-logo' }),
+      headers: { authorization: 'Bearer secret-token', 'content-type': 'application/json' },
+      method: 'POST',
+    };
+
+    const first = await (await fetch(`http://127.0.0.1:${port}/jmap/message-body`, requestBody)).json();
+    expect(first.email.bodyValues.html.value).toContain('data:image/png;base64,bG9nbw==');
+    expect(first.email.bodyValues.html.value).not.toContain('cid:');
+    const second = await (await fetch(`http://127.0.0.1:${port}/jmap/message-body`, requestBody)).json();
+    expect(second.email.bodyValues.html.value).toContain('data:image/png;base64,bG9nbw==');
+    expect(imageRequests).toBe(1);
+  });
 });
 
 async function readRequestJson(request) {
