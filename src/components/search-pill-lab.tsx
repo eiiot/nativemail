@@ -1,37 +1,44 @@
-import { GlassContainer, GlassView, isLiquidGlassAvailable } from 'expo-glass-effect';
+import { Button, ControlGroup, Host, HStack, Menu } from '@expo/ui/swift-ui';
+import { buttonBorderShape, controlSize, labelStyle, tint } from '@expo/ui/swift-ui/modifiers';
 import * as Haptics from 'expo-haptics';
 import { LinearGradient } from 'expo-linear-gradient';
-import { useState, type ReactNode } from 'react';
+import { useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View, useColorScheme } from 'react-native';
 
-type PillProps = {
-  clear?: boolean;
-  compact?: boolean;
-  icon?: string;
-  scope?: string;
-  term: string;
-  tint?: string;
+type NativeControlSize = 'mini' | 'small' | 'regular';
+
+type Concept = {
+  accent?: string;
+  destructiveRemove?: boolean;
+  id: number;
+  name: string;
+  note: string;
+  scopeIcon?: 'magnifyingglass' | 'line.3.horizontal.decrease';
+  scopeLabel: string;
+  size: NativeControlSize;
+  termAccent?: string;
+  titleOnly?: boolean;
 };
 
-const concepts = [
-  { id: 1, name: 'Crystal Segments', note: 'One continuous control with crisp internal divisions.' },
-  { id: 2, name: 'Paired Droplets', note: 'Scope and term are separate droplets that visually attract.' },
-  { id: 3, name: 'Compact Tokens', note: 'Small, quiet tokens for fitting several terms above the keyboard.' },
-  { id: 4, name: 'Chromatic Scope', note: 'A restrained blue tint makes the editable scope obvious.' },
-  { id: 5, name: 'Orbital Controls', note: 'The scope and remove actions become tactile circular satellites.' },
-  { id: 6, name: 'Search Rail', note: 'Both terms share one floating glass rail, like compact toolbar items.' },
-  { id: 7, name: 'Icon Scope', note: 'An SF-style symbol replaces the repeated “Anywhere” label.' },
-  { id: 8, name: 'Clear Crystal', note: 'Thinner clear glass prioritizes the content underneath.' },
-  { id: 9, name: 'Soft Tint', note: 'Each term gets a subtle semantic tint without becoming a badge.' },
-  { id: 10, name: 'Magnetic Cluster', note: 'Independent pieces sit close enough to merge while interacting.' },
+const concepts: Concept[] = [
+  { id: 1, name: 'Native Small', note: 'The baseline: native Menu, button, and xmark in one ControlGroup.', scopeLabel: 'Anywhere', size: 'small' },
+  { id: 2, name: 'Native Mini', note: 'The densest system size for fitting many terms above the search bar.', scopeLabel: 'Anywhere', size: 'mini' },
+  { id: 3, name: 'Comfortable Capsule', note: 'Regular control sizing with more breathing room and a larger tap target.', scopeLabel: 'Anywhere', size: 'regular' },
+  { accent: '#0a84ff', id: 4, name: 'Blue Scope', note: 'System blue identifies the scope menu while the term stays neutral.', scopeLabel: 'Anywhere', size: 'small' },
+  { id: 5, name: 'Search Icon + Scope', note: 'The native magnifying-glass symbol reinforces that the first segment changes scope.', scopeIcon: 'magnifyingglass', scopeLabel: 'Anywhere', size: 'small' },
+  { id: 6, name: 'Compact “All”', note: 'Shortens Anywhere to All for the most economical repeated token.', scopeIcon: 'magnifyingglass', scopeLabel: 'All', size: 'small' },
+  { id: 7, name: 'Filter Scope', note: 'A filter symbol makes advanced search intent explicit without a custom chevron.', scopeIcon: 'line.3.horizontal.decrease', scopeLabel: 'Anywhere', size: 'small' },
+  { accent: '#bf5af2', id: 8, name: 'Violet Scope', note: 'A softer semantic tint separates filters from ordinary toolbar controls.', scopeLabel: 'Anywhere', size: 'small' },
+  { destructiveRemove: true, id: 9, name: 'Destructive Remove', note: 'The native destructive role gives the remove action clearer affordance.', scopeLabel: 'Anywhere', size: 'small' },
+  { accent: '#0a84ff', id: 10, name: 'Dual Accent', note: 'Scope and term share one restrained tint for a more active search state.', scopeLabel: 'All', size: 'small', termAccent: '#0a84ff' },
 ];
 
 export function SearchPillLab() {
   const dark = useColorScheme() === 'dark';
   const [favorite, setFavorite] = useState<number | null>(null);
   const colors = dark
-    ? { background: '#09090b', text: '#f7f7f8', secondary: '#aaaab2', card: '#17171a' }
-    : { background: '#f2f2f7', text: '#111114', secondary: '#6e6e76', card: '#ffffff' };
+    ? { background: '#09090b', card: '#17171a', secondary: '#aaaab2', text: '#f7f7f8' }
+    : { background: '#f2f2f7', card: '#ffffff', secondary: '#6e6e76', text: '#111114' };
 
   const choose = (id: number) => {
     setFavorite(id);
@@ -44,13 +51,12 @@ export function SearchPillLab() {
       contentInsetAdjustmentBehavior="automatic"
       style={{ backgroundColor: colors.background }}>
       <View style={styles.intro}>
-        <Text style={[styles.introTitle, { color: colors.text }]}>Ten directions</Text>
-        <Text style={[styles.introCopy, { color: colors.secondary }]}>Tap a design to mark it. Every sample uses real system Liquid Glass over the same colorful canvas.</Text>
-        {!isLiquidGlassAvailable() && <Text style={styles.warning}>Liquid Glass is unavailable on this OS; fallback rendering is shown.</Text>}
+        <Text style={[styles.introTitle, { color: colors.text }]}>Compact Token Lab</Text>
+        <Text style={[styles.introCopy, { color: colors.secondary }]}>All ten now use SwiftUI’s real ControlGroup. The system owns the capsule, dividers, menu chevron, press behavior, and xmark.</Text>
       </View>
 
       {concepts.map((concept) => (
-        <Pressable key={concept.id} onPress={() => choose(concept.id)} style={({ pressed }) => [{ opacity: pressed ? 0.82 : 1 }]}>
+        <Pressable key={concept.id} onPress={() => choose(concept.id)} style={({ pressed }) => ({ opacity: pressed ? 0.82 : 1 })}>
           <View style={[styles.card, { backgroundColor: colors.card }, favorite === concept.id && styles.selectedCard]}>
             <View style={styles.cardHeading}>
               <View style={styles.numberBadge}><Text style={styles.numberText}>{concept.id}</Text></View>
@@ -60,7 +66,7 @@ export function SearchPillLab() {
               </View>
               {favorite === concept.id && <Text style={styles.check}>✓</Text>}
             </View>
-            <ConceptCanvas concept={concept.id} />
+            <ConceptCanvas concept={concept} dark={dark} />
           </View>
         </Pressable>
       ))}
@@ -68,68 +74,47 @@ export function SearchPillLab() {
   );
 }
 
-function ConceptCanvas({ concept }: { concept: number }) {
+function ConceptCanvas({ concept, dark }: { concept: Concept; dark: boolean }) {
   return (
     <View style={styles.canvas}>
       <LinearGradient colors={['#3855ff', '#a636e8', '#ff6e62']} end={{ x: 1, y: 1 }} start={{ x: 0, y: 0 }} style={StyleSheet.absoluteFill} />
       <View style={[styles.glow, styles.glowOne]} />
       <View style={[styles.glow, styles.glowTwo]} />
-      <View style={styles.sampleRow}>{renderConcept(concept)}</View>
+      <Host colorScheme={dark ? 'dark' : 'light'} style={styles.host}>
+        <HStack spacing={8}>
+          <NativeToken concept={concept} term="claude" />
+          <NativeToken concept={concept} term="code" />
+        </HStack>
+      </Host>
     </View>
   );
 }
 
-function renderConcept(concept: number): ReactNode {
-  switch (concept) {
-    case 1:
-      return <><Pill term="claude" /><Pill term="code" /></>;
-    case 2:
-      return <GlassContainer spacing={18} style={styles.row}><DropletPair term="claude" /><DropletPair term="code" /></GlassContainer>;
-    case 3:
-      return <><Pill compact term="claude" /><Pill compact term="code" /></>;
-    case 4:
-      return <><Pill term="claude" tint="rgba(10,132,255,0.28)" /><Pill term="code" tint="rgba(10,132,255,0.28)" /></>;
-    case 5:
-      return <GlassContainer spacing={10} style={styles.row}><Orbital term="claude" /><Orbital term="code" /></GlassContainer>;
-    case 6:
-      return <GlassView glassEffectStyle="regular" isInteractive style={styles.rail}><RailTerm term="claude" /><View style={styles.railDivider} /><RailTerm term="code" /></GlassView>;
-    case 7:
-      return <><Pill icon="⌕" scope="" term="claude" /><Pill icon="⌕" scope="" term="code" /></>;
-    case 8:
-      return <><Pill clear term="claude" /><Pill clear term="code" /></>;
-    case 9:
-      return <><Pill term="claude" tint="rgba(88,86,214,0.24)" /><Pill term="code" tint="rgba(255,159,10,0.22)" /></>;
-    default:
-      return <GlassContainer spacing={28} style={styles.row}><Magnetic term="claude" /><Magnetic term="code" /></GlassContainer>;
-  }
-}
+function NativeToken({ concept, term }: { concept: Concept; term: string }) {
+  const groupModifiers = [controlSize(concept.size), buttonBorderShape('capsule')];
+  const scopeModifiers = concept.accent ? [tint(concept.accent)] : [];
+  const termModifiers = concept.termAccent ? [tint(concept.termAccent)] : [];
 
-function Pill({ clear, compact, icon, scope = 'Anywhere', term, tint }: PillProps) {
   return (
-    <GlassView glassEffectStyle={clear ? 'clear' : 'regular'} isInteractive style={[styles.pill, compact && styles.compactPill]} tintColor={tint}>
-      <View style={[styles.scope, compact && styles.compactScope]}>{icon && <Text style={styles.pillIcon}>{icon}</Text>}<Text style={styles.scopeText}>{scope}</Text>{scope && <Text style={styles.chevron}>⌄</Text>}</View>
-      <View style={styles.divider} />
-      <Text style={[styles.term, compact && styles.compactTerm]}>{term}</Text>
-      <View style={styles.divider} />
-      <Text style={styles.remove}>×</Text>
-    </GlassView>
+    <ControlGroup modifiers={groupModifiers}>
+      <Menu
+        label={concept.scopeLabel}
+        modifiers={scopeModifiers}
+        systemImage={concept.scopeIcon}>
+        <Button label="Anywhere" systemImage="text.magnifyingglass" />
+        <Button label="From" systemImage="person" />
+        <Button label="To" systemImage="arrow.right" />
+        <Button label="Subject" systemImage="text.alignleft" />
+        <Button label="Body" systemImage="doc.text" />
+      </Menu>
+      <Button label={term} modifiers={termModifiers} />
+      <Button
+        modifiers={[labelStyle('iconOnly')]}
+        role={concept.destructiveRemove ? 'destructive' : 'default'}
+        systemImage="xmark"
+      />
+    </ControlGroup>
   );
-}
-
-function DropletPair({ term }: { term: string }) {
-  return <View style={styles.cluster}><GlassView glassEffectStyle="regular" isInteractive style={styles.scopeDrop}><Text style={styles.scopeText}>Anywhere⌄</Text></GlassView><GlassView glassEffectStyle="regular" isInteractive style={styles.termDrop}><Text style={styles.term}>{term}</Text><Text style={styles.remove}>×</Text></GlassView></View>;
-}
-
-function Orbital({ term }: { term: string }) {
-  return <View style={styles.cluster}><GlassView glassEffectStyle="regular" isInteractive style={styles.orb}><Text style={styles.orbText}>⌕</Text></GlassView><GlassView glassEffectStyle="regular" isInteractive style={styles.orbitTerm}><Text style={styles.term}>{term}</Text></GlassView><GlassView glassEffectStyle="regular" isInteractive style={styles.orb}><Text style={styles.remove}>×</Text></GlassView></View>;
-}
-
-function RailTerm({ term }: { term: string }) {
-  return <View style={styles.railTerm}><Text style={styles.railScope}>Anywhere⌄</Text><Text style={styles.term}>{term}</Text><Text style={styles.remove}>×</Text></View>;
-}
-
-function Magnetic({ term }: { term: string }) {
-  return <View style={styles.cluster}><GlassView glassEffectStyle="clear" isInteractive style={styles.magneticScope}><Text style={styles.scopeText}>Anywhere</Text></GlassView><GlassView glassEffectStyle="regular" isInteractive style={styles.magneticTerm}><Text style={styles.term}>{term}</Text><Text style={styles.remove}>×</Text></GlassView></View>;
 }
 
 const styles = StyleSheet.create({
@@ -137,43 +122,18 @@ const styles = StyleSheet.create({
   intro: { gap: 6, paddingHorizontal: 4, paddingVertical: 8 },
   introTitle: { fontSize: 28, fontWeight: '700', letterSpacing: -0.5 },
   introCopy: { fontSize: 15, lineHeight: 21 },
-  warning: { color: '#ff9f0a', fontSize: 13, fontWeight: '600' },
   card: { borderCurve: 'continuous', borderRadius: 26, gap: 14, overflow: 'hidden', padding: 14 },
   selectedCard: { borderColor: '#0a84ff', borderWidth: 2, padding: 12 },
   cardHeading: { alignItems: 'center', flexDirection: 'row', gap: 10, paddingHorizontal: 2 },
   numberBadge: { alignItems: 'center', backgroundColor: '#0a84ff', borderRadius: 13, height: 26, justifyContent: 'center', width: 26 },
-  numberText: { color: '#fff', fontSize: 13, fontWeight: '700', fontVariant: ['tabular-nums'] },
+  numberText: { color: '#fff', fontSize: 13, fontVariant: ['tabular-nums'], fontWeight: '700' },
   headingCopy: { flex: 1, gap: 2 },
   name: { fontSize: 17, fontWeight: '600' },
   note: { fontSize: 13, lineHeight: 17 },
   check: { color: '#0a84ff', fontSize: 22, fontWeight: '700' },
-  canvas: { borderCurve: 'continuous', borderRadius: 20, height: 130, justifyContent: 'center', overflow: 'hidden' },
+  canvas: { borderCurve: 'continuous', borderRadius: 20, height: 126, overflow: 'hidden' },
   glow: { borderRadius: 40, height: 80, opacity: 0.7, position: 'absolute', width: 80 },
   glowOne: { backgroundColor: '#ffcc00', left: 35, top: -30 },
   glowTwo: { backgroundColor: '#32d7ff', bottom: -38, right: 18 },
-  sampleRow: { alignItems: 'center', flexDirection: 'row', gap: 8, paddingHorizontal: 12 },
-  row: { alignItems: 'center', flexDirection: 'row', gap: 8 },
-  cluster: { alignItems: 'center', flexDirection: 'row', gap: 4 },
-  pill: { alignItems: 'center', borderRadius: 18, flexDirection: 'row', height: 46, overflow: 'hidden' },
-  compactPill: { borderRadius: 999, height: 36 },
-  scope: { alignItems: 'center', flexDirection: 'row', gap: 3, paddingHorizontal: 10 },
-  compactScope: { paddingHorizontal: 8 },
-  pillIcon: { color: '#fff', fontSize: 18, fontWeight: '600' },
-  scopeText: { color: 'rgba(255,255,255,0.92)', fontSize: 13, fontWeight: '600' },
-  chevron: { color: 'rgba(255,255,255,0.72)', fontSize: 12 },
-  divider: { backgroundColor: 'rgba(255,255,255,0.22)', height: 24, width: StyleSheet.hairlineWidth },
-  term: { color: '#fff', fontSize: 14, fontWeight: '600', paddingHorizontal: 10 },
-  compactTerm: { fontSize: 13, paddingHorizontal: 8 },
-  remove: { color: 'rgba(255,255,255,0.86)', fontSize: 19, fontWeight: '400', paddingHorizontal: 9 },
-  scopeDrop: { borderRadius: 18, justifyContent: 'center', height: 44, paddingHorizontal: 10 },
-  termDrop: { alignItems: 'center', borderRadius: 18, flexDirection: 'row', height: 44 },
-  orb: { alignItems: 'center', borderRadius: 21, height: 42, justifyContent: 'center', width: 42 },
-  orbText: { color: '#fff', fontSize: 19, fontWeight: '600' },
-  orbitTerm: { borderRadius: 18, height: 42, justifyContent: 'center' },
-  rail: { alignItems: 'center', borderRadius: 20, flexDirection: 'row', height: 50, overflow: 'hidden' },
-  railTerm: { alignItems: 'center', flexDirection: 'row' },
-  railScope: { color: 'rgba(255,255,255,0.8)', fontSize: 11, fontWeight: '600', paddingLeft: 10 },
-  railDivider: { backgroundColor: 'rgba(255,255,255,0.24)', height: 28, width: StyleSheet.hairlineWidth },
-  magneticScope: { borderRadius: 17, justifyContent: 'center', height: 42, paddingHorizontal: 10 },
-  magneticTerm: { alignItems: 'center', borderRadius: 17, flexDirection: 'row', height: 42 },
+  host: { alignItems: 'center', height: 126, justifyContent: 'center', width: '100%' },
 });
