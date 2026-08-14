@@ -7,6 +7,7 @@ import {
 import { getFastmailJmapToken } from '@/lib/fastmail-token'
 import type { Message, MessageAttachment } from '@/lib/mock-mail'
 import { observeDuration, observeError, observeEvent } from '@/lib/observability'
+import { parseJmapSearchQuery } from '@/lib/search-query'
 import {
     createStateTracker,
     type SyncStateSnapshot,
@@ -21,6 +22,7 @@ import {
     isErrorInvocation,
     type EmailAddress,
     type EmailBodyPart,
+    type EmailFilterCondition,
     type EmailObject,
     type Id,
     type MailboxObject,
@@ -126,6 +128,7 @@ export type JmapMailboxSnapshot = {
     total?: number | null
     username: string
 }
+
 
 export type JmapThread = {
     emailIds: Id[]
@@ -636,6 +639,79 @@ export async function fetchJmapMailboxSnapshot({
                 mailboxId: mailboxId ?? 'inbox',
                 position,
             })
+        }
+        throw error
+    } finally {
+        await releaseFastmailJmapClient(client)
+    }
+}
+
+export async function fetchJmapSearchSnapshot({
+    limit = DEFAULT_MESSAGE_LIMIT,
+    position = 0,
+    query,
+    signal,
+}: {
+    limit?: number
+    position?: number
+    query: string
+    signal?: AbortSignal
+}): Promise<JmapMailboxSnapshot> {
+    const startedAt = Date.now()
+    const { accountId, client } = await createFastmailJmapClient(signal)
+
+    try {
+        const mailboxes = await getMailboxes(client, accountId, signal)
+        const excludedMailboxIds = mailboxes
+            .filter((mailbox) => mailbox.role === 'trash' || mailbox.role === 'junk')
+            .map((mailbox) => mailbox.id)
+        const filter = parseJmapSearchQuery(query)
+
+        if (excludedMailboxIds.length) {
+            filter.inMailboxOtherThan = excludedMailboxIds
+        }
+
+        const page = await getSearchSnapshotBatch(
+            client,
+            accountId,
+            filter,
+            mailboxes,
+            position,
+            limit,
+            signal,
+        )
+        const threads = await buildThreadMap(
+            client,
+            accountId,
+            page.threads,
+            page.messages,
+            mailboxes,
+            signal,
+        )
+        const messages = applyThreadCountsToMessages(page.messages, threads)
+        const snapshot: JmapMailboxSnapshot = {
+            accountId,
+            mailbox: null,
+            mailboxes,
+            messages,
+            position: page.position,
+            threads,
+            total: page.total,
+            username: client.username,
+        }
+
+        observeDuration('jmap.search.success', startedAt, {
+            messages: messages.length,
+            position: page.position,
+            queryLength: query.length,
+            total: page.total ?? -1,
+        })
+        return snapshot
+    } catch (error: unknown) {
+        if (error instanceof Error && error.name === 'AbortError') {
+            observeEvent('jmap.search.canceled', { queryLength: query.length })
+        } else {
+            observeError('jmap.search.failed', error, { queryLength: query.length })
         }
         throw error
     } finally {
@@ -2520,6 +2596,67 @@ async function getMailboxSnapshotBatch(
         ),
         position: responsePosition,
         states: getInvocationStates(response.methodResponses),
+        threads: threadObjects,
+        total,
+    }
+}
+
+async function getSearchSnapshotBatch(
+    client: JMAPClient,
+    accountId: Id,
+    filter: EmailFilterCondition,
+    mailboxes: JmapMailbox[],
+    position: number,
+    limit: number,
+    signal?: AbortSignal,
+) {
+    const query = Email.request.query({
+        accountId,
+        calculateTotal: true,
+        collapseThreads: true,
+        filter,
+        limit,
+        position,
+        sort: [{ property: 'receivedAt', isAscending: false }],
+    })
+    const emailGet = Email.request.get({
+        accountId,
+        bodyProperties: emailBodyPartProperties,
+        ids: query.createReference('/ids'),
+        properties: emailSummaryProperties,
+    })
+    const response = await client
+        .createRequestBuilder()
+        .add(query)
+        .add(emailGet)
+        .add(Thread.request.get({
+            accountId,
+            ids: emailGet.createReference('/list/*/threadId'),
+            properties: threadProperties,
+        }))
+        .send(signal)
+    let emailIds: Id[] = []
+    let emails: EmailObject[] = []
+    let threadObjects: ThreadObject[] = []
+    let responsePosition = position
+    let total: number | null = null
+
+    for (const invocation of response.methodResponses) {
+        if (isErrorInvocation(invocation)) {
+            throw new Error(`JMAP ${invocation.type}: ${JSON.stringify(invocation.arguments)}`)
+        }
+        if (invocation.name === 'Email/query') {
+            emailIds = invocation.getArgument('ids') as Id[]
+            responsePosition = (invocation.getArgument('position') as number | undefined) ?? position
+            total = (invocation.getArgument('total') as number | undefined) ?? null
+        }
+        if (invocation.name === 'Email/get') emails = invocation.getArgument('list') as EmailObject[]
+        if (invocation.name === 'Thread/get') threadObjects = invocation.getArgument('list') as ThreadObject[]
+    }
+
+    return {
+        messages: sortEmailsByQuery(emails, emailIds).map((email) => mapEmailToMessage(email, mailboxes)),
+        position: responsePosition,
         threads: threadObjects,
         total,
     }

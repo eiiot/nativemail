@@ -31,6 +31,7 @@ import { useDebugMode } from '@/lib/debug-mode';
 import {
   describeJmapError,
   fetchJmapMailboxSnapshot,
+  fetchJmapSearchSnapshot,
   hasJmapMailboxViewChanged,
   type JmapMailboxSnapshot,
 } from '@/lib/jmap-client';
@@ -126,6 +127,7 @@ import { SymbolView } from 'expo-symbols';
 import { ComponentProps, PropsWithChildren, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   Clipboard,
+  ActivityIndicator,
   InteractionManager,
   Platform,
   Pressable,
@@ -229,6 +231,9 @@ export default function InboxScreen() {
   const [scrollY, setScrollY] = useState(0);
   const [listScrollPhase, setListScrollPhase] = useState<ScrollPhase>('idle');
   const [searchQuery, setSearchQuery] = useState('');
+  const [searchSnapshot, setSearchSnapshot] = useState<JmapMailboxSnapshot | null>(null);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [avatarFileUriBySourceUrl, setAvatarFileUriBySourceUrl] = useState<Record<string, string>>({});
   const [contactAvatarUriByEmail, setContactAvatarUriByEmail] = useState<Record<string, string>>({});
   const [bodyDiskStateById, setBodyDiskStateById] = useState<Record<string, boolean | undefined>>({});
@@ -236,8 +241,13 @@ export default function InboxScreen() {
   const [screenFocused, setScreenFocused] = useState(false);
   const [backgroundBodyWarmPaused, setBackgroundBodyWarmPaused] = useState(false);
   const activeMailboxName = liveMailboxName ?? mailboxName ?? 'Inbox';
-  const sourceMessages = liveMessages ?? [];
-  const visibleMessages = getSearchFilteredMessages(sourceMessages, searchQuery);
+  const mailboxMessages = liveMessages ?? [];
+  const normalizedSearchQuery = searchQuery.trim();
+  const searchActive = normalizedSearchQuery.length > 0;
+  const sourceMessages = searchActive && searchSnapshot ? searchSnapshot.messages : mailboxMessages;
+  const visibleMessages = searchActive && !searchSnapshot
+    ? getSearchFilteredMessages(mailboxMessages, searchQuery)
+    : sourceMessages;
   const renderedMessages = visibleMessages.slice(0, rowRenderLimit);
   const bodyDebugMessageIds = renderedMessages.map((message) => message.id);
   const bodyDebugKey = bodyDebugMessageIds.join('\n');
@@ -275,6 +285,54 @@ export default function InboxScreen() {
     }, [clearPendingMessageNavigation]),
   );
   useEffect(() => clearPendingMessageNavigation, [clearPendingMessageNavigation]);
+  useEffect(() => {
+    if (normalizedSearchQuery.length < 2) {
+      setSearchSnapshot(null);
+      setSearchLoading(false);
+      setSearchError(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    setSearchSnapshot(null);
+    const timer = setTimeout(() => {
+      const startedAt = Date.now();
+      setSearchLoading(true);
+      setSearchError(null);
+      observeEvent('inbox.search.start', { queryLength: normalizedSearchQuery.length });
+
+      void fetchJmapSearchSnapshot({
+        limit: inboxMailboxPageSize,
+        query: normalizedSearchQuery,
+        signal: controller.signal,
+      })
+        .then((result) => {
+          setSearchSnapshot(result);
+          setRowRenderLimit(initialInboxRowRenderLimit);
+          observeDuration('inbox.search.success', startedAt, {
+            messages: result.messages.length,
+            queryLength: normalizedSearchQuery.length,
+            total: result.total ?? -1,
+          });
+        })
+        .catch((error: unknown) => {
+          if (!(error instanceof Error && error.name === 'AbortError')) {
+            setSearchError(describeJmapError(error));
+            observeError('inbox.search.failed', error, {
+              queryLength: normalizedSearchQuery.length,
+            });
+          }
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setSearchLoading(false);
+        });
+    }, 300);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [normalizedSearchQuery]);
   const hiddenRowCount = Math.max(0, visibleMessages.length - renderedMessages.length);
   const messageRouteSource = liveMessages ? 'jmap' : 'mock';
   const navTitleVisible = scrollY >= titleRevealStart;
@@ -707,8 +765,35 @@ export default function InboxScreen() {
       return true;
     }
 
-    if (searchQuery.trim()) {
-      return false;
+    if (normalizedSearchQuery) {
+      const currentSearch = searchSnapshot;
+      const nextPosition = currentSearch?.messages.length ?? 0;
+      const hasMoreSearchResults = Boolean(
+        currentSearch &&
+        (currentSearch.total === null || currentSearch.total === undefined || nextPosition < currentSearch.total),
+      );
+
+      if (!currentSearch || !hasMoreSearchResults || loadMoreInFlightRef.current) return false;
+
+      const loadMore = fetchJmapSearchSnapshot({
+        limit: inboxMailboxPageSize,
+        position: nextPosition,
+        query: normalizedSearchQuery,
+      })
+        .then((page) => {
+          setSearchSnapshot((current) => current ? mergeMailboxPageIntoSnapshot(current, page) : page);
+          setRowRenderLimit((current) => current + inboxRenderPageSize);
+        })
+        .catch((error: unknown) => {
+          setSearchError(describeJmapError(error));
+          observeError('inbox.search.load-more.failed', error, { position: nextPosition });
+        })
+        .finally(() => {
+          loadMoreInFlightRef.current = null;
+        });
+
+      loadMoreInFlightRef.current = loadMore;
+      return true;
     }
 
     const currentSnapshot = selectMailboxSnapshot(useMailStore.getState(), mailboxId);
@@ -781,7 +866,8 @@ export default function InboxScreen() {
     mailboxId,
     refreshMailboxFromServer,
     rowRenderLimit,
-    searchQuery,
+    normalizedSearchQuery,
+    searchSnapshot,
     updateHasMoreMessages,
     visibleMessages.length,
   ]);
@@ -1241,6 +1327,24 @@ export default function InboxScreen() {
                 />
               </RNHostView>
             </HStack>
+            {searchActive && (
+              <HStack
+                key="search-status"
+                modifiers={[
+                  listRowInsets({ top: 4, leading: 16, bottom: 8, trailing: 16 }),
+                  listRowBackground(colors.background),
+                  listRowSeparator('hidden'),
+                ]}>
+                <RNHostView matchContents>
+                  <SearchStatusPanel
+                    colors={colors}
+                    error={searchError}
+                    loading={searchLoading}
+                    resultCount={searchSnapshot?.total ?? searchSnapshot?.messages.length ?? null}
+                  />
+                </RNHostView>
+              </HStack>
+            )}
             <List.ForEach key="mailbox-messages">
               {renderedMessages.map((item) => {
                 const avatarSourceUrl = getMessageAvatarSourceUrl(item);
@@ -1567,6 +1671,38 @@ function formatDebugRecordKeys(record: Record<string, true> | undefined) {
   const keys = Object.keys(record ?? {});
 
   return keys.length ? keys.join(',') : 'none';
+}
+
+function SearchStatusPanel({
+  colors,
+  error,
+  loading,
+  resultCount,
+}: {
+  colors: ColorSet;
+  error: string | null;
+  loading: boolean;
+  resultCount: number | null;
+}) {
+  const status = error
+    ? 'Search unavailable — showing cached matches'
+    : loading
+      ? 'Searching all mail…'
+      : resultCount === null
+        ? 'Search all mail'
+        : `${resultCount} ${resultCount === 1 ? 'result' : 'results'} across all mail`;
+
+  return (
+    <GlassView style={styles.searchStatusGlass} glassEffectStyle="regular">
+      <View style={styles.searchStatusRow}>
+        {loading ? <ActivityIndicator color={tint} size="small" /> : <SymbolView name="sparkle.magnifyingglass" size={16} tintColor={tint} />}
+        <View style={styles.searchStatusCopy}>
+          <Text style={[styles.searchStatusTitle, { color: colors.text }]}>{status}</Text>
+          <Text style={[styles.searchStatusHint, { color: colors.secondaryText }]}>from: · to: · subject: · after: · before: · has:attachment · is:unread</Text>
+        </View>
+      </View>
+    </GlassView>
+  );
 }
 
 function InboxListHeader({
@@ -2661,6 +2797,31 @@ const styles = StyleSheet.create({
   },
   inboxListHost: {
     flex: 1,
+  },
+  searchStatusGlass: {
+    borderRadius: 18,
+    overflow: 'hidden',
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+  },
+  searchStatusRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 10,
+  },
+  searchStatusCopy: {
+    flex: 1,
+    gap: 2,
+  },
+  searchStatusTitle: {
+    fontFamily: systemFont,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  searchStatusHint: {
+    fontFamily: systemFont,
+    fontSize: 11,
+    lineHeight: 15,
   },
   headerBackdrop: {
     left: 0,
