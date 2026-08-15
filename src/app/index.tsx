@@ -1526,6 +1526,20 @@ function getSearchFilteredMessages(messages: Message[], searchQuery: string) {
 type SearchPillScope = 'Anywhere' | 'From' | 'To' | 'Cc' | 'Bcc' | 'Subject' | 'Body' | 'After' | 'Before' | 'Has' | 'Is';
 type SearchPillTerm = { scope: SearchPillScope; value: string };
 
+const searchPillScopes: readonly SearchPillScope[] = [
+  'Anywhere',
+  'From',
+  'To',
+  'Cc',
+  'Bcc',
+  'Subject',
+  'Body',
+  'After',
+  'Before',
+  'Has',
+  'Is',
+];
+
 const searchScopeByOperator: Record<string, SearchPillScope> = {
   after: 'After',
   bcc: 'Bcc',
@@ -1765,7 +1779,7 @@ function SearchPillBar({
                   </HStack>
                 )}
                 modifiers={[buttonStyle('plain')]}>
-                {(['Anywhere', 'From', 'To', 'Subject', 'Body'] as SearchPillScope[]).map((scope) => (
+                {searchPillScopes.map((scope) => (
                   <SwiftButton
                     key={scope}
                     label={scope}
