@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Fastmail Glass",
+    "name": "Nativemail",
     "slug": "fastmail-glass",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -9,7 +9,7 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "bundleIdentifier": "dev.tuft.fastmailglass",
-      "icon": "./assets/expo.icon",
+      "icon": "./assets/Mail.icon",
       "supportsTablet": true,
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
