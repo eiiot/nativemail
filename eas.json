@@ -21,5 +21,12 @@
       "autoIncrement": true,
       "channel": "nativemail-dev"
     }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "ascAppId": "6800177659"
+      }
+    }
   }
 }
