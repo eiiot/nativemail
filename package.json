@@ -38,6 +38,7 @@
     "react-native-web": "~0.21.0",
     "react-native-webview": "13.16.1",
     "react-native-worklets": "0.8.3",
+    "undici": "^8.10.2",
     "zustand": "^5.0.14"
   },
   "devDependencies": {

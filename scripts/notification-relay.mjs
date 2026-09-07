@@ -7,6 +7,7 @@ import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { Agent, fetch as undiciFetch } from 'undici';
 
 const CORE_CAPABILITY = 'urn:ietf:params:jmap:core';
 const MAIL_CAPABILITY = 'urn:ietf:params:jmap:mail';
@@ -45,6 +46,12 @@ const BODY_BACKFILL_QUERY_LIMIT = 100;
 const BODY_BACKFILL_BATCH_DELAY_MS = 150;
 const CID_CACHE_VERSION = 1;
 const MAX_INLINE_CID_IMAGE_BYTES = 2 * 1024 * 1024;
+
+// Keep Fastmail's long-lived event stream out of the API request pool. API
+// requests deliberately disable connection reuse while we test whether stale
+// Undici keep-alive sockets are responsible for intermittent body stalls.
+const fastmailApiDispatcher = new Agent({ connections: 8, pipelining: 0 });
+const fastmailEventDispatcher = new Agent({ connections: 1 });
 
 /** @type {Map<string, { accountId: string; apiUrl: string; expiresAt: number }>} */
 const jmapSessionCache = new Map();
@@ -634,7 +641,11 @@ async function fetchWithTimeout(url, options, timeoutMs, message) {
   options.signal?.addEventListener('abort', forwardAbort, { once: true });
   const timeout = setTimeout(() => controller.abort(new Error(message)), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await undiciFetch(url, {
+      ...options,
+      dispatcher: fastmailApiDispatcher,
+      signal: controller.signal,
+    });
   } catch (error) {
     if (controller.signal.aborted) {
       throw new Error(message);
@@ -779,7 +790,8 @@ async function readEventSource(subscriber, signal) {
     ping: '60',
     types: EVENT_SOURCE_TYPES,
   });
-  const response = await fetch(eventSourceUrl, {
+  const response = await undiciFetch(eventSourceUrl, {
+    dispatcher: fastmailEventDispatcher,
     headers: {
       Accept: 'text/event-stream',
       Authorization: `Bearer ${subscriber.jmapToken}`,
@@ -1299,7 +1311,8 @@ function getExpoPushTicketId(payload) {
 }
 
 async function discoverJmapSession(token) {
-  const response = await fetch(FASTMAIL_SESSION_URL, {
+  const response = await undiciFetch(FASTMAIL_SESSION_URL, {
+    dispatcher: fastmailApiDispatcher,
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${token}`,
@@ -1314,7 +1327,8 @@ async function discoverJmapSession(token) {
 }
 
 async function jmapRequest(apiUrl, token, methodCalls) {
-  const response = await fetch(apiUrl, {
+  const response = await undiciFetch(apiUrl, {
+    dispatcher: fastmailApiDispatcher,
     body: JSON.stringify({
       methodCalls,
       using: [CORE_CAPABILITY, MAIL_CAPABILITY],
