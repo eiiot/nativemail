@@ -13,6 +13,11 @@ import {
   type JmapThread,
 } from '@/lib/jmap-client';
 import type { Message } from '@/lib/mock-mail';
+import {
+  FOREGROUND_MESSAGE_BODY_FETCH_MAX_ATTEMPTS,
+  FOREGROUND_MESSAGE_BODY_FETCH_RETRY_DELAYS_MS,
+  isRetriableMessageBodyFetchError,
+} from '@/lib/message-body-retry';
 import { observeDuration, observeError, observeEvent } from '@/lib/observability';
 
 type MessagePatch = Pick<Partial<Message>, 'keywords' | 'pinned' | 'unread'>;
@@ -22,10 +27,6 @@ const SLOW_FOREGROUND_BODY_FETCH_MS = 1000;
 // The relay serializes these behind foreground reads and aborts them as soon as
 // the user opens a message, so warming visible rows no longer competes with taps.
 const BACKGROUND_MESSAGE_BODY_NETWORK_FETCHES_ENABLED = true;
-// One attempt — simplest possible: tap email, one direct fetch, show it. No
-// retry storms.
-const FOREGROUND_MESSAGE_BODY_FETCH_MAX_ATTEMPTS = 1;
-const FOREGROUND_MESSAGE_BODY_FETCH_RETRY_DELAYS_MS = [120, 350];
 
 type MessageBodyFetchPriority = 'background' | 'foreground';
 
@@ -142,21 +143,6 @@ function isAbortError(error: unknown) {
   }
 
   return false;
-}
-
-function isRetriableMessageBodyFetchError(error: unknown) {
-  const message = getErrorMessage(error).toLowerCase();
-
-  return (
-    message.includes('network connection was lost') ||
-    message.includes('network request failed') ||
-    message.includes('fetch failed') ||
-    message.includes('timed out') ||
-    message.includes('the request timed out') ||
-    message.includes('offline') ||
-    message.includes('connection reset') ||
-    message.includes('connection closed')
-  );
 }
 
 function createBodyFetchRetryAbortError() {
