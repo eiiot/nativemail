@@ -41,6 +41,8 @@ const JMAP_BODY_TIMEOUT_MS = 4000;
 const JMAP_PROXY_TIMEOUT_MS = 8000;
 const DIAGNOSTIC_TOKEN = process.env.NOTIFICATION_RELAY_DIAGNOSTIC_TOKEN ?? '';
 const BODY_CACHE_BATCH_SIZE = 10;
+const BODY_CACHE_MAX_ATTEMPTS = 4;
+const BODY_CACHE_RETRY_DELAYS_MS = [250, 1000, 2500];
 const BODY_BACKFILL_QUERY_LIMIT = 100;
 const BODY_BACKFILL_BATCH_DELAY_MS = 150;
 const CID_CACHE_VERSION = 1;
@@ -628,6 +630,25 @@ async function fetchAndCacheBodies({ accountId, apiUrl, downloadUrl, messageIds,
   return uniqueIds.map((messageId) => cached.get(messageId)).filter(Boolean);
 }
 
+async function fetchAndCacheBodiesWithRetry(options) {
+  let lastError;
+  for (let attempt = 1; attempt <= BODY_CACHE_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await fetchAndCacheBodies(options);
+    } catch (error) {
+      lastError = error;
+      if (attempt === BODY_CACHE_MAX_ATTEMPTS) break;
+      console.warn('[relay] body cache fill retry', JSON.stringify({
+        attempt,
+        messageIds: options.messageIds,
+        reason: describeError(error),
+      }));
+      await delay(BODY_CACHE_RETRY_DELAYS_MS[attempt - 1]);
+    }
+  }
+  throw lastError;
+}
+
 async function fetchWithTimeout(url, options, timeoutMs, message) {
   const controller = new AbortController();
   const forwardAbort = () => controller.abort();
@@ -977,7 +998,7 @@ async function refreshInbox(subscriber, { notify, reason }) {
 
   if (newEmails.length) {
     try {
-      await fetchAndCacheBodies({
+      await fetchAndCacheBodiesWithRetry({
         accountId: subscriber.accountId,
         apiUrl: subscriber.apiUrl,
         downloadUrl: subscriber.downloadUrl,
@@ -1125,7 +1146,7 @@ async function backfillInboxBodies(subscriber) {
     for (let index = 0; index < ids.length; index += BODY_CACHE_BATCH_SIZE) {
       const batch = ids.slice(index, index + BODY_CACHE_BATCH_SIZE);
       try {
-        const emails = await fetchAndCacheBodies({
+        const emails = await fetchAndCacheBodiesWithRetry({
           accountId: subscriber.accountId,
           apiUrl: subscriber.apiUrl,
           downloadUrl: subscriber.downloadUrl,
