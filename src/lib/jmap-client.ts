@@ -6,6 +6,7 @@ import {
 } from '@/lib/avatar-photos'
 import { getFastmailJmapToken } from '@/lib/fastmail-token'
 import type { Message, MessageAttachment } from '@/lib/mock-mail'
+import { createMessageBodyTimeoutError } from '@/lib/message-body-retry'
 import { observeDuration, observeError, observeEvent } from '@/lib/observability'
 import { parseJmapSearchQuery, type JmapSearchFilter } from '@/lib/search-query'
 import {
@@ -743,7 +744,7 @@ export async function fetchJmapMessage(
 const DIRECT_SESSION_URL = 'https://api.fastmail.com/jmap/session'
 const MESSAGE_BODY_RELAY_URL =
     process.env.EXPO_PUBLIC_NOTIFICATION_RELAY_URL ?? 'https://nativemail-relay.fly.dev'
-const MESSAGE_BODY_RELAY_TIMEOUT_MS = 4500
+const MESSAGE_BODY_RELAY_TIMEOUT_MS = 5500
 const MESSAGE_BODY_HEDGE_DELAY_MS = 500
 const DIRECT_BODY_TIMEOUT_MS = 12000
 let cachedDirectSession: { accountId: Id; apiUrl: string; token: string } | null = null
@@ -899,7 +900,11 @@ async function fetchJmapMessageBodiesViaRelay(
 ): Promise<Record<string, JmapMessageBody>> {
     const startedAt = Date.now()
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), MESSAGE_BODY_RELAY_TIMEOUT_MS)
+    let didTimeOut = false
+    const timeout = setTimeout(() => {
+        didTimeOut = true
+        controller.abort()
+    }, MESSAGE_BODY_RELAY_TIMEOUT_MS)
     const onAbort = () => controller.abort()
     signal?.addEventListener('abort', onAbort, { once: true })
 
@@ -933,6 +938,11 @@ async function fetchJmapMessageBodiesViaRelay(
             relayTotalMs: result.timings?.totalMs,
         })
         return bodies
+    } catch (error) {
+        if (didTimeOut && !signal?.aborted) {
+            throw createMessageBodyTimeoutError()
+        }
+        throw error
     } finally {
         clearTimeout(timeout)
         signal?.removeEventListener('abort', onAbort)

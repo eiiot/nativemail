@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  createMessageBodyTimeoutError,
   FOREGROUND_MESSAGE_BODY_FETCH_MAX_ATTEMPTS,
   isRetriableMessageBodyFetchError,
 } from '../message-body-retry';
@@ -16,5 +17,12 @@ describe('message body retry policy', () => {
   it('does not retry permanent client errors', () => {
     expect(isRetriableMessageBodyFetchError(new Error('Message relay failed with HTTP 401.'))).toBe(false);
     expect(isRetriableMessageBodyFetchError(new Error('JMAP Email/get: notFound'))).toBe(false);
+  });
+
+  it('turns an internal request deadline into a retriable error', () => {
+    const error = createMessageBodyTimeoutError();
+
+    expect(error.name).toBe('MessageBodyTimeoutError');
+    expect(isRetriableMessageBodyFetchError(error)).toBe(true);
   });
 });

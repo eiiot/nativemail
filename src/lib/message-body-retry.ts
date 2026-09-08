@@ -1,6 +1,12 @@
 export const FOREGROUND_MESSAGE_BODY_FETCH_MAX_ATTEMPTS = 5;
 export const FOREGROUND_MESSAGE_BODY_FETCH_RETRY_DELAYS_MS = [250, 1000, 2500, 5000];
 
+export function createMessageBodyTimeoutError() {
+  const error = new Error('Message body request timed out.');
+  error.name = 'MessageBodyTimeoutError';
+  return error;
+}
+
 export function isRetriableMessageBodyFetchError(error: unknown) {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
 
