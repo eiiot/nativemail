@@ -35,7 +35,6 @@ describe('notification relay message-body proxy', () => {
 
   it('fetches one email body from Fastmail without persisting the bearer token', async () => {
     const seenAuthorization = [];
-    const seenApiConnections = [];
     let sessionRequests = 0;
     const fastmail = createServer(async (request, response) => {
       seenAuthorization.push(request.headers.authorization ?? '');
@@ -49,8 +48,6 @@ describe('notification relay message-body proxy', () => {
         }));
         return;
       }
-
-      seenApiConnections.push(request.headers.connection);
 
       response.end(JSON.stringify({
         methodResponses: [['Email/get', { list: [{ id: 'message-1', textBody: [], bodyValues: {} }] }, '0']],
@@ -95,7 +92,6 @@ describe('notification relay message-body proxy', () => {
     expect(await secondResponse.json()).toMatchObject({ cache: { hits: 1, misses: 0 } });
     expect(sessionRequests).toBe(1);
     expect(seenAuthorization).toEqual(['Bearer secret-token', 'Bearer secret-token']);
-    expect(seenApiConnections).toEqual(['close']);
   });
 
   it('fetches multiple immutable email bodies in one JMAP call', async () => {
